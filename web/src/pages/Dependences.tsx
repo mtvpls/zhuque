@@ -33,21 +33,25 @@ const Dependences: React.FC = () => {
   const [form] = Form.useForm();
 
   useEffect(() => {
-    loadDependences();
+    loadDependences(true);
     // 每5秒刷新一次状态
     const interval = setInterval(() => {
-      loadDependences();
+      loadDependences(false);
     }, 5000);
     return () => clearInterval(interval);
   }, []);
 
-  const loadDependences = async () => {
-    setLoading(true);
+  const loadDependences = async (showLoading: boolean = true) => {
+    if (showLoading) {
+      setLoading(true);
+    }
     try {
       const res: any = await dependenceApi.list();
       setDependences(res);
     } finally {
-      setLoading(false);
+      if (showLoading) {
+        setLoading(false);
+      }
     }
   };
 
@@ -93,7 +97,7 @@ const Dependences: React.FC = () => {
       }
 
       setVisible(false);
-      loadDependences();
+      loadDependences(false);
     } catch (error: any) {
       Message.error(error.response?.data?.error || '操作失败');
     }
@@ -103,7 +107,7 @@ const Dependences: React.FC = () => {
     try {
       await dependenceApi.delete(id);
       Message.success('删除成功');
-      loadDependences();
+      loadDependences(false);
     } catch (error: any) {
       Message.error(error.response?.data?.error || '删除失败');
     }
@@ -113,7 +117,7 @@ const Dependences: React.FC = () => {
     try {
       await dependenceApi.reinstall(id);
       Message.success('重新安装中...');
-      loadDependences();
+      loadDependences(false);
     } catch (error: any) {
       Message.error(error.response?.data?.error || '操作失败');
     }

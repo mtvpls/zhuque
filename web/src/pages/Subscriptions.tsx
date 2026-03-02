@@ -28,22 +28,26 @@ const Subscriptions: React.FC = () => {
   const [form] = Form.useForm();
 
   useEffect(() => {
-    loadSubscriptions();
+    loadSubscriptions(true);
     const interval = setInterval(() => {
-      loadSubscriptions();
+      loadSubscriptions(false);
     }, 5000);
     return () => clearInterval(interval);
   }, []);
 
-  const loadSubscriptions = async () => {
-    setLoading(true);
+  const loadSubscriptions = async (showLoading: boolean = true) => {
+    if (showLoading) {
+      setLoading(true);
+    }
     try {
       const res = await subscriptionApi.list();
       setSubscriptions(res);
     } catch (error: any) {
       Message.error(error.response?.data?.error || '加载失败');
     } finally {
-      setLoading(false);
+      if (showLoading) {
+        setLoading(false);
+      }
     }
   };
 
@@ -75,7 +79,7 @@ const Subscriptions: React.FC = () => {
         Message.success('创建成功');
       }
       setVisible(false);
-      loadSubscriptions();
+      loadSubscriptions(false);
     } catch (error: any) {
       Message.error(error.response?.data?.error || '操作失败');
     }
@@ -85,7 +89,7 @@ const Subscriptions: React.FC = () => {
     try {
       await subscriptionApi.delete(id);
       Message.success('删除成功');
-      loadSubscriptions();
+      loadSubscriptions(false);
     } catch (error: any) {
       Message.error(error.response?.data?.error || '删除失败');
     }
@@ -101,7 +105,7 @@ const Subscriptions: React.FC = () => {
         const sub = subs.find((s: any) => s.id === id);
         if (sub && sub.last_run_status !== 'running') {
           clearInterval(pollInterval);
-          loadSubscriptions();
+          loadSubscriptions(false);
           if (sub.last_run_status === 'success') {
             Message.success('拉取成功');
           } else if (sub.last_run_status === 'failed') {
@@ -120,7 +124,7 @@ const Subscriptions: React.FC = () => {
     try {
       await subscriptionApi.update(id, { enabled });
       Message.success(enabled ? '已启用' : '已禁用');
-      loadSubscriptions();
+      loadSubscriptions(false);
     } catch (error: any) {
       Message.error(error.response?.data?.error || '操作失败');
     }
