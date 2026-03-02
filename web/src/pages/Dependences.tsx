@@ -64,14 +64,34 @@ const Dependences: React.FC = () => {
   const handleSubmit = async () => {
     try {
       const values = await form.validate();
-      // 后端期望的字段名是 type，不是 dep_type
-      const payload = {
-        name: values.name,
+      // 按换行符分割依赖名称，过滤空行
+      const names = values.name
+        .split('\n')
+        .map((n: string) => n.trim())
+        .filter((n: string) => n.length > 0);
+
+      if (names.length === 0) {
+        Message.warning('请输入至少一个依赖名称');
+        return;
+      }
+
+      // 构建批量创建的 payload
+      const payloads = names.map((name: string) => ({
+        name,
         type: values.dep_type,
         remark: values.remark,
-      };
-      await dependenceApi.create(payload);
-      Message.success('添加成功，正在安装...');
+      }));
+
+      if (payloads.length === 1) {
+        // 单个依赖使用单个创建接口
+        await dependenceApi.create(payloads[0]);
+        Message.success('添加成功，正在安装...');
+      } else {
+        // 多个依赖使用批量创建接口
+        await dependenceApi.createBatch(payloads);
+        Message.success(`已添加 ${payloads.length} 个依赖，正在安装...`);
+      }
+
       setVisible(false);
       loadDependences();
     } catch (error: any) {
@@ -254,7 +274,10 @@ const Dependences: React.FC = () => {
               </Select>
             </FormItem>
             <FormItem label="依赖名称" field="name" rules={[{ required: true, message: '请输入依赖名称' }]}>
-              <Input placeholder="例如: requests" />
+              <Input.TextArea
+                placeholder="例如: requests&#10;可输入多个依赖，每行一个"
+                autoSize={{ minRows: 3, maxRows: 10 }}
+              />
             </FormItem>
             <FormItem label="备注" field="remark">
               <Input placeholder="依赖说明" />
