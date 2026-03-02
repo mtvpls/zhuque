@@ -68,8 +68,20 @@ sysinfo = "0.30"
 # 终端
 portable-pty = "0.8"
 
+# 内存分配器
+tikv-jemallocator = { version = "0.6", optional = true }
+tikv-jemalloc-ctl = { version = "0.6", optional = true }
+
+[features]
+default = ["jemalloc"]
+jemalloc = ["tikv-jemallocator", "tikv-jemalloc-ctl"]
+
 [profile.release]
 opt-level = "z"     # 优化体积
 lto = true          # 链接时优化
 codegen-units = 1   # 更好的优化
 strip = true        # 移除符号表
+
+# jemalloc 配置：激进的内存回收策略
+[profile.release.package.tikv-jemallocator]
+opt-level = 3

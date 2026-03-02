@@ -8,6 +8,24 @@ use tokio::process::Command;
 use tokio::sync::{Semaphore, oneshot, RwLock};
 use tracing::{error, info};
 
+/// 激进的内存回收（公共函数）
+#[cfg(feature = "jemalloc")]
+pub fn aggressive_memory_reclaim() {
+    use tikv_jemalloc_ctl::epoch;
+
+    // 强制推进 epoch，触发内存统计更新和内存回收
+    if let Ok(e) = epoch::mib() {
+        let _ = e.advance();
+    }
+
+    info!("Aggressive memory reclaim completed");
+}
+
+#[cfg(not(feature = "jemalloc"))]
+pub fn aggressive_memory_reclaim() {
+    // 非 jemalloc 环境下不做任何操作
+}
+
 pub struct DependenceService {
     pool: Arc<RwLock<SqlitePool>>,
     install_semaphore: Arc<Semaphore>, // 限制同时安装的依赖数量
@@ -73,9 +91,16 @@ impl DependenceService {
                     error!("Failed to install dependency: {}", e);
                 }
 
+                // 每个依赖安装完后立即清理内存
+                aggressive_memory_reclaim();
+
                 // permit自动释放，继续下一个
             }
             info!("All startup dependencies processed");
+
+            // 所有依赖安装完成后，再做一次全局清理
+            aggressive_memory_reclaim();
+
             let _ = tx.send(()); // 通知安装完成
         });
 
@@ -346,6 +371,9 @@ impl DependenceService {
                 .await?;
             }
         }
+
+        // 激进的内存回收
+        aggressive_memory_reclaim();
 
         Ok(())
     }

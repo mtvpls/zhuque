@@ -16,6 +16,14 @@ use tower_http::cors::CorsLayer;
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(feature = "jemalloc")]
+#[export_name = "malloc_conf"]
+pub static MALLOC_CONF: &[u8] = b"dirty_decay_ms:10000,muzzy_decay_ms:10000,background_thread:true\0";
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // 初始化日志
