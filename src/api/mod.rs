@@ -236,6 +236,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/subscriptions/:id/run", post(subscription::run_subscription))
         // 系统信息
         .route("/api/system/info", get(system::get_system_info))
+        .route("/api/system/webhook-config", get(system::get_webhook_config))
         .layer(middleware::from_fn_with_state(
             state.auth_service.clone(),
             auth_middleware,

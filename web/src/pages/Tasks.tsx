@@ -124,12 +124,11 @@ const Tasks: React.FC = () => {
   const loadWebhookToken = async () => {
     try {
       const token = localStorage.getItem('token');
-      const res = await axios.get('/api/env', {
+      const res = await axios.get('/api/system/webhook-config', {
         headers: { Authorization: `Bearer ${token}` },
       });
-      const webhookEnv = res.data.find((env: any) => env.key === 'WEBHOOK_TOKEN');
-      if (webhookEnv) {
-        setWebhookToken(webhookEnv.value);
+      if (res.data.configured && res.data.token) {
+        setWebhookToken(res.data.token);
       }
     } catch (error) {
       console.error('Failed to load webhook token:', error);
