@@ -70,7 +70,8 @@ portable-pty = "0.8"
 
 # 内存分配器
 tikv-jemallocator = { version = "0.6", optional = true }
-tikv-jemalloc-ctl = { version = "0.6", optional = true }
+tikv-jemalloc-ctl = { version = "0.6", optional = true, features = ["stats"] }
+libc = "0.2.182"
 
 [features]
 default = ["jemalloc"]

@@ -8,22 +8,53 @@ use tokio::process::Command;
 use tokio::sync::{Semaphore, oneshot, RwLock};
 use tracing::{error, info};
 
-/// 激进的内存回收（公共函数）
-#[cfg(feature = "jemalloc")]
-pub fn aggressive_memory_reclaim() {
-    use tikv_jemalloc_ctl::epoch;
+#[cfg(all(feature = "jemalloc", target_os = "linux"))]
+extern "C" {
+    fn malloc_trim(pad: libc::size_t) -> libc::c_int;
+}
 
-    // 强制推进 epoch，触发内存统计更新和内存回收
+/// 激进的内存回收（公共函数）
+#[cfg(all(feature = "jemalloc", target_os = "linux"))]
+pub fn aggressive_memory_reclaim() {
+    use tikv_jemalloc_ctl::{epoch, stats};
+
+    // 获取回收前的内存使用
+    let allocated_before = stats::allocated::read().unwrap_or(0);
+    let resident_before = stats::resident::read().unwrap_or(0);
+
+    info!("Before reclaim - Allocated: {:.2} MB, Resident: {:.2} MB",
+          allocated_before as f64 / 1024.0 / 1024.0,
+          resident_before as f64 / 1024.0 / 1024.0);
+
+    // 强制推进 epoch
     if let Ok(e) = epoch::mib() {
         let _ = e.advance();
     }
 
-    info!("Aggressive memory reclaim completed");
+    // 使用 malloc_trim 强制归还内存给操作系统
+    unsafe {
+        malloc_trim(0);
+    }
+
+    // 获取回收后的内存使用
+    let allocated_after = stats::allocated::read().unwrap_or(0);
+    let resident_after = stats::resident::read().unwrap_or(0);
+
+    info!("After reclaim - Allocated: {:.2} MB, Resident: {:.2} MB",
+          allocated_after as f64 / 1024.0 / 1024.0,
+          resident_after as f64 / 1024.0 / 1024.0);
+
+    let freed_allocated = if allocated_before > allocated_after { allocated_before - allocated_after } else { 0 };
+    let freed_resident = if resident_before > resident_after { resident_before - resident_after } else { 0 };
+
+    info!("Freed - Allocated: {:.2} MB, Resident: {:.2} MB",
+          freed_allocated as f64 / 1024.0 / 1024.0,
+          freed_resident as f64 / 1024.0 / 1024.0);
 }
 
-#[cfg(not(feature = "jemalloc"))]
+#[cfg(not(all(feature = "jemalloc", target_os = "linux")))]
 pub fn aggressive_memory_reclaim() {
-    // 非 jemalloc 环境下不做任何操作
+    // 非 Linux + jemalloc 环境下不做任何操作
 }
 
 pub struct DependenceService {
