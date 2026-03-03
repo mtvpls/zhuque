@@ -152,6 +152,7 @@ const Subscriptions: React.FC = () => {
     {
       title: '仓库地址',
       dataIndex: 'url',
+      width: 300,
       ellipsis: true,
     },
     {
