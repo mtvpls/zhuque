@@ -1,4 +1,4 @@
-use crate::models::{SystemConfig, CreateSystemConfig, UpdateSystemConfig, MirrorConfig};
+use crate::models::{SystemConfig, CreateSystemConfig, UpdateSystemConfig, MirrorConfig, AutoBackupConfig};
 use anyhow::Result;
 use sqlx::SqlitePool;
 use std::process::Command;
@@ -243,6 +243,36 @@ impl ConfigService {
         info!("Loading mirror configuration on startup...");
         let config = self.get_mirror_config().await?;
         self.apply_mirror_config(&config).await?;
+        Ok(())
+    }
+
+    // 获取自动备份配置
+    pub async fn get_auto_backup_config(&self) -> Result<AutoBackupConfig> {
+        if let Some(config) = self.get_by_key("auto_backup").await? {
+            let backup_config: AutoBackupConfig = serde_json::from_str(&config.value)?;
+            Ok(backup_config)
+        } else {
+            Ok(AutoBackupConfig::default())
+        }
+    }
+
+    // 更新自动备份配置
+    pub async fn update_auto_backup_config(&self, config: &AutoBackupConfig) -> Result<()> {
+        let value = serde_json::to_string(config)?;
+
+        if self.get_by_key("auto_backup").await?.is_some() {
+            self.update("auto_backup", UpdateSystemConfig {
+                value,
+                description: Some("自动备份配置".to_string()),
+            }).await?;
+        } else {
+            self.create(CreateSystemConfig {
+                key: "auto_backup".to_string(),
+                value,
+                description: Some("自动备份配置".to_string()),
+            }).await?;
+        }
+
         Ok(())
     }
 }

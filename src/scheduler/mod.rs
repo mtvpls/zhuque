@@ -1,6 +1,8 @@
 mod subscription_scheduler;
+mod backup_scheduler;
 
 pub use subscription_scheduler::SubscriptionScheduler;
+pub use backup_scheduler::BackupScheduler;
 
 use crate::services::{Executor, LogService, TaskService};
 use anyhow::Result;

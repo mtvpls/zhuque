@@ -68,6 +68,9 @@ sysinfo = "0.30"
 # 终端
 portable-pty = "0.8"
 
+# WebDAV 客户端
+reqwest = { version = "0.12", features = ["rustls-tls", "stream"] }
+
 # 内存分配器
 tikv-jemallocator = { version = "0.6", optional = true }
 tikv-jemalloc-ctl = { version = "0.6", optional = true, features = ["stats"] }

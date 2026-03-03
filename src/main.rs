@@ -8,7 +8,7 @@ mod utils;
 use anyhow::Result;
 use api::AppState;
 use models::db::init_db;
-use scheduler::{Scheduler, SubscriptionScheduler};
+use scheduler::{Scheduler, SubscriptionScheduler, BackupScheduler};
 use services::{AuthService, ConfigService, DependenceService, EnvService, Executor, LogService, ScriptService, SubscriptionService, TaskService, TaskGroupService, TerminalService, TotpService};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -88,6 +88,19 @@ async fn main() -> Result<()> {
     let subscription_scheduler = Arc::new(SubscriptionScheduler::new(subscription_service.clone()).await?);
     subscription_scheduler.start().await?;
 
+    // 初始化自动备份调度器
+    info!("Initializing backup scheduler...");
+    let backup_scheduler = match BackupScheduler::new(config_service.clone()).await {
+        Ok(scheduler) => {
+            scheduler.start().await?;
+            Some(Arc::new(scheduler))
+        }
+        Err(e) => {
+            error!("Failed to initialize backup scheduler: {}", e);
+            None
+        }
+    };
+
     // 启动日志清理定时任务
     info!("Starting log cleanup task...");
     let log_service_cleanup = log_service.clone();
@@ -126,6 +139,7 @@ async fn main() -> Result<()> {
         totp_service,
         scheduler,
         subscription_scheduler,
+        backup_scheduler,
         db_pool: shared_pool,
     });
 

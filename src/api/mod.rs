@@ -12,7 +12,7 @@ pub mod task_group;
 pub mod terminal;
 
 use crate::middleware::{auth_middleware, webhook_auth_middleware};
-use crate::scheduler::{Scheduler, SubscriptionScheduler};
+use crate::scheduler::{Scheduler, SubscriptionScheduler, BackupScheduler};
 use crate::services::{AuthService, ConfigService, DependenceService, EnvService, LogService, ScriptService, SubscriptionService, TaskService, TaskGroupService, TerminalService, TotpService};
 use axum::{
     http::{StatusCode, Uri},
@@ -42,6 +42,7 @@ pub struct AppState {
     pub totp_service: Arc<TotpService>,
     pub scheduler: Arc<Scheduler>,
     pub subscription_scheduler: Arc<SubscriptionScheduler>,
+    pub backup_scheduler: Option<Arc<BackupScheduler>>,
     pub db_pool: Arc<RwLock<SqlitePool>>,
 }
 
@@ -226,6 +227,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/configs/mirror/config", get(config::get_mirror_config))
         .route("/api/configs/mirror/config", post(config::update_mirror_config))
+        // 自动备份配置
+        .route("/api/configs/auto-backup/config", get(config::get_auto_backup_config))
+        .route("/api/configs/auto-backup/config", post(config::update_auto_backup_config))
+        .route("/api/configs/auto-backup/test", post(config::test_webdav_connection))
         // 订阅管理
         .route(
             "/api/subscriptions",

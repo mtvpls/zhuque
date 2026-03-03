@@ -51,3 +51,27 @@ pub struct PythonMirror {
     pub enabled: bool,
     pub index_url: Option<String>, // pip index
 }
+
+// 自动备份配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoBackupConfig {
+    pub enabled: bool,
+    pub webdav_url: String,
+    pub webdav_username: String,
+    pub webdav_password: String,
+    pub cron: String,
+    pub remote_path: Option<String>, // WebDAV 远程路径，默认为根目录
+}
+
+impl Default for AutoBackupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            webdav_url: String::new(),
+            webdav_username: String::new(),
+            webdav_password: String::new(),
+            cron: "0 2 * * *".to_string(), // 默认每天凌晨2点（5字段格式）
+            remote_path: None,
+        }
+    }
+}

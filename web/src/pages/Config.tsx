@@ -12,6 +12,7 @@ import {
   Spin,
   Tabs,
   Grid,
+  Switch,
 } from '@arco-design/web-react';
 import { IconSave, IconDownload, IconUpload } from '@arco-design/web-react/icon';
 import axios from 'axios';
@@ -55,10 +56,14 @@ const Config: React.FC = () => {
   const [systemInfo, setSystemInfo] = useState<SystemInfo | null>(null);
   const [systemInfoLoading, setSystemInfoLoading] = useState(false);
   const [currentUptime, setCurrentUptime] = useState<number>(0);
+  const [autoBackupForm] = Form.useForm();
+  const [autoBackupLoading, setAutoBackupLoading] = useState(false);
+  const [testConnectionLoading, setTestConnectionLoading] = useState(false);
 
   useEffect(() => {
     loadConfig();
     loadLogRetentionConfig();
+    loadAutoBackupConfig();
     if (activeTab === 'system') {
       loadSystemInfo();
     }
@@ -117,6 +122,70 @@ const Config: React.FC = () => {
       Message.error('加载系统信息失败');
     } finally {
       setSystemInfoLoading(false);
+    }
+  };
+
+  const loadAutoBackupConfig = async () => {
+    try {
+      const token = localStorage.getItem('token');
+      const res = await axios.get('/api/configs/auto-backup/config', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      autoBackupForm.setFieldsValue(res.data);
+    } catch (error: any) {
+      Message.error('加载自动备份配置失败');
+    }
+  };
+
+  const handleSaveAutoBackup = async () => {
+    try {
+      await autoBackupForm.validate();
+      const values = autoBackupForm.getFieldsValue();
+
+      setAutoBackupLoading(true);
+      const token = localStorage.getItem('token');
+      await axios.post('/api/configs/auto-backup/config', values, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+
+      Message.success('自动备份配置已保存');
+    } catch (error: any) {
+      if (error.response?.data?.message) {
+        Message.error(error.response.data.message);
+      } else {
+        Message.error('保存失败');
+      }
+    } finally {
+      setAutoBackupLoading(false);
+    }
+  };
+
+  const handleTestConnection = async () => {
+    try {
+      await autoBackupForm.validate(['webdav_url', 'webdav_username', 'webdav_password']);
+      const values = autoBackupForm.getFieldsValue();
+
+      setTestConnectionLoading(true);
+      const token = localStorage.getItem('token');
+      await axios.post('/api/configs/auto-backup/test', {
+        webdav_url: values.webdav_url,
+        webdav_username: values.webdav_username,
+        webdav_password: values.webdav_password,
+        enabled: false,
+        cron: '',
+      }, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+
+      Message.success('WebDAV 连接测试成功');
+    } catch (error: any) {
+      if (error.response?.data) {
+        Message.error(error.response.data);
+      } else {
+        Message.error('连接测试失败');
+      }
+    } finally {
+      setTestConnectionLoading(false);
     }
   };
 
@@ -451,6 +520,106 @@ const Config: React.FC = () => {
                   </div>
                 </div>
               </Space>
+            </div>
+          </TabPane>
+
+          <TabPane key="auto-backup" title="自动备份">
+            <div style={{ padding: '16px 24px' }}>
+              <div style={{ marginBottom: 16, display: 'flex', justifyContent: 'flex-end' }}>
+                <Button
+                  type="primary"
+                  icon={<IconSave />}
+                  loading={autoBackupLoading}
+                  onClick={handleSaveAutoBackup}
+                >
+                  保存配置
+                </Button>
+              </div>
+
+              <Form form={autoBackupForm} layout="vertical">
+                <FormItem
+                  label="启用自动备份"
+                  field="enabled"
+                  triggerPropName="checked"
+                  extra="开启后将按照设置的时间自动备份到 WebDAV"
+                >
+                  <Switch />
+                </FormItem>
+
+                <Divider />
+
+                <Title heading={6}>WebDAV 配置</Title>
+
+                <FormItem
+                  label="WebDAV 地址"
+                  field="webdav_url"
+                  rules={[{ required: true, message: '请输入 WebDAV 地址' }]}
+                  extra="例如: https://dav.example.com"
+                >
+                  <Input placeholder="https://dav.example.com" />
+                </FormItem>
+
+                <FormItem
+                  label="用户名"
+                  field="webdav_username"
+                  rules={[{ required: true, message: '请输入用户名' }]}
+                >
+                  <Input placeholder="用户名" />
+                </FormItem>
+
+                <FormItem
+                  label="密码"
+                  field="webdav_password"
+                  rules={[{ required: true, message: '请输入密码' }]}
+                >
+                  <Input.Password placeholder="密码" />
+                </FormItem>
+
+                <FormItem
+                  label="远程路径"
+                  field="remote_path"
+                  extra="备份文件保存的远程路径，留空则保存到根目录"
+                >
+                  <Input placeholder="/backups" />
+                </FormItem>
+
+                <div style={{ marginBottom: 16 }}>
+                  <Button
+                    type="outline"
+                    loading={testConnectionLoading}
+                    onClick={handleTestConnection}
+                  >
+                    测试连接
+                  </Button>
+                </div>
+
+                <Divider />
+
+                <Title heading={6}>备份计划</Title>
+
+                <FormItem
+                  label="Cron 表达式"
+                  field="cron"
+                  rules={[{ required: true, message: '请输入 Cron 表达式' }]}
+                  extra="支持 5 字段格式（分 时 日 月 周），例如: 0 2 * * * (每天凌晨2点)"
+                >
+                  <Input placeholder="0 2 * * *" />
+                </FormItem>
+
+                <div style={{ marginTop: 24 }}>
+                  <Title heading={6}>常用 Cron 表达式</Title>
+                  <Space direction="vertical" style={{ width: '100%' }}>
+                    <ul style={{ marginTop: 8 }}>
+                      <li>每天凌晨2点: 0 2 * * *</li>
+                      <li>每天中午12点: 0 12 * * *</li>
+                      <li>每周日凌晨3点: 0 3 * * 0</li>
+                      <li>每月1号凌晨4点: 0 4 1 * *</li>
+                      <li>每6小时: 0 */6 * * *</li>
+                      <li>每12小时: 0 */12 * * *</li>
+                    </ul>
+                  </Space>
+                </div>
+              </Form>
             </div>
           </TabPane>
 
