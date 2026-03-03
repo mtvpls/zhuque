@@ -8,43 +8,6 @@ use tokio::process::Command;
 use tokio::sync::{Semaphore, oneshot, RwLock};
 use tracing::{error, info};
 
-#[cfg(all(feature = "jemalloc", target_os = "linux"))]
-extern "C" {
-    fn malloc_trim(pad: libc::size_t) -> libc::c_int;
-}
-
-/// 激进的内存回收（公共函数）
-#[cfg(all(feature = "jemalloc", target_os = "linux"))]
-pub fn aggressive_memory_reclaim() {
-    use tikv_jemalloc_ctl::{epoch, stats};
-
-    // 获取回收前的内存使用
-    let allocated_before = stats::allocated::read().unwrap_or(0);
-    let resident_before = stats::resident::read().unwrap_or(0);
-
-    // 强制推进 epoch
-    if let Ok(e) = epoch::mib() {
-        let _ = e.advance();
-    }
-
-    // 使用 malloc_trim 强制归还内存给操作系统
-    unsafe {
-        malloc_trim(0);
-    }
-
-    // 获取回收后的内存使用
-    let allocated_after = stats::allocated::read().unwrap_or(0);
-    let resident_after = stats::resident::read().unwrap_or(0);
-
-    let freed_allocated = if allocated_before > allocated_after { allocated_before - allocated_after } else { 0 };
-    let freed_resident = if resident_before > resident_after { resident_before - resident_after } else { 0 };
-}
-
-#[cfg(not(all(feature = "jemalloc", target_os = "linux")))]
-pub fn aggressive_memory_reclaim() {
-    // 非 Linux + jemalloc 环境下不做任何操作
-}
-
 pub struct DependenceService {
     pool: Arc<RwLock<SqlitePool>>,
     install_semaphore: Arc<Semaphore>, // 限制同时安装的依赖数量
