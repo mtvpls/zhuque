@@ -250,8 +250,15 @@ xuanwu/
 | `PORT` | 服务端口 | `3000` | 否 |
 | `RUST_LOG` | 日志级别 (trace/debug/info/warn/error) | `info` | 否 |
 | `TZ` | 时区设置 | `Asia/Shanghai` | 否 |
+| `AUTO_RESTORE_ON_STARTUP` | 启动时自动恢复备份 | `false` | 否 |
+| `WEBDAV_URL` | WebDAV 服务器地址 | 无 | 否** |
+| `WEBDAV_USERNAME` | WebDAV 用户名 | 无 | 否** |
+| `WEBDAV_PASSWORD` | WebDAV 密码 | 无 | 否** |
+| `WEBDAV_REMOTE_PATH` | WebDAV 远程路径 | 无 | 否 |
 
-> **注意：** `WEBHOOK_TOKEN` 如果需要使用 Webhook 功能则必须配置。
+> **注意：**
+> - `WEBHOOK_TOKEN` 如果需要使用 Webhook 功能则必须配置
+> - `WEBDAV_*` 如果启用 `AUTO_RESTORE_ON_STARTUP` 则必须配置 WebDAV 相关信息
 
 **Docker 运行示例：**
 

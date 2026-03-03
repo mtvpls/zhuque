@@ -76,7 +76,42 @@ async fn main() -> Result<()> {
 
     // 检查是否需要自动恢复备份
     info!("Checking auto restore configuration...");
-    if let Ok(backup_config) = config_service.get_auto_backup_config().await {
+
+    // 优先从环境变量读取配置
+    let auto_restore_enabled = std::env::var("AUTO_RESTORE_ON_STARTUP")
+        .ok()
+        .and_then(|v| v.parse::<bool>().ok())
+        .unwrap_or(false);
+
+    let env_webdav_url = std::env::var("WEBDAV_URL").ok();
+    let env_webdav_username = std::env::var("WEBDAV_USERNAME").ok();
+    let env_webdav_password = std::env::var("WEBDAV_PASSWORD").ok();
+    let env_remote_path = std::env::var("WEBDAV_REMOTE_PATH").ok();
+
+    // 如果环境变量配置了自动恢复
+    if auto_restore_enabled && env_webdav_url.is_some() && env_webdav_username.is_some() && env_webdav_password.is_some() {
+        info!("Auto restore is enabled via environment variables, restoring latest backup...");
+        let backup_config = models::config::AutoBackupConfig {
+            enabled: false,
+            webdav_url: env_webdav_url.unwrap(),
+            webdav_username: env_webdav_username.unwrap(),
+            webdav_password: env_webdav_password.unwrap(),
+            cron: String::new(),
+            remote_path: env_remote_path,
+            max_backups: None,
+            auto_restore_on_startup: true,
+        };
+
+        if let Err(e) = restore_latest_backup(&backup_config, &data_dir).await {
+            error!("Failed to restore backup on startup: {}", e);
+        } else {
+            info!("Backup restored successfully, reinitializing database...");
+            // 重新初始化数据库
+            let pool = init_db(&database_url).await?;
+            *shared_pool.write().await = pool;
+        }
+    } else if let Ok(backup_config) = config_service.get_auto_backup_config().await {
+        // 否则从数据库配置读取
         if backup_config.auto_restore_on_startup
             && !backup_config.webdav_url.is_empty()
             && !backup_config.webdav_username.is_empty()
