@@ -13,7 +13,10 @@ pub mod terminal;
 
 use crate::middleware::{auth_middleware, webhook_auth_middleware};
 use crate::scheduler::{Scheduler, SubscriptionScheduler, BackupScheduler};
-use crate::services::{AuthService, ConfigService, DependenceService, EnvService, LogService, ScriptService, SubscriptionService, TaskService, TaskGroupService, TerminalService, TotpService};
+use crate::services::{AuthService, ConfigService, DependenceService, EnvService, LogService, ScriptService, SubscriptionService, TaskService, TaskGroupService, TotpService};
+
+#[cfg(not(target_os = "android"))]
+use crate::services::TerminalService;
 use axum::{
     http::{StatusCode, Uri},
     middleware,
@@ -38,6 +41,7 @@ pub struct AppState {
     pub subscription_service: Arc<SubscriptionService>,
     pub config_service: Arc<ConfigService>,
     pub auth_service: Arc<AuthService>,
+    #[cfg(not(target_os = "android"))]
     pub terminal_service: Arc<TerminalService>,
     pub totp_service: Arc<TotpService>,
     pub scheduler: Arc<Scheduler>,
@@ -231,6 +235,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/configs/auto-backup/config", get(config::get_auto_backup_config))
         .route("/api/configs/auto-backup/config", post(config::update_auto_backup_config))
         .route("/api/configs/auto-backup/test", post(config::test_webdav_connection))
+        .route("/api/configs/auto-backup/backup-now", post(config::backup_now))
         // 订阅管理
         .route(
             "/api/subscriptions",
@@ -245,9 +250,13 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/subscriptions/:id/run", post(subscription::run_subscription))
         // 系统信息
         .route("/api/system/info", get(system::get_system_info))
-        .route("/api/system/webhook-config", get(system::get_webhook_config))
-        // 终端
-        .route("/api/terminal/connect", get(terminal::connect_terminal))
+        .route("/api/system/webhook-config", get(system::get_webhook_config));
+
+    // 终端路由（仅非 Android 平台）
+    #[cfg(not(target_os = "android"))]
+    let protected_routes = protected_routes.route("/api/terminal/connect", get(terminal::connect_terminal));
+
+    let protected_routes = protected_routes
         // TOTP管理
         .route("/api/auth/totp/status", get(auth::get_totp_status))
         .route("/api/auth/totp/setup", post(auth::setup_totp))

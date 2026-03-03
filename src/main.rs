@@ -9,7 +9,10 @@ use anyhow::Result;
 use api::AppState;
 use models::db::init_db;
 use scheduler::{Scheduler, SubscriptionScheduler, BackupScheduler};
-use services::{AuthService, ConfigService, DependenceService, EnvService, Executor, LogService, ScriptService, SubscriptionService, TaskService, TaskGroupService, TerminalService, TotpService};
+use services::{AuthService, ConfigService, DependenceService, EnvService, Executor, LogService, ScriptService, SubscriptionService, TaskService, TaskGroupService, TotpService};
+
+#[cfg(not(target_os = "android"))]
+use services::TerminalService;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
@@ -62,7 +65,10 @@ async fn main() -> Result<()> {
     let mut auth_service = AuthService::new()?;
     auth_service.set_config_service(config_service.clone());
     let auth_service = Arc::new(auth_service);
+
+    #[cfg(not(target_os = "android"))]
     let terminal_service = Arc::new(TerminalService::new(scripts_dir.clone()));
+
     let totp_service = Arc::new(TotpService::new(config_service.clone()));
     let executor = Arc::new(Executor::new(env_service.clone(), config_service.clone()));
 
@@ -135,6 +141,7 @@ async fn main() -> Result<()> {
         subscription_service,
         config_service,
         auth_service,
+        #[cfg(not(target_os = "android"))]
         terminal_service,
         totp_service,
         scheduler,

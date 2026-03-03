@@ -74,16 +74,18 @@ impl BackupScheduler {
         let webdav_username = backup_config.webdav_username.clone();
         let webdav_password = backup_config.webdav_password.clone();
         let remote_path = backup_config.remote_path.clone();
+        let max_backups = backup_config.max_backups;
 
         match Job::new_async_tz(cron_expr.as_str(), chrono::Local, move |_uuid, _l| {
             let url = webdav_url.clone();
             let username = webdav_username.clone();
             let password = webdav_password.clone();
             let path = remote_path.clone();
+            let max = max_backups;
 
             Box::pin(async move {
                 info!("Running scheduled backup...");
-                if let Err(e) = Self::perform_backup(&url, &username, &password, path.as_deref()).await {
+                if let Err(e) = Self::perform_backup(&url, &username, &password, path.as_deref(), max).await {
                     error!("Failed to perform scheduled backup: {}", e);
                 } else {
                     info!("Scheduled backup completed successfully");
@@ -106,15 +108,27 @@ impl BackupScheduler {
         Ok(())
     }
 
+    // 静态方法，供外部调用执行备份
+    pub async fn perform_backup_static(
+        webdav_url: &str,
+        webdav_username: &str,
+        webdav_password: &str,
+        remote_path: Option<&str>,
+        max_backups: Option<u32>,
+    ) -> Result<()> {
+        Self::perform_backup(webdav_url, webdav_username, webdav_password, remote_path, max_backups).await
+    }
+
     async fn perform_backup(
         webdav_url: &str,
         webdav_username: &str,
         webdav_password: &str,
         remote_path: Option<&str>,
+        max_backups: Option<u32>,
     ) -> Result<()> {
         let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "./data".into());
         let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-        let backup_filename = format!("xuanwu_backup_{}.tar.gz", timestamp);
+        let backup_filename = format!("zhuque_backup_{}.tar.gz", timestamp);
 
         // 创建备份文件
         info!("Creating backup archive...");
@@ -146,7 +160,7 @@ impl BackupScheduler {
         let remote_file_path = if let Some(path) = remote_path {
             format!("{}/{}", path.trim_end_matches('/'), backup_filename)
         } else {
-            backup_filename
+            backup_filename.clone()
         };
 
         client.upload_file(&temp_file, &remote_file_path).await?;
@@ -155,6 +169,51 @@ impl BackupScheduler {
         let _ = tokio::fs::remove_file(&temp_file).await;
 
         info!("Backup uploaded to WebDAV: {}", remote_file_path);
+
+        // 清理旧备份
+        if let Some(max) = max_backups {
+            if max > 0 {
+                info!("Cleaning up old backups, keeping latest {} backups", max);
+                if let Err(e) = Self::cleanup_old_backups(&client, remote_path, max).await {
+                    error!("Failed to cleanup old backups: {}", e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn cleanup_old_backups(
+        client: &WebDavClient,
+        remote_path: Option<&str>,
+        max_backups: u32,
+    ) -> Result<()> {
+        let list_path = remote_path.unwrap_or("");
+
+        // 列出所有备份文件
+        let mut files = client.list_files(list_path).await?;
+
+        // 过滤出备份文件（以 zhuque_backup_ 开头，以 .tar.gz 结尾）
+        files.retain(|f| f.name.starts_with("zhuque_backup_") && f.name.ends_with(".tar.gz"));
+
+        // 按文件名排序（文件名包含时间戳，所以可以直接排序）
+        files.sort_by(|a, b| b.name.cmp(&a.name)); // 降序排列，最新的在前面
+
+        // 如果备份数量超过限制，删除旧的备份
+        if files.len() > max_backups as usize {
+            let files_to_delete = &files[max_backups as usize..];
+            info!("Found {} old backups to delete", files_to_delete.len());
+
+            for file in files_to_delete {
+                info!("Deleting old backup: {}", file.name);
+                if let Err(e) = client.delete_file(&file.path).await {
+                    error!("Failed to delete {}: {}", file.name, e);
+                }
+            }
+        } else {
+            info!("No old backups to delete (total: {})", files.len());
+        }
+
         Ok(())
     }
 }

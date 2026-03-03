@@ -150,3 +150,57 @@ pub async fn test_webdav_connection(
 
     Ok(Json(serde_json::json!({ "success": true, "message": "连接成功" })))
 }
+
+// 立即备份到 WebDAV
+pub async fn backup_now(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // 获取自动备份配置
+    let backup_config = state
+        .config_service
+        .get_auto_backup_config()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // 验证配置
+    if backup_config.webdav_url.is_empty()
+        || backup_config.webdav_username.is_empty()
+        || backup_config.webdav_password.is_empty()
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "WebDAV 配置不完整，请先配置 WebDAV 信息".to_string(),
+        ));
+    }
+
+    // 在后台执行备份
+    let webdav_url = backup_config.webdav_url.clone();
+    let webdav_username = backup_config.webdav_username.clone();
+    let webdav_password = backup_config.webdav_password.clone();
+    let remote_path = backup_config.remote_path.clone();
+    let max_backups = backup_config.max_backups;
+
+    tokio::spawn(async move {
+        use crate::scheduler::BackupScheduler;
+        use tracing::{error, info};
+
+        info!("Manual backup triggered");
+        match BackupScheduler::perform_backup_static(
+            &webdav_url,
+            &webdav_username,
+            &webdav_password,
+            remote_path.as_deref(),
+            max_backups,
+        )
+        .await
+        {
+            Ok(_) => info!("Manual backup completed successfully"),
+            Err(e) => error!("Manual backup failed: {}", e),
+        }
+    });
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "备份任务已启动，正在后台执行"
+    })))
+}

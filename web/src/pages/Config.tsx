@@ -59,6 +59,7 @@ const Config: React.FC = () => {
   const [autoBackupForm] = Form.useForm();
   const [autoBackupLoading, setAutoBackupLoading] = useState(false);
   const [testConnectionLoading, setTestConnectionLoading] = useState(false);
+  const [backupNowLoading, setBackupNowLoading] = useState(false);
 
   useEffect(() => {
     loadConfig();
@@ -189,6 +190,26 @@ const Config: React.FC = () => {
     }
   };
 
+  const handleBackupNow = async () => {
+    try {
+      setBackupNowLoading(true);
+      const token = localStorage.getItem('token');
+      await axios.post('/api/configs/auto-backup/backup-now', {}, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+
+      Message.success('备份任务已启动，正在后台执行');
+    } catch (error: any) {
+      if (error.response?.data) {
+        Message.error(error.response.data);
+      } else {
+        Message.error('启动备份失败');
+      }
+    } finally {
+      setBackupNowLoading(false);
+    }
+  };
+
   const formatBytes = (bytes: number): string => {
     if (bytes === 0) return '0 B';
     const k = 1024;
@@ -309,7 +330,7 @@ const Config: React.FC = () => {
       const contentDisposition = response.headers['content-disposition'];
       const filename = contentDisposition
         ? contentDisposition.split('filename=')[1].replace(/"/g, '')
-        : `xuanwu_backup_${new Date().getTime()}.tar.gz`;
+        : `zhuque_backup_${new Date().getTime()}.tar.gz`;
 
       link.setAttribute('download', filename);
       document.body.appendChild(link);
@@ -525,7 +546,15 @@ const Config: React.FC = () => {
 
           <TabPane key="auto-backup" title="自动备份">
             <div style={{ padding: '16px 24px' }}>
-              <div style={{ marginBottom: 16, display: 'flex', justifyContent: 'flex-end' }}>
+              <div style={{ marginBottom: 16, display: 'flex', justifyContent: 'space-between' }}>
+                <Button
+                  type="outline"
+                  icon={<IconDownload />}
+                  loading={backupNowLoading}
+                  onClick={handleBackupNow}
+                >
+                  立即备份
+                </Button>
                 <Button
                   type="primary"
                   icon={<IconSave />}
@@ -604,6 +633,24 @@ const Config: React.FC = () => {
                   extra="支持 5 字段格式（分 时 日 月 周），例如: 0 2 * * * (每天凌晨2点)"
                 >
                   <Input placeholder="0 2 * * *" />
+                </FormItem>
+
+                <Divider />
+
+                <Title heading={6}>备份保留策略</Title>
+
+                <FormItem
+                  label="最大保留备份数"
+                  field="max_backups"
+                  extra="自动删除超过此数量的旧备份，留空表示不限制"
+                >
+                  <Input
+                    type="number"
+                    placeholder="10"
+                    min={1}
+                    max={100}
+                    style={{ width: 200 }}
+                  />
                 </FormItem>
 
                 <div style={{ marginTop: 24 }}>

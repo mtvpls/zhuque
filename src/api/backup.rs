@@ -52,7 +52,7 @@ pub async fn create_backup(
 ) -> Result<impl IntoResponse, StatusCode> {
     let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "./data".into());
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-    let backup_filename = format!("xuanwu_backup_{}.tar.gz", timestamp);
+    let backup_filename = format!("zhuque_backup_{}.tar.gz", timestamp);
 
     info!("Creating backup from: {}", data_dir);
 
@@ -149,7 +149,7 @@ pub async fn restore_backup(
         .parent()
         .and_then(|p| p.to_str())
         .unwrap_or(".");
-    let current_backup_path = format!("{}/xuanwu_before_restore_{}.tar.gz", parent_dir, timestamp);
+    let current_backup_path = format!("{}/zhuque_before_restore_{}.tar.gz", parent_dir, timestamp);
 
     if !current_backup_data.is_empty() {
         if let Err(e) = fs::write(&current_backup_path, &current_backup_data).await {
