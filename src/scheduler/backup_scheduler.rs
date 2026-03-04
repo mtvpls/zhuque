@@ -127,7 +127,7 @@ impl BackupScheduler {
         max_backups: Option<u32>,
     ) -> Result<()> {
         let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "./data".into());
-        let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+        let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
         let backup_filename = format!("zhuque_backup_{}.tar.gz", timestamp);
 
         // 创建备份文件
