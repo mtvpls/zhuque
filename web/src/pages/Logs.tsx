@@ -94,10 +94,7 @@ const Logs: React.FC = () => {
 
     try {
       const startTime = new Date(log.created_at).toLocaleString('zh-CN');
-      const durationText = log.duration
-        ? `\n[执行耗时: ${log.duration}ms (${(log.duration / 1000).toFixed(2)}s)]`
-        : '';
-      setLogContent(`[任务开始时间: ${startTime}]\n${log.output || '无日志输出'}${durationText}`);
+      setLogContent(`[任务开始时间: ${startTime}]\n${log.output || '无日志输出'}`);
     } finally {
       setLogLoading(false);
     }
