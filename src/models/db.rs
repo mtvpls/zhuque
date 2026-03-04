@@ -9,8 +9,25 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool> {
     }
 
     let pool = SqlitePoolOptions::new()
-        .max_connections(5)
+        .max_connections(20)
+        .acquire_timeout(std::time::Duration::from_secs(30))
+        .idle_timeout(std::time::Duration::from_secs(300))
         .connect(&format!("{}?mode=rwc", database_url))
+        .await?;
+
+    // 启用 WAL 模式（Write-Ahead Logging）- 关键！允许并发读写
+    sqlx::query("PRAGMA journal_mode = WAL")
+        .execute(&pool)
+        .await?;
+
+    // 设置繁忙超时（毫秒）- 避免立即失败
+    sqlx::query("PRAGMA busy_timeout = 5000")
+        .execute(&pool)
+        .await?;
+
+    // 同步模式设置为 NORMAL（平衡性能和安全性）
+    sqlx::query("PRAGMA synchronous = NORMAL")
+        .execute(&pool)
         .await?;
 
     // 启用增量自动压缩

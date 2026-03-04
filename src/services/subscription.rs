@@ -126,16 +126,19 @@ impl SubscriptionService {
     }
 
     pub async fn delete(&self, id: i64) -> Result<bool> {
-        let pool = self.db_pool.read().await;
+        // 先获取订阅信息（不持有锁）
+        let sub = self.get(id).await?;
 
         // 删除订阅目录
-        if let Some(sub) = self.get(id).await? {
+        if let Some(sub) = sub {
             let sub_dir = self.base_path.join(&sub.name);
             if sub_dir.exists() {
                 tokio::fs::remove_dir_all(sub_dir).await.ok();
             }
         }
 
+        // 再获取连接执行删除操作
+        let pool = self.db_pool.read().await;
         let result = sqlx::query("DELETE FROM subscriptions WHERE id = ?")
             .bind(id)
             .execute(&*pool)
@@ -367,20 +370,23 @@ impl SubscriptionService {
         status: &str,
         log: Option<&str>,
     ) -> Result<()> {
-        let pool = db_pool.read().await;
-        sqlx::query(
-            r#"
-            UPDATE subscriptions
-            SET last_run_time = ?, last_run_status = ?, last_run_log = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-            "#
-        )
-        .bind(Utc::now())
-        .bind(status)
-        .bind(log)
-        .bind(id)
-        .execute(&*pool)
-        .await?;
+        // 获取连接，执行更新，立即释放
+        {
+            let pool = db_pool.read().await;
+            sqlx::query(
+                r#"
+                UPDATE subscriptions
+                SET last_run_time = ?, last_run_status = ?, last_run_log = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                "#
+            )
+            .bind(Utc::now())
+            .bind(status)
+            .bind(log)
+            .bind(id)
+            .execute(&*pool)
+            .await?;
+        } // 锁在这里被释放
         Ok(())
     }
 

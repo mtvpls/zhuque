@@ -132,15 +132,21 @@ impl BackupScheduler {
 
         // 创建备份文件
         info!("Creating backup archive...");
-        let mut tar_gz_data = Vec::new();
-        {
-            let encoder = GzEncoder::new(&mut tar_gz_data, Compression::default());
-            let mut tar = Builder::new(encoder);
-            tar.append_dir_all("data", &data_dir)
-                .map_err(|e| anyhow::anyhow!("Failed to create tar archive: {}", e))?;
-            tar.finish()
-                .map_err(|e| anyhow::anyhow!("Failed to finish tar archive: {}", e))?;
-        }
+
+        // 在后台线程中执行阻塞的 tar 操作，避免阻塞 tokio 运行时
+        let data_dir_clone = data_dir.clone();
+        let tar_gz_data = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+            let mut tar_gz_data = Vec::new();
+            {
+                let encoder = GzEncoder::new(&mut tar_gz_data, Compression::default());
+                let mut tar = Builder::new(encoder);
+                tar.append_dir_all("data", &data_dir_clone)
+                    .map_err(|e| anyhow::anyhow!("Failed to create tar archive: {}", e))?;
+                tar.finish()
+                    .map_err(|e| anyhow::anyhow!("Failed to finish tar archive: {}", e))?;
+            }
+            Ok(tar_gz_data)
+        }).await??;
 
         // 保存到临时文件
         let temp_dir = std::env::temp_dir();

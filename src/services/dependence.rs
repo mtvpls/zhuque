@@ -318,33 +318,40 @@ impl DependenceService {
             DependenceType::Linux => Self::install_linux(&dep.name).await,
         };
 
+        // 执行完系统命令后再获取连接更新数据库
         match result {
             Ok(log_lines) => {
                 info!("Dependency {} installed successfully", dep.name);
                 let log_json = Dependence::set_log_lines(log_lines);
-                sqlx::query(
-                    "UPDATE dependences SET status = ?, log = ?, updated_at = ? WHERE id = ?",
-                )
-                .bind(DependenceStatus::Installed.to_i32())
-                .bind(log_json)
-                .bind(Utc::now())
-                .bind(dep.id)
-                .execute(&*pool.read().await)
-                .await?;
+                {
+                    let pool_guard = pool.read().await;
+                    sqlx::query(
+                        "UPDATE dependences SET status = ?, log = ?, updated_at = ? WHERE id = ?",
+                    )
+                    .bind(DependenceStatus::Installed.to_i32())
+                    .bind(log_json)
+                    .bind(Utc::now())
+                    .bind(dep.id)
+                    .execute(&*pool_guard)
+                    .await?;
+                }
             }
             Err(e) => {
                 error!("Failed to install dependency {}: {}", dep.name, e);
                 let error_lines = vec![format!("Error: {}", e)];
                 let log_json = Dependence::set_log_lines(error_lines);
-                sqlx::query(
-                    "UPDATE dependences SET status = ?, log = ?, updated_at = ? WHERE id = ?",
-                )
-                .bind(DependenceStatus::Failed.to_i32())
-                .bind(log_json)
-                .bind(Utc::now())
-                .bind(dep.id)
-                .execute(&*pool.read().await)
-                .await?;
+                {
+                    let pool_guard = pool.read().await;
+                    sqlx::query(
+                        "UPDATE dependences SET status = ?, log = ?, updated_at = ? WHERE id = ?",
+                    )
+                    .bind(DependenceStatus::Failed.to_i32())
+                    .bind(log_json)
+                    .bind(Utc::now())
+                    .bind(dep.id)
+                    .execute(&*pool_guard)
+                    .await?;
+                }
             }
         }
 

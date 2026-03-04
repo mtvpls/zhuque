@@ -74,14 +74,17 @@ mod terminal_impl {
 
         // 从 PTY 读取并发送到 WebSocket
         let session_id_clone = session_id.clone();
-        let read_task = tokio::spawn(async move {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
+
+        // 在 blocking 线程中读取 PTY
+        tokio::task::spawn_blocking(move || {
             let mut buffer = [0u8; 8192];
             loop {
                 match reader.read(&mut buffer) {
                     Ok(n) if n > 0 => {
-                        let data = &buffer[..n];
-                        if let Err(e) = sender.send(Message::Binary(data.to_vec())).await {
-                            tracing::error!("Failed to send to websocket: {}", e);
+                        let data = buffer[..n].to_vec();
+                        if tx.blocking_send(data).is_err() {
+                            tracing::error!("Failed to send data through channel");
                             break;
                         }
                     }
@@ -95,6 +98,18 @@ mod terminal_impl {
                     }
                 }
             }
+        });
+
+        // 从 channel 接收数据并发送到 WebSocket
+        let session_id_clone2 = session_id.clone();
+        let read_task = tokio::spawn(async move {
+            while let Some(data) = rx.recv().await {
+                if let Err(e) = sender.send(Message::Binary(data)).await {
+                    tracing::error!("Failed to send to websocket: {}", e);
+                    break;
+                }
+            }
+            tracing::info!("Read task finished for session: {}", session_id_clone2);
         });
 
         // 从 WebSocket 读取并写入到 PTY

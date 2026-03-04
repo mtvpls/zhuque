@@ -63,30 +63,33 @@ pub async fn create_backup(
         .unwrap_or(".");
     let backup_path = format!("{}/{}", parent_dir, backup_filename);
 
-    // 创建备份文件
-    let backup_file = std::fs::File::create(&backup_path).map_err(|e| {
-        error!("Failed to create backup file: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    // 在后台线程中执行阻塞的 tar 操作，避免阻塞 tokio 运行时
+    let backup_path_clone = backup_path.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
+        // 创建备份文件
+        let backup_file = std::fs::File::create(&backup_path_clone)?;
 
-    {
         let encoder = GzEncoder::new(backup_file, Compression::default());
         let mut tar = Builder::new(encoder);
 
         // 递归添加 data 目录下的所有文件
         let data_path = std::path::Path::new(&data_dir);
         if data_path.exists() {
-            tar.append_dir_all("data", &data_dir).map_err(|e| {
-                error!("Failed to add directory to tar: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+            tar.append_dir_all("data", data_path)?;
         }
 
-        tar.finish().map_err(|e| {
-            error!("Failed to finish tar: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    }
+        tar.finish()?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| {
+        error!("Task join error: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .map_err(|e| {
+        error!("Failed to create backup: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     // 读取备份文件
     let backup_data = fs::read(&backup_path).await.map_err(|e| {
