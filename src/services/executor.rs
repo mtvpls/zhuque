@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{broadcast, RwLock};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use uuid::Uuid;
 
 /// 辅助结构体：处理 \r 和 \n 作为行分隔符的读取器
@@ -122,20 +122,20 @@ impl Executor {
         let project_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let scripts_dir = project_root.join("data/scripts");
 
-        info!("get_working_directory_from_command - command: {}", command);
+        debug!("get_working_directory_from_command - command: {}", command);
 
         // 检查是否是单行命令
         if command.lines().count() != 1 {
-            info!("Multi-line command, using scripts_dir");
+            debug!("Multi-line command, using scripts_dir");
             return scripts_dir;
         }
 
         // 解析命令，提取脚本路径
         let parts: Vec<&str> = command.trim().split_whitespace().collect();
-        info!("Command parts: {:?}", parts);
+        debug!("Command parts: {:?}", parts);
 
         if parts.is_empty() {
-            info!("Empty command, using scripts_dir");
+            debug!("Empty command, using scripts_dir");
             return scripts_dir;
         }
 
@@ -144,7 +144,7 @@ impl Executor {
             part.ends_with(".py") || part.ends_with(".js") || part.ends_with(".sh")
         });
 
-        info!("Found script_path: {:?}", script_path);
+        debug!("Found script_path: {:?}", script_path);
 
         if let Some(script) = script_path {
             let script_path = std::path::Path::new(script);
@@ -152,21 +152,21 @@ impl Executor {
             // 如果是绝对路径，返回脚本所在目录
             if script_path.is_absolute() {
                 if let Some(parent) = script_path.parent() {
-                    info!("Absolute path, parent: {:?}", parent);
+                    debug!("Absolute path, parent: {:?}", parent);
                     return parent.to_path_buf();
                 }
             } else {
                 // 相对路径，以 scripts 为基础
                 let full_path = scripts_dir.join(script_path);
-                info!("Relative path, full_path: {:?}", full_path);
+                debug!("Relative path, full_path: {:?}", full_path);
                 if let Some(parent) = full_path.parent() {
-                    info!("Returning parent: {:?}", parent);
+                    debug!("Returning parent: {:?}", parent);
                     return parent.to_path_buf();
                 }
             }
         }
 
-        info!("No script found, using scripts_dir");
+        debug!("No script found, using scripts_dir");
         scripts_dir
     }
 
@@ -174,18 +174,18 @@ impl Executor {
         let project_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let scripts_dir = project_root.join("data/scripts");
 
-        info!("adjust_command_for_working_dir - command: {}, working_dir: {:?}, scripts_dir: {:?}", command, working_dir, scripts_dir);
+        debug!("adjust_command_for_working_dir - command: {}, working_dir: {:?}, scripts_dir: {:?}", command, working_dir, scripts_dir);
 
         // 检查是否是单行命令
         if command.lines().count() != 1 {
-            info!("Multi-line command, no adjustment");
+            debug!("Multi-line command, no adjustment");
             return command.to_string();
         }
 
         // 解析命令
         let parts: Vec<&str> = command.trim().split_whitespace().collect();
         if parts.is_empty() {
-            info!("Empty command, no adjustment");
+            debug!("Empty command, no adjustment");
             return command.to_string();
         }
 
@@ -198,7 +198,7 @@ impl Executor {
         for (i, part) in parts.iter().enumerate() {
             if part.ends_with(".py") || part.ends_with(".js") || part.ends_with(".sh") {
                 let script_path = std::path::Path::new(part);
-                info!("Found script at index {}: {}, is_absolute: {}", i, part, script_path.is_absolute());
+                debug!("Found script at index {}: {}, is_absolute: {}", i, part, script_path.is_absolute());
                 found_script = true;
                 is_python_script = part.ends_with(".py");
                 script_index = i;
@@ -210,7 +210,7 @@ impl Executor {
                         if i == 0 {
                             if !part.starts_with("./") {
                                 let adjusted = format!("./{}", part);
-                                info!("Adding ./ prefix: {} to {}", part, adjusted);
+                                debug!("Adding ./ prefix: {} to {}", part, adjusted);
                                 adjusted_parts[i] = adjusted;
                             }
                         }
@@ -228,7 +228,7 @@ impl Executor {
                                 } else {
                                     name_str.to_string()
                                 };
-                                info!("Adjusting {} to {}", part, adjusted);
+                                debug!("Adjusting {} to {}", part, adjusted);
                                 adjusted_parts[i] = adjusted;
                             }
                         }
@@ -253,14 +253,14 @@ impl Executor {
                 adjusted_parts.push("-u".to_string());
                 adjusted_parts.push(script_path);
                 adjusted_parts.extend(remaining_args);
-                info!("Converted direct Python script execution to: {} -u", PYTHON_CMD.as_str());
+                debug!("Converted direct Python script execution to: {} -u", PYTHON_CMD.as_str());
             } else if has_python_cmd {
                 // 命令中已有python，添加-u参数
                 for (i, part) in adjusted_parts.clone().iter().enumerate() {
                     if part == "python" || part == "python3" || part.ends_with("/python") || part.ends_with("/python3") {
                         if i + 1 < adjusted_parts.len() && adjusted_parts[i + 1] != "-u" {
                             adjusted_parts.insert(i + 1, "-u".to_string());
-                            info!("Added -u flag to python command");
+                            debug!("Added -u flag to python command");
                         }
                         break;
                     }
@@ -269,7 +269,7 @@ impl Executor {
         }
 
         let result = adjusted_parts.join(" ");
-        info!("Adjusted command result: {}", result);
+        debug!("Adjusted command result: {}", result);
         result
     }
 
@@ -307,7 +307,7 @@ impl Executor {
                         let mode = perms.mode();
                         perms.set_mode(mode | 0o111); // 添加执行权限
                         let _ = tokio::fs::set_permissions(&full_path, perms).await;
-                        info!("Set executable permission for: {:?}", full_path);
+                        debug!("Set executable permission for: {:?}", full_path);
                     }
                 }
             }
@@ -318,7 +318,7 @@ impl Executor {
     pub async fn execute(&self, task: &Task) -> Result<(String, String, bool)> {
         let execution_id = Uuid::new_v4().to_string();
         let start_time = std::time::Instant::now();
-        info!("Executing task: {} ({}) with execution_id: {}", task.name, task.command, execution_id);
+        debug!("Executing task: {} ({}) with execution_id: {}", task.name, task.command, execution_id);
 
         // 创建广播通道和日志缓存
         let (tx, _) = broadcast::channel(100);
@@ -346,7 +346,7 @@ impl Executor {
             tokio::fs::create_dir_all(&working_dir).await?;
         }
 
-        info!("Working directory: {:?}", working_dir);
+        debug!("Working directory: {:?}", working_dir);
 
         let mut output = String::new();
         let mut overall_success = true;
@@ -354,7 +354,7 @@ impl Executor {
         // 执行前置命令
         if let Some(pre_cmd) = &task.pre_command {
             if !pre_cmd.trim().is_empty() {
-                info!("Executing pre-command: {}", pre_cmd);
+                debug!("Executing pre-command: {}", pre_cmd);
                 let _ = tx.send(format!("[PRE] Executing: {}", pre_cmd));
 
                 match self.execute_command(pre_cmd, &env_vars, &tx, &working_dir).await {
@@ -389,7 +389,7 @@ impl Executor {
         }
 
         // 执行主命令
-        info!("Executing main command: {}", task.command);
+        debug!("Executing main command: {}", task.command);
         let _ = tx.send(format!("[MAIN] Executing: {}", task.command));
 
         // 给脚本文件添加执行权限
@@ -397,7 +397,7 @@ impl Executor {
 
         // 调整命令以适应工作目录
         let adjusted_command = self.adjust_command_for_working_dir(&task.command, &working_dir);
-        info!("Adjusted command: {}", adjusted_command);
+        debug!("Adjusted command: {}", adjusted_command);
 
         let mut child = Command::new("sh")
             .arg("-c")
@@ -496,7 +496,7 @@ impl Executor {
         // 执行后置命令（无论主命令成功与否都执行，用于清理工作）
         if let Some(post_cmd) = &task.post_command {
             if !post_cmd.trim().is_empty() {
-                info!("Executing post-command: {}", post_cmd);
+                debug!("Executing post-command: {}", post_cmd);
                 let _ = tx.send(format!("[POST] Executing: {}", post_cmd));
 
                 match self.execute_command(post_cmd, &env_vars, &tx, &working_dir).await {
@@ -546,7 +546,7 @@ impl Executor {
         task: &Task,
     ) -> Result<(String, impl tokio_stream::Stream<Item = Result<String>>)> {
         let execution_id = Uuid::new_v4().to_string();
-        info!("Executing task with stream: {} ({}) with execution_id: {}", task.name, task.command, execution_id);
+        debug!("Executing task with stream: {} ({}) with execution_id: {}", task.name, task.command, execution_id);
 
         // 创建广播通道和日志缓存
         let (tx, _) = broadcast::channel(100);
