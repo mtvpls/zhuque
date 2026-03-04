@@ -231,5 +231,16 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool> {
         .await
         .ok(); // 忽略错误
 
+    // 插入默认配置（如果不存在）
+    sqlx::query(
+        r#"
+        INSERT OR IGNORE INTO system_configs (key, value, description)
+        VALUES ('log_retention_days', '30', '日志保留天数')
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .ok();
+
     Ok(pool)
 }

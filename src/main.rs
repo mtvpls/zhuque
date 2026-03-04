@@ -9,7 +9,7 @@ use anyhow::Result;
 use api::AppState;
 use models::db::init_db;
 use scheduler::{Scheduler, SubscriptionScheduler, BackupScheduler};
-use services::{AuthService, ConfigService, DependenceService, EnvService, Executor, LogService, ScriptService, SubscriptionService, TaskService, TaskGroupService, TotpService};
+use services::{AuthService, ConfigService, DependenceService, EnvService, Executor, LogService, ScriptService, SubscriptionService, SystemLogCollector, TaskService, TaskGroupService, TotpService};
 
 #[cfg(not(target_os = "android"))]
 use services::TerminalService;
@@ -29,13 +29,27 @@ pub static MALLOC_CONF: &[u8] = b"dirty_decay_ms:10000,muzzy_decay_ms:10000,back
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // 创建日志目录
+    let log_dir = PathBuf::from("./logs");
+    tokio::fs::create_dir_all(&log_dir).await?;
+
+    // 创建文件日志 appender（每天滚动）
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "zhuque.log");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
+    // 创建系统日志收集器
+    let system_log_collector = SystemLogCollector::new(100);
+    let log_layer = services::system_log::SystemLogLayer::new(system_log_collector.clone());
+
     // 初始化日志
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "zhuque=info,tower_http=info".into()),
         )
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer()) // 控制台输出
+        .with(tracing_subscriber::fmt::layer().with_writer(non_blocking)) // 文件输出
+        .with(log_layer)
         .init();
 
     info!("Starting Zhuque...");
@@ -181,6 +195,7 @@ async fn main() -> Result<()> {
         subscription_scheduler,
         backup_scheduler,
         db_pool: shared_pool,
+        system_log_collector,
     });
 
     // 创建路由

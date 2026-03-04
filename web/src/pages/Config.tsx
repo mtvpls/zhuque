@@ -17,6 +17,7 @@ import {
 import { IconSave, IconDownload, IconUpload } from '@arco-design/web-react/icon';
 import axios from 'axios';
 import TotpSettings from '@/components/TotpSettings';
+import { getSystemLogs, type SystemLogEntry } from '@/api/systemLog';
 
 const FormItem = Form.Item;
 const { Title, Text } = Typography;
@@ -60,6 +61,8 @@ const Config: React.FC = () => {
   const [autoBackupLoading, setAutoBackupLoading] = useState(false);
   const [testConnectionLoading, setTestConnectionLoading] = useState(false);
   const [backupNowLoading, setBackupNowLoading] = useState(false);
+  const [systemLogs, setSystemLogs] = useState<SystemLogEntry[]>([]);
+  const [systemLogsLoading, setSystemLogsLoading] = useState(false);
 
   useEffect(() => {
     loadConfig();
@@ -67,6 +70,29 @@ const Config: React.FC = () => {
     loadAutoBackupConfig();
     if (activeTab === 'system') {
       loadSystemInfo();
+    }
+    if (activeTab === 'systemlogs') {
+      loadSystemLogs();
+      // 启动 SSE 连接
+      const token = localStorage.getItem('token');
+      const eventSource = new EventSource(`/api/system/logs/stream?token=${token}`);
+
+      eventSource.onmessage = (event) => {
+        try {
+          const logs = JSON.parse(event.data);
+          setSystemLogs(logs);
+        } catch (error) {
+          console.error('Failed to parse log data:', error);
+        }
+      };
+
+      eventSource.onerror = () => {
+        eventSource.close();
+      };
+
+      return () => {
+        eventSource.close();
+      };
     }
   }, [activeTab]);
 
@@ -207,6 +233,18 @@ const Config: React.FC = () => {
       }
     } finally {
       setBackupNowLoading(false);
+    }
+  };
+
+  const loadSystemLogs = async () => {
+    try {
+      setSystemLogsLoading(true);
+      const data = await getSystemLogs();
+      setSystemLogs(data.logs);
+    } catch (error: any) {
+      Message.error('加载系统日志失败');
+    } finally {
+      setSystemLogsLoading(false);
     }
   };
 
@@ -844,6 +882,71 @@ const Config: React.FC = () => {
                   )}
                 </Space>
               </Spin>
+            </div>
+          </TabPane>
+
+          <TabPane key="systemlogs" title="系统日志">
+            <div style={{ padding: '16px 24px' }}>
+              <Space direction="vertical" style={{ width: '100%' }} size="large">
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <Typography.Title heading={6}>系统运行日志（最近100条）</Typography.Title>
+                </div>
+
+                <Spin loading={systemLogsLoading}>
+                  <div
+                    style={{
+                      backgroundColor: '#1e1e1e',
+                      color: '#d4d4d4',
+                      padding: '16px',
+                      borderRadius: '4px',
+                      fontFamily: 'Consolas, Monaco, "Courier New", monospace',
+                      fontSize: '13px',
+                      lineHeight: '1.6',
+                      maxHeight: '600px',
+                      overflowY: 'auto',
+                      whiteSpace: 'pre-wrap',
+                      wordBreak: 'break-word',
+                    }}
+                  >
+                    {systemLogs.length === 0 ? (
+                      <div style={{ color: '#888', textAlign: 'center', padding: '20px' }}>
+                        暂无日志
+                      </div>
+                    ) : (
+                      systemLogs.map((log, index) => {
+                        const date = new Date(log.timestamp);
+                        const timeStr = date.toLocaleString('zh-CN', {
+                          month: '2-digit',
+                          day: '2-digit',
+                          hour: '2-digit',
+                          minute: '2-digit',
+                          second: '2-digit',
+                        });
+
+                        let levelColor = '#4fc3f7';
+                        if (log.level === 'ERROR') levelColor = '#f44336';
+                        else if (log.level === 'WARN') levelColor = '#ff9800';
+                        else if (log.level === 'INFO') levelColor = '#4caf50';
+                        else if (log.level === 'DEBUG') levelColor = '#9e9e9e';
+
+                        return (
+                          <div key={index} style={{ marginBottom: '4px' }}>
+                            <span style={{ color: '#888' }}>[{timeStr}]</span>
+                            {' '}
+                            <span style={{ color: levelColor, fontWeight: 'bold' }}>
+                              {log.level.padEnd(5)}
+                            </span>
+                            {' '}
+                            <span style={{ color: '#888' }}>{log.target}</span>
+                            {' - '}
+                            <span>{log.message}</span>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+                </Spin>
+              </Space>
             </div>
           </TabPane>
 

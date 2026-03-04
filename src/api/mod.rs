@@ -7,13 +7,14 @@ pub mod log;
 pub mod script;
 pub mod subscription;
 pub mod system;
+pub mod system_log;
 pub mod task;
 pub mod task_group;
 pub mod terminal;
 
 use crate::middleware::{auth_middleware, webhook_auth_middleware};
 use crate::scheduler::{Scheduler, SubscriptionScheduler, BackupScheduler};
-use crate::services::{AuthService, ConfigService, DependenceService, EnvService, LogService, ScriptService, SubscriptionService, TaskService, TaskGroupService, TotpService};
+use crate::services::{AuthService, ConfigService, DependenceService, EnvService, LogService, ScriptService, SubscriptionService, SystemLogCollector, TaskService, TaskGroupService, TotpService};
 
 #[cfg(not(target_os = "android"))]
 use crate::services::TerminalService;
@@ -49,6 +50,7 @@ pub struct AppState {
     pub subscription_scheduler: Arc<SubscriptionScheduler>,
     pub backup_scheduler: Option<Arc<BackupScheduler>>,
     pub db_pool: Arc<RwLock<SqlitePool>>,
+    pub system_log_collector: SystemLogCollector,
 }
 
 impl AppState {
@@ -252,7 +254,9 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/subscriptions/:id/run", post(subscription::run_subscription))
         // 系统信息
         .route("/api/system/info", get(system::get_system_info))
-        .route("/api/system/webhook-config", get(system::get_webhook_config));
+        .route("/api/system/webhook-config", get(system::get_webhook_config))
+        .route("/api/system/logs", get(system_log::get_system_logs))
+        .route("/api/system/logs/stream", get(system_log::stream_system_logs));
 
     // 终端路由（仅非 Android 平台）
     #[cfg(not(target_os = "android"))]
