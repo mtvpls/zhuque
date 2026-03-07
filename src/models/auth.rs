@@ -1,4 +1,11 @@
 use serde::{Deserialize, Serialize};
+use chrono::{DateTime, Utc};
+use sqlx::FromRow;
+use axum::{
+    async_trait,
+    extract::FromRequestParts,
+    http::{request::Parts, StatusCode},
+};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LoginRequest {
@@ -43,9 +50,53 @@ pub struct TotpStatusResponse {
     pub enabled: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: String, // username or session:username
     pub exp: i64,    // 过期时间
     pub iat: i64,    // 签发时间
+}
+
+// Axum extractor for Claims
+#[async_trait]
+impl<S> FromRequestParts<S> for Claims
+where
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, &'static str);
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        parts
+            .extensions
+            .get::<Claims>()
+            .cloned()
+            .ok_or((StatusCode::UNAUTHORIZED, "Unauthorized"))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct User {
+    pub id: i64,
+    pub username: String,
+    #[serde(skip_serializing)]  // 永远不序列化密码哈希
+    pub password_hash: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InitialSetupRequest {
+    pub username: String,
+    pub password: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InitialSetupStatusResponse {
+    pub needs_setup: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UpdatePasswordRequest {
+    pub old_password: String,
+    pub new_password: String,
 }

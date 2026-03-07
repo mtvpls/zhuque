@@ -1,6 +1,7 @@
 import { createBrowserRouter, Navigate } from 'react-router-dom';
 import BasicLayout from '@/layouts/BasicLayout';
 import Login from '@/pages/Login';
+import InitialSetup from '@/pages/InitialSetup';
 import Dashboard from '@/pages/Dashboard';
 import Tasks from '@/pages/Tasks';
 import Scripts from '@/pages/Scripts';
@@ -12,6 +13,10 @@ import Config from '@/pages/Config';
 import Terminal from '@/pages/Terminal';
 
 const router = createBrowserRouter([
+  {
+    path: '/setup',
+    element: <InitialSetup />,
+  },
   {
     path: '/login',
     element: <Login />,

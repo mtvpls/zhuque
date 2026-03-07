@@ -1,5 +1,5 @@
 use crate::models::{Claims, LoginRequest, LoginResponse, LoginStepOneResponse};
-use crate::services::ConfigService;
+use crate::services::{ConfigService, UserService};
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
@@ -11,19 +11,13 @@ const TOKEN_EXPIRATION_DAYS: i64 = 7;
 const SESSION_TOKEN_EXPIRATION: i64 = 300; // 5分钟
 
 pub struct AuthService {
-    username: String,
-    password: String,
     jwt_secret: String,
     config_service: Option<Arc<ConfigService>>,
+    user_service: Arc<UserService>,
 }
 
 impl AuthService {
-    pub fn new() -> Result<Self> {
-        let username = std::env::var("AUTH_USERNAME")
-            .unwrap_or_else(|_| "admin".to_string());
-        let password = std::env::var("AUTH_PASSWORD")
-            .unwrap_or_else(|_| "admin".to_string());
-
+    pub fn new(user_service: Arc<UserService>) -> Result<Self> {
         let jwt_secret = match std::env::var("JWT_SECRET") {
             Ok(secret) if !secret.is_empty() => {
                 info!("Using JWT_SECRET from environment variable");
@@ -37,10 +31,9 @@ impl AuthService {
         };
 
         Ok(Self {
-            username,
-            password,
             jwt_secret,
             config_service: None,
+            user_service,
         })
     }
 
@@ -50,8 +43,8 @@ impl AuthService {
 
     /// 第一步登录：验证用户名密码
     pub async fn login_step_one(&self, request: &LoginRequest) -> Result<LoginStepOneResponse> {
-        // 验证用户名密码
-        if request.username != self.username || request.password != self.password {
+        // 使用 UserService 验证用户名密码
+        if !self.user_service.verify_password(&request.username, &request.password).await? {
             return Err(anyhow!("Invalid username or password"));
         }
 
@@ -149,16 +142,6 @@ impl AuthService {
             token,
             expires_in,
         })
-    }
-
-    /// 保留原有的login方法以保持兼容性
-    pub fn login(&self, request: &LoginRequest) -> Result<LoginResponse> {
-        // 验证用户名密码
-        if request.username != self.username || request.password != self.password {
-            return Err(anyhow!("Invalid username or password"));
-        }
-
-        self.generate_jwt_token(&request.username)
     }
 
     pub fn verify_token(&self, token: &str) -> Result<Claims> {

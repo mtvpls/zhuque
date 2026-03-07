@@ -75,28 +75,65 @@ const TotpSettings: React.FC = () => {
   };
 
   const handleDisable = () => {
+    let disableCode = '';
     Modal.confirm({
       title: '确认禁用TOTP',
-      content: '禁用后，登录将不再需要验证码。确定要禁用吗？',
+      content: (
+        <div>
+          <p style={{ marginBottom: 16 }}>禁用后，登录将不再需要验证码。</p>
+          <p style={{ marginBottom: 8, fontWeight: 'bold' }}>请输入TOTP验证码以确认：</p>
+          <Input
+            placeholder="请输入6位验证码"
+            maxLength={6}
+            onChange={(value) => {
+              disableCode = value;
+            }}
+            autoFocus
+          />
+        </div>
+      ),
       onOk: async () => {
+        if (!disableCode || disableCode.length !== 6) {
+          Message.error('请输入6位验证码');
+          return Promise.reject();
+        }
         try {
-          await authApi.disableTotp();
+          await authApi.disableTotp(disableCode);
           Message.success('TOTP已禁用');
           setEnabled(false);
-        } catch (error) {
-          Message.error('禁用失败');
+        } catch (error: any) {
+          Message.error(error.response?.data || '禁用失败，请检查验证码');
+          return Promise.reject();
         }
       },
     });
   };
 
   const handleRegenerateBackupCodes = () => {
+    let regenerateCode = '';
     Modal.confirm({
       title: '重新生成备用码',
-      content: '重新生成后，旧的备用码将失效。确定要继续吗？',
+      content: (
+        <div>
+          <p style={{ marginBottom: 16 }}>重新生成后，旧的备用码将失效。</p>
+          <p style={{ marginBottom: 8, fontWeight: 'bold' }}>请输入TOTP验证码以确认：</p>
+          <Input
+            placeholder="请输入6位验证码"
+            maxLength={6}
+            onChange={(value) => {
+              regenerateCode = value;
+            }}
+            autoFocus
+          />
+        </div>
+      ),
       onOk: async () => {
+        if (!regenerateCode || regenerateCode.length !== 6) {
+          Message.error('请输入6位验证码');
+          return Promise.reject();
+        }
         try {
-          const res = await authApi.regenerateBackupCodes();
+          const res = await authApi.regenerateBackupCodes(regenerateCode);
           Modal.info({
             title: '新的备用恢复码',
             content: (
@@ -116,8 +153,9 @@ const TotpSettings: React.FC = () => {
               </div>
             ),
           });
-        } catch (error) {
-          Message.error('重新生成失败');
+        } catch (error: any) {
+          Message.error(error.response?.data || '重新生成失败，请检查验证码');
+          return Promise.reject();
         }
       },
     });

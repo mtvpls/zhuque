@@ -242,5 +242,67 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool> {
     .await
     .ok();
 
+    // 创建用户表
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
+        .execute(&pool)
+        .await?;
+
+    // 数据迁移：从环境变量迁移到数据库（一次性操作）
+    migrate_auth_from_env(&pool).await?;
+
     Ok(pool)
+}
+
+use bcrypt::{hash, DEFAULT_COST};
+use tracing::info;
+
+async fn migrate_auth_from_env(pool: &SqlitePool) -> Result<()> {
+    // 检查是否已有用户
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
+        .fetch_one(pool)
+        .await?;
+
+    if count.0 > 0 {
+        info!("Users table already has data, skipping migration");
+        return Ok(());
+    }
+
+    // 从环境变量读取（仅用于一次性迁移）
+    let username = std::env::var("AUTH_USERNAME").ok();
+    let password = std::env::var("AUTH_PASSWORD").ok();
+
+    if let (Some(username), Some(password)) = (username, password) {
+        info!("Migrating credentials from environment variables to database");
+
+        let password_hash = hash(&password, DEFAULT_COST)
+            .map_err(|e| anyhow::anyhow!("Failed to hash password: {}", e))?;
+
+        sqlx::query("INSERT INTO users (username, password_hash) VALUES (?, ?)")
+            .bind(&username)
+            .bind(&password_hash)
+            .execute(pool)
+            .await?;
+
+        info!("✓ Migration completed: user '{}' created", username);
+        info!("⚠ Please remove AUTH_USERNAME and AUTH_PASSWORD from environment variables");
+        info!("  These variables are now deprecated and will not be used in future startups");
+    } else {
+        info!("No environment variables found, initial setup will be required");
+    }
+
+    Ok(())
 }

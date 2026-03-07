@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Form, Input, Button, Card, Message } from '@arco-design/web-react';
 import { IconLock, IconUser } from '@arco-design/web-react/icon';
@@ -18,6 +18,19 @@ const Login: React.FC = () => {
   const { setToken } = useUserStore();
   const [form] = Form.useForm();
   const [totpForm] = Form.useForm();
+
+  // 检查是否需要初始设置
+  useEffect(() => {
+    authApi.checkInitialSetup()
+      .then(res => {
+        if (res.needs_setup) {
+          navigate('/setup');
+        }
+      })
+      .catch(() => {
+        // 忽略错误，继续显示登录页面
+      });
+  }, [navigate]);
 
   const handleCredentialsSubmit = async (values: any) => {
     setLoading(true);

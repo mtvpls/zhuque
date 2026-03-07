@@ -61,13 +61,11 @@ docker run -d \
   --name zhuque \
   -p 3000:3000 \
   -v $(pwd)/data:/app/data \
-  -e AUTH_USERNAME=admin \
-  -e AUTH_PASSWORD=your_password \
   -e TZ=Asia/Shanghai \
   ghcr.io/mtvpls/zhuque:latest
 ```
 
-访问 `http://localhost:3000`，使用设置的用户名密码登录。
+首次访问 `http://localhost:3000` 会自动跳转到初始设置页面，设置管理员账号和密码。
 
 或使用 Docker Compose：
 
@@ -113,15 +111,13 @@ docker run -d \
   --name zhuque \
   -p 3000:3000 \
   -v $(pwd)/data:/app/data \
-  -e AUTH_USERNAME=admin \
-  -e AUTH_PASSWORD=your_secure_password \
   -e RUST_LOG=info \
   -e TZ=Asia/Shanghai \
   --restart unless-stopped \
   ghcr.io/mtvpls/zhuque:latest
 ```
 
-> **重要提示：** 生产环境请务必修改 `AUTH_PASSWORD` 为强密码！
+> **首次启动：** 访问 `http://localhost:3000` 会自动跳转到初始设置页面，请设置管理员账号和强密码。
 
 #### 方式二：Docker Compose
 
@@ -144,8 +140,6 @@ npm run build
 
 3. 设置环境变量（可选，创建 `.env` 文件或直接导出）
 ```bash
-export AUTH_USERNAME=admin
-export AUTH_PASSWORD=your_secure_password
 export RUST_LOG=info
 export TZ=Asia/Shanghai
 ```
@@ -157,7 +151,7 @@ export TZ=Asia/Shanghai
 
 后端会自动服务前端静态文件。
 
-> **重要提示：** 生产环境请务必修改 `AUTH_PASSWORD` 为强密码！
+> **首次启动：** 访问 `http://localhost:3000` 会自动跳转到初始设置页面，请设置管理员账号和强密码。
 
 ## 📁 项目结构
 
@@ -255,8 +249,6 @@ xuanwu/
 
 | 变量名 | 说明 | 默认值 | 必填 |
 |--------|------|--------|------|
-| `AUTH_USERNAME` | 管理员用户名 | `admin` | 否 |
-| `AUTH_PASSWORD` | 管理员密码 | `admin` | 否 |
 | `JWT_SECRET` | JWT 密钥（建议自定义） | 自动生成 UUID | 否 |
 | `WEBHOOK_TOKEN` | Webhook 认证令牌 | 无 | 否* |
 | `DATA_DIR` | 数据目录路径 | `./data` | 否 |
@@ -272,6 +264,7 @@ xuanwu/
 > **注意：**
 > - `WEBHOOK_TOKEN` 如果需要使用 Webhook 功能则必须配置
 > - `WEBDAV_*` 如果启用 `AUTO_RESTORE_ON_STARTUP` 则必须配置 WebDAV 相关信息
+> - ~~`AUTH_USERNAME` 和 `AUTH_PASSWORD` 已废弃~~，首次启动时通过 Web 界面设置管理员账号
 
 **Docker 运行示例：**
 
@@ -280,8 +273,6 @@ docker run -d \
   --name zhuque \
   -p 3000:3000 \
   -v $(pwd)/data:/app/data \
-  -e AUTH_USERNAME=admin \
-  -e AUTH_PASSWORD=your_secure_password \
   -e JWT_SECRET=your_jwt_secret_key \
   -e WEBHOOK_TOKEN=your_webhook_token \
   -e DATA_DIR=/app/data \
@@ -293,7 +284,7 @@ docker run -d \
 ```
 
 **重要提示：**
-- 生产环境请务必修改默认的 `AUTH_USERNAME` 和 `AUTH_PASSWORD`！
+- 首次启动时，访问 Web 界面会自动跳转到初始设置页面，请设置管理员账号和强密码
 - 如需使用 Webhook 功能，必须配置 `WEBHOOK_TOKEN`
 
 **本地开发示例：**

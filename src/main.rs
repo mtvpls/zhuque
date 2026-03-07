@@ -9,7 +9,7 @@ use anyhow::Result;
 use api::AppState;
 use models::db::init_db;
 use scheduler::{Scheduler, SubscriptionScheduler, BackupScheduler};
-use services::{AuthService, ConfigService, DependenceService, EnvService, Executor, LogService, ScriptService, SubscriptionService, SystemLogCollector, TaskService, TaskGroupService, TotpService};
+use services::{AuthService, ConfigService, DependenceService, EnvService, Executor, LogService, ScriptService, SubscriptionService, SystemLogCollector, TaskService, TaskGroupService, TotpService, UserService};
 
 #[cfg(not(target_os = "android"))]
 use services::TerminalService;
@@ -109,7 +109,8 @@ async fn main() -> Result<()> {
     let task_group_service = Arc::new(TaskGroupService::new(shared_pool.clone()));
     let subscription_service = Arc::new(SubscriptionService::new(shared_pool.clone(), scripts_dir.clone()));
     let config_service = Arc::new(ConfigService::new(shared_pool.clone()));
-    let mut auth_service = AuthService::new()?;
+    let user_service = Arc::new(UserService::new(shared_pool.clone()));
+    let mut auth_service = AuthService::new(user_service.clone())?;
     auth_service.set_config_service(config_service.clone());
     let auth_service = Arc::new(auth_service);
 
@@ -188,6 +189,7 @@ async fn main() -> Result<()> {
         subscription_service,
         config_service,
         auth_service,
+        user_service,
         #[cfg(not(target_os = "android"))]
         terminal_service,
         totp_service,

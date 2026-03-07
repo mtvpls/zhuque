@@ -36,9 +36,10 @@ request.interceptors.response.use(
   },
   (error) => {
     if (error.response?.status === 401) {
-      localStorage.removeItem('token');
-      // 只有不在登录页面时才重定向
-      if (window.location.pathname !== '/login') {
+      // 只有不在登录页面和初始设置页面时才清除token并重定向
+      const currentPath = window.location.pathname;
+      if (currentPath !== '/login' && currentPath !== '/setup') {
+        localStorage.removeItem('token');
         window.location.href = '/login';
       }
     }

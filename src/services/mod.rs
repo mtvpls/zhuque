@@ -11,6 +11,7 @@ pub mod task;
 pub mod task_group;
 pub mod terminal;
 pub mod totp;
+pub mod user;
 pub mod webdav;
 
 pub use auth::AuthService;
@@ -26,4 +27,5 @@ pub use task::TaskService;
 pub use task_group::TaskGroupService;
 pub use terminal::TerminalService;
 pub use totp::TotpService;
+pub use user::UserService;
 pub use webdav::WebDavClient;

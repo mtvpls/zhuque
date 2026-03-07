@@ -8,6 +8,21 @@ import type {
 } from '@/types/totp';
 
 export const authApi = {
+  // 检查是否需要初始设置
+  checkInitialSetup: () =>
+    request.get<{ needs_setup: boolean }>('/auth/setup/status'),
+
+  // 初始设置
+  initialSetup: (username: string, password: string) =>
+    request.post<{ success: boolean }>('/auth/setup', { username, password }),
+
+  // 修改密码
+  changePassword: (oldPassword: string, newPassword: string) =>
+    request.post<{ success: boolean }>('/auth/password', {
+      old_password: oldPassword,
+      new_password: newPassword,
+    }),
+
   // 第一步登录：验证用户名密码
   login: (username: string, password: string) =>
     request.post<LoginStepOneResponse>('/auth/login', { username, password }),
@@ -29,10 +44,10 @@ export const authApi = {
     request.post<{ success: boolean }>('/auth/totp/enable', data),
 
   // 禁用TOTP
-  disableTotp: () =>
-    request.post<{ success: boolean }>('/auth/totp/disable'),
+  disableTotp: (code: string) =>
+    request.post<{ success: boolean }>('/auth/totp/disable', { code }),
 
   // 重新生成备用码
-  regenerateBackupCodes: () =>
-    request.post<{ backup_codes: string[] }>('/auth/totp/regenerate-backup-codes'),
+  regenerateBackupCodes: (code: string) =>
+    request.post<{ backup_codes: string[] }>('/auth/totp/regenerate-backup-codes', { code }),
 };

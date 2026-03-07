@@ -18,6 +18,7 @@ import { IconSave, IconDownload, IconUpload } from '@arco-design/web-react/icon'
 import axios from 'axios';
 import TotpSettings from '@/components/TotpSettings';
 import { getSystemLogs, type SystemLogEntry } from '@/api/systemLog';
+import { authApi } from '@/api/auth';
 
 const FormItem = Form.Item;
 const { Title, Text } = Typography;
@@ -46,6 +47,7 @@ interface SystemInfo {
 
 const Config: React.FC = () => {
   const [form] = Form.useForm();
+  const [passwordForm] = Form.useForm();
   const [saveLoading, setSaveLoading] = useState(false);
   const [backupLoading, setBackupLoading] = useState(false);
   const [restoreLoading, setRestoreLoading] = useState(false);
@@ -63,6 +65,7 @@ const Config: React.FC = () => {
   const [backupNowLoading, setBackupNowLoading] = useState(false);
   const [systemLogs, setSystemLogs] = useState<SystemLogEntry[]>([]);
   const [systemLogsLoading, setSystemLogsLoading] = useState(false);
+  const [passwordChangeLoading, setPasswordChangeLoading] = useState(false);
 
   useEffect(() => {
     loadConfig();
@@ -386,47 +389,104 @@ const Config: React.FC = () => {
     }
   };
 
-  const handleRestoreFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleRestoreFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    Modal.confirm({
-      title: '确认恢复备份',
-      content: '恢复备份将覆盖当前所有数据，此操作不可逆。确定要继续吗？',
-      onOk: async () => {
-        try {
-          setRestoreLoading(true);
-          setGlobalLoading(true);
-          setLoadingText('正在恢复备份，请稍候...');
+    // 先检查是否启用了TOTP
+    let totpEnabled = false;
+    try {
+      const token = localStorage.getItem('token');
+      const totpStatus = await axios.get('/api/auth/totp/status', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      totpEnabled = totpStatus.data.enabled;
+    } catch (error) {
+      console.error('Failed to check TOTP status:', error);
+    }
 
-          const token = localStorage.getItem('token');
+    const performRestore = async (totpCode?: string) => {
+      try {
+        setRestoreLoading(true);
+        setGlobalLoading(true);
+        setLoadingText('正在恢复备份，请稍候...');
 
-          const formData = new FormData();
-          formData.append('file', file);
+        const token = localStorage.getItem('token');
 
-          const response = await axios.post('/api/backup/restore', formData, {
-            headers: {
-              Authorization: `Bearer ${token}`,
-              'Content-Type': 'multipart/form-data',
-            },
-          });
-
-          Message.success(response.data.message || '恢复成功');
-        } catch (error: any) {
-          Message.error(error.response?.data?.message || '恢复失败');
-        } finally {
-          setRestoreLoading(false);
-          setGlobalLoading(false);
-          setLoadingText('');
-          // 清空 input，允许重复选择同一个文件
-          e.target.value = '';
+        const formData = new FormData();
+        formData.append('file', file);
+        if (totpCode) {
+          formData.append('totp_code', totpCode);
         }
-      },
-      onCancel: () => {
-        // 取消时也清空 input
+
+        const response = await axios.post('/api/backup/restore', formData, {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'multipart/form-data',
+          },
+        });
+
+        Message.success(response.data.message || '恢复成功');
+      } catch (error: any) {
+        if (error.response?.data?.requires_totp) {
+          Message.error('需要提供TOTP验证码');
+        } else {
+          Message.error(error.response?.data?.message || '恢复失败');
+        }
+      } finally {
+        setRestoreLoading(false);
+        setGlobalLoading(false);
+        setLoadingText('');
+        // 清空 input，允许重复选择同一个文件
         e.target.value = '';
-      },
-    });
+      }
+    };
+
+    if (totpEnabled) {
+      // 如果启用了TOTP，先弹出验证码输入框
+      let totpCode = '';
+      Modal.confirm({
+        title: '确认恢复备份',
+        content: (
+          <div>
+            <p style={{ marginBottom: 16 }}>恢复备份将覆盖当前所有数据，此操作不可逆。</p>
+            <p style={{ marginBottom: 8, fontWeight: 'bold' }}>请输入TOTP验证码：</p>
+            <Input
+              placeholder="请输入6位验证码"
+              maxLength={6}
+              onChange={(value) => {
+                totpCode = value;
+              }}
+              autoFocus
+            />
+          </div>
+        ),
+        onOk: async () => {
+          if (!totpCode || totpCode.length !== 6) {
+            Message.error('请输入6位验证码');
+            return Promise.reject();
+          }
+          await performRestore(totpCode);
+        },
+        onCancel: () => {
+          // 取消时也清空 input
+          e.target.value = '';
+        },
+      });
+    } else {
+      // 如果没有启用TOTP，直接确认恢复
+      Modal.confirm({
+        title: '确认恢复备份',
+        content: '恢复备份将覆盖当前所有数据，此操作不可逆。确定要继续吗？',
+        onOk: async () => {
+          await performRestore();
+        },
+        onCancel: () => {
+          // 取消时也清空 input
+          e.target.value = '';
+        },
+      });
+    }
   };
 
   return (
@@ -774,12 +834,12 @@ const Config: React.FC = () => {
                     <Row gutter={[16, 16]}>
                       <Col xs={24} sm={12} md={12} lg={8} xl={6}>
                         <div>
-                          <Text bold>版本:</Text> <Text>朱雀 v1.0.0</Text>
+                          <Text bold>版本:</Text> <Text>朱雀 v1.1.0</Text>
                         </div>
                       </Col>
                       <Col xs={24} sm={12} md={12} lg={8} xl={6}>
                         <div>
-                          <Text bold>更新时间:</Text> <Text>2026/03/01</Text>
+                          <Text bold>更新时间:</Text> <Text>2026/03/07</Text>
                         </div>
                       </Col>
                       <Col xs={24} sm={12} md={12} lg={8} xl={6}>
@@ -953,6 +1013,66 @@ const Config: React.FC = () => {
           <TabPane key="security" title="安全设置">
             <div style={{ padding: '16px 24px' }}>
               <TotpSettings />
+
+              <Divider />
+
+              <Title heading={6} style={{ marginBottom: 16 }}>修改密码</Title>
+              <Form
+                form={passwordForm}
+                style={{ maxWidth: 500 }}
+                layout="vertical"
+                onSubmit={async (values: any) => {
+                  if (values.newPassword !== values.confirmPassword) {
+                    Message.error('两次密码不一致');
+                    return;
+                  }
+
+                  setPasswordChangeLoading(true);
+                  try {
+                    await authApi.changePassword(values.oldPassword, values.newPassword);
+                    Message.success('密码修改成功');
+                    passwordForm.resetFields();
+                  } catch (error: any) {
+                    Message.error(error.response?.data || '修改失败');
+                  } finally {
+                    setPasswordChangeLoading(false);
+                  }
+                }}
+              >
+                <FormItem
+                  label="当前密码"
+                  field="oldPassword"
+                  rules={[{ required: true, message: '请输入当前密码' }]}
+                >
+                  <Input.Password placeholder="请输入当前密码" />
+                </FormItem>
+                <FormItem
+                  label="新密码"
+                  field="newPassword"
+                  rules={[
+                    { required: true, message: '请输入新密码' },
+                    { minLength: 6, message: '密码至少6个字符' }
+                  ]}
+                >
+                  <Input.Password placeholder="请输入新密码" />
+                </FormItem>
+                <FormItem
+                  label="确认新密码"
+                  field="confirmPassword"
+                  rules={[{ required: true, message: '请确认新密码' }]}
+                >
+                  <Input.Password placeholder="请再次输入新密码" />
+                </FormItem>
+                <FormItem>
+                  <Button
+                    type="primary"
+                    htmlType="submit"
+                    loading={passwordChangeLoading}
+                  >
+                    修改密码
+                  </Button>
+                </FormItem>
+              </Form>
             </div>
           </TabPane>
         </Tabs>

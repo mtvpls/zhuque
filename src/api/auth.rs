@@ -1,5 +1,5 @@
 use crate::api::AppState;
-use crate::models::{LoginRequest, TotpVerifyRequest};
+use crate::models::{LoginRequest, TotpVerifyRequest, InitialSetupRequest, InitialSetupStatusResponse, UpdatePasswordRequest, Claims};
 use axum::{
     extract::State,
     http::StatusCode,
@@ -14,6 +14,44 @@ pub struct TotpEnableRequestFull {
     pub secret: String,
     pub backup_codes: Vec<String>,
     pub code: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TotpCodeRequest {
+    pub code: String,
+}
+
+// 检查是否需要初始设置
+pub async fn check_initial_setup(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    match state.user_service.needs_initial_setup().await {
+        Ok(needs_setup) => Ok(Json(InitialSetupStatusResponse { needs_setup })),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+}
+
+// 初始设置（创建第一个用户）
+pub async fn initial_setup(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<InitialSetupRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    match state.user_service.create_initial_user(&request.username, &request.password).await {
+        Ok(_) => Ok(Json(serde_json::json!({ "success": true }))),
+        Err(e) => Err((StatusCode::BAD_REQUEST, e.to_string())),
+    }
+}
+
+// 修改密码（需要认证）
+pub async fn change_password(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,  // 从中间件注入
+    Json(request): Json<UpdatePasswordRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    match state.user_service.update_password(&claims.sub, &request.old_password, &request.new_password).await {
+        Ok(_) => Ok(Json(serde_json::json!({ "success": true }))),
+        Err(e) => Err((StatusCode::BAD_REQUEST, e.to_string())),
+    }
 }
 
 /// 第一步登录：验证用户名密码
@@ -65,11 +103,9 @@ pub async fn get_totp_status(
 /// 初始化TOTP设置
 pub async fn setup_totp(
     State(state): State<Arc<AppState>>,
+    claims: Claims,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    // 从环境变量获取用户名
-    let username = std::env::var("AUTH_USERNAME").unwrap_or_else(|_| "admin".to_string());
-
-    match state.totp_service.generate_setup(&username).await {
+    match state.totp_service.generate_setup(&claims.sub).await {
         Ok(response) => Ok(Json(response)),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }
@@ -89,9 +125,17 @@ pub async fn enable_totp(
 /// 禁用TOTP
 pub async fn disable_totp(
     State(state): State<Arc<AppState>>,
+    Json(request): Json<TotpCodeRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    match state.totp_service.disable_totp().await {
-        Ok(_) => Ok(Json(serde_json::json!({ "success": true }))),
+    // 验证TOTP码
+    match state.totp_service.verify_code(&request.code).await {
+        Ok(true) => {
+            match state.totp_service.disable_totp().await {
+                Ok(_) => Ok(Json(serde_json::json!({ "success": true }))),
+                Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+            }
+        }
+        Ok(false) => Err((StatusCode::BAD_REQUEST, "验证码错误".to_string())),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }
 }
@@ -99,9 +143,17 @@ pub async fn disable_totp(
 /// 重新生成备用码
 pub async fn regenerate_backup_codes(
     State(state): State<Arc<AppState>>,
+    Json(request): Json<TotpCodeRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    match state.totp_service.regenerate_backup_codes().await {
-        Ok(codes) => Ok(Json(serde_json::json!({ "backup_codes": codes }))),
+    // 验证TOTP码
+    match state.totp_service.verify_code(&request.code).await {
+        Ok(true) => {
+            match state.totp_service.regenerate_backup_codes().await {
+                Ok(codes) => Ok(Json(serde_json::json!({ "backup_codes": codes }))),
+                Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+            }
+        }
+        Ok(false) => Err((StatusCode::BAD_REQUEST, "验证码错误".to_string())),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }
 }

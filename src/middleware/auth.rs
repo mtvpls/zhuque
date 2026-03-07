@@ -1,4 +1,5 @@
 use crate::services::AuthService;
+use crate::models::Claims;
 use axum::{
     extract::{Request, State},
     http::{HeaderMap, StatusCode},
@@ -12,7 +13,7 @@ use std::sync::Arc;
 pub async fn auth_middleware(
     State(auth_service): State<Arc<AuthService>>,
     headers: HeaderMap,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     // 先尝试从 Authorization header 获取 token
@@ -47,7 +48,7 @@ pub async fn auth_middleware(
     };
 
     // 验证 token
-    match auth_service.verify_token(token) {
+    let claims = match auth_service.verify_token(token) {
         Ok(claims) => {
             // 拒绝session token访问受保护资源
             if claims.sub.starts_with("session:") {
@@ -60,6 +61,7 @@ pub async fn auth_middleware(
                 )
                     .into_response();
             }
+            claims
         }
         Err(_) => {
             return (
@@ -71,7 +73,10 @@ pub async fn auth_middleware(
             )
                 .into_response();
         }
-    }
+    };
+
+    // 将 claims 注入到请求扩展中
+    request.extensions_mut().insert(claims);
 
     next.run(request).await
 }

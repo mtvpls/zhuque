@@ -135,6 +135,7 @@ pub async fn restore_backup(
     // 保存上传的备份文件到临时位置
     let uploaded_backup_path = format!("{}/zhuque_uploaded_{}.tar.gz", parent_dir, timestamp);
     let mut file_received = false;
+    let mut totp_code: Option<String> = None;
 
     // 接收上传的文件并直接写入磁盘
     while let Some(field) = multipart.next_field().await.map_err(|e| {
@@ -159,7 +160,13 @@ pub async fn restore_backup(
 
             info!("Received backup file: {} bytes", data.len());
             file_received = true;
-            break;
+        } else if name == "totp_code" {
+            let text = field.text().await.map_err(|e| {
+                error!("Failed to read totp_code field: {}", e);
+                StatusCode::BAD_REQUEST
+            })?;
+            totp_code = Some(text);
+            info!("Received TOTP code");
         }
     }
 
@@ -172,6 +179,62 @@ pub async fn restore_backup(
                 "message": "未接收到备份文件，请选择一个有效的 .tar.gz 文件"
             }))
         ));
+    }
+
+    // 检查是否启用了TOTP
+    let totp_enabled = match state.totp_service.is_enabled().await {
+        Ok(enabled) => enabled,
+        Err(e) => {
+            error!("Failed to check TOTP status: {}", e);
+            false
+        }
+    };
+
+    // 如果启用了TOTP，验证验证码
+    if totp_enabled {
+        match totp_code {
+            Some(code) => {
+                match state.totp_service.verify_code(&code).await {
+                    Ok(true) => {
+                        info!("TOTP verification successful");
+                    }
+                    Ok(false) => {
+                        error!("Invalid TOTP code");
+                        let _ = fs::remove_file(&uploaded_backup_path).await;
+                        return Ok((
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({
+                                "success": false,
+                                "message": "TOTP验证码错误"
+                            }))
+                        ));
+                    }
+                    Err(e) => {
+                        error!("Failed to verify TOTP: {}", e);
+                        let _ = fs::remove_file(&uploaded_backup_path).await;
+                        return Ok((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({
+                                "success": false,
+                                "message": "TOTP验证失败"
+                            }))
+                        ));
+                    }
+                }
+            }
+            None => {
+                error!("TOTP is enabled but no code provided");
+                let _ = fs::remove_file(&uploaded_backup_path).await;
+                return Ok((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "success": false,
+                        "message": "需要提供TOTP验证码",
+                        "requires_totp": true
+                    }))
+                ));
+            }
+        }
     }
 
     // 创建当前数据的备份（直接写入文件）

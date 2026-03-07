@@ -14,7 +14,7 @@ pub mod terminal;
 
 use crate::middleware::{auth_middleware, webhook_auth_middleware};
 use crate::scheduler::{Scheduler, SubscriptionScheduler, BackupScheduler};
-use crate::services::{AuthService, ConfigService, DependenceService, EnvService, LogService, ScriptService, SubscriptionService, SystemLogCollector, TaskService, TaskGroupService, TotpService};
+use crate::services::{AuthService, ConfigService, DependenceService, EnvService, LogService, ScriptService, SubscriptionService, SystemLogCollector, TaskService, TaskGroupService, TotpService, UserService};
 
 #[cfg(not(target_os = "android"))]
 use crate::services::TerminalService;
@@ -43,6 +43,7 @@ pub struct AppState {
     pub subscription_service: Arc<SubscriptionService>,
     pub config_service: Arc<ConfigService>,
     pub auth_service: Arc<AuthService>,
+    pub user_service: Arc<UserService>,
     #[cfg(not(target_os = "android"))]
     pub terminal_service: Arc<TerminalService>,
     pub totp_service: Arc<TotpService>,
@@ -273,6 +274,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/auth/totp/enable", post(auth::enable_totp))
         .route("/api/auth/totp/disable", post(auth::disable_totp))
         .route("/api/auth/totp/regenerate-backup-codes", post(auth::regenerate_backup_codes))
+        // 修改密码
+        .route("/api/auth/password", post(auth::change_password))
         .layer(middleware::from_fn_with_state(
             state.auth_service.clone(),
             auth_middleware,
@@ -280,6 +283,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
 
     // 公开路由
     let app = Router::new()
+        .route("/api/auth/setup/status", get(auth::check_initial_setup))
+        .route("/api/auth/setup", post(auth::initial_setup))
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/totp/verify", post(auth::verify_totp))
         .merge(webhook_routes)
