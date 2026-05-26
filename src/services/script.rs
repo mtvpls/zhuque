@@ -490,14 +490,25 @@ impl ScriptService {
         env_json: Option<&str>,
         file_path: Option<&str>,
     ) -> Result<(String, impl tokio_stream::Stream<Item = Result<String>>)> {
-        // 创建临时文件
-        let temp_dir = self.base_path.join(".temp");
-        tokio::fs::create_dir_all(&temp_dir).await?;
-
         let script_type = Self::normalize_script_type(script_type);
-
         let execution_id = uuid::Uuid::new_v4().to_string();
-        let temp_file = temp_dir.join(format!("debug_{}.{}", execution_id, script_type));
+
+        // 先计算工作目录，临时文件也写到这里
+        // 这样 Python 的 sys.path[0] 和 Node.js 的 require('./') 都能正确解析同目录模块
+        let work_dir = if let Some(path) = file_path {
+            let file_full_path = self.base_path.join(path);
+            if let Some(parent) = file_full_path.parent() {
+                parent.to_path_buf()
+            } else {
+                self.base_path.clone()
+            }
+        } else {
+            self.base_path.clone()
+        };
+        tokio::fs::create_dir_all(&work_dir).await?;
+
+        // 临时文件写到 work_dir，文件名以 .__debug_ 开头避免与用户文件冲突
+        let temp_file = work_dir.join(format!(".__debug_{}.{}", execution_id, script_type));
         tokio::fs::write(&temp_file, content).await?;
 
         // 如果是shell脚本，添加执行权限
@@ -535,18 +546,6 @@ impl ScriptService {
                 c
             }
             _ => return Err(anyhow!("Unsupported script type")),
-        };
-
-        // 设置工作目录：如果提供了file_path，使用文件所在目录；否则使用脚本根目录
-        let work_dir = if let Some(path) = file_path {
-            let file_full_path = self.base_path.join(path);
-            if let Some(parent) = file_full_path.parent() {
-                parent.to_path_buf()
-            } else {
-                self.base_path.clone()
-            }
-        } else {
-            self.base_path.clone()
         };
 
         cmd.current_dir(&work_dir);
