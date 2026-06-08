@@ -9,7 +9,7 @@ use anyhow::Result;
 use api::AppState;
 use models::db::init_db;
 use scheduler::{Scheduler, SubscriptionScheduler, BackupScheduler};
-use services::{AuthService, ConfigService, DependenceService, EnvService, Executor, LogService, LoginLogService, NotificationService, NotifyTokenRegistry, ScriptService, SubscriptionService, SystemLogCollector, TaskService, TaskGroupService, TotpService, UserService};
+use services::{AuthService, ConfigService, DependenceService, EnvService, Executor, LogService, LoginLogService, NotificationService, NotifyTokenRegistry, RemoteService, ScriptService, SubscriptionService, SystemLogCollector, TaskService, TaskGroupService, TotpService, UserService};
 
 #[cfg(not(target_os = "android"))]
 use services::TerminalService;
@@ -128,6 +128,7 @@ async fn main() -> Result<()> {
         config_service.clone(),
         token_registry.clone(),
     ));
+    let remote_service = Arc::new(RemoteService::new(shared_pool.clone()));
 
     let totp_service = Arc::new(TotpService::new(config_service.clone()));
     let executor = Arc::new(Executor::new(
@@ -152,7 +153,7 @@ async fn main() -> Result<()> {
 
     // 初始化调度器
     info!("Initializing scheduler...");
-    let scheduler = Arc::new(Scheduler::new(task_service.clone(), log_service.clone(), executor.clone()).await?);
+    let scheduler = Arc::new(Scheduler::new(task_service.clone(), log_service.clone(), executor.clone(), remote_service.clone()).await?);
     scheduler.start().await?;
 
     // 初始化订阅调度器
@@ -227,6 +228,7 @@ async fn main() -> Result<()> {
         db_pool: shared_pool,
         system_log_collector,
         notification_service,
+        remote_service: remote_service.clone(),
     });
 
     // 创建路由
@@ -242,6 +244,7 @@ async fn main() -> Result<()> {
     let task_service_clone = task_service.clone();
     let log_service_clone = log_service.clone();
     let executor_clone = executor.clone();
+    let remote_service_clone = remote_service.clone();
     tokio::spawn(async move {
         // 等待依赖安装完成
         if let Ok(_) = deps_done_rx.await {
@@ -255,7 +258,36 @@ async fn main() -> Result<()> {
                             info!("Executing startup task: {}", task.name);
                             let start_time = chrono::Utc::now();
 
-                            match executor_clone.execute(&task).await {
+                            let execution_result = if task.target_type == "remote" {
+                                if let Some(agent_id) = task.target_agent_id {
+                                    let env = task
+                                        .env
+                                        .as_deref()
+                                        .and_then(|s| serde_json::from_str::<std::collections::HashMap<String, String>>(s).ok());
+                                    match remote_service_clone
+                                        .execute_task_command(
+                                            agent_id,
+                                            task.command.clone(),
+                                            task.working_dir.clone(),
+                                            env,
+                                            if task.timeout > 0 { Some(task.timeout) } else { None },
+                                        )
+                                        .await
+                                    {
+                                        Ok((execution_id, output, status)) => {
+                                            let status = if status == "success" { "success" } else { "failed" };
+                                            Ok((execution_id, output, status))
+                                        }
+                                        Err(e) => Err(e),
+                                    }
+                                } else {
+                                    Err(anyhow::anyhow!("remote startup task missing target_agent_id"))
+                                }
+                            } else {
+                                executor_clone.execute(&task).await
+                            };
+
+                            match execution_result {
                                 Ok((_execution_id, output, status)) => {
                                     let duration = (chrono::Utc::now() - start_time).num_milliseconds();
                                     info!("Startup task {} completed with status: {}", task.name, status);

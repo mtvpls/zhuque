@@ -44,6 +44,7 @@ const BasicLayout: React.FC = () => {
     { key: '/subscriptions', icon: <IconSync />, label: '订阅管理' },
     { key: '/logs', icon: <IconHistory />, label: '执行日志' },
     { key: '/terminal', icon: <IconCode />, label: '终端' },
+    { key: '/remote', icon: <IconStorage />, label: '远程机器' },
     { key: '/notifications', icon: <IconNotification />, label: '通知管理' },
     { key: '/config', icon: <IconStorage />, label: '系统配置' },
   ];

@@ -3,6 +3,7 @@ pub mod config;
 pub mod db;
 pub mod dependence;
 pub mod env;
+pub mod remote;
 pub mod subscription;
 
 use chrono::{DateTime, Utc};
@@ -13,6 +14,7 @@ pub use auth::*;
 pub use config::*;
 pub use dependence::*;
 pub use env::*;
+pub use remote::*;
 pub use subscription::*;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +33,8 @@ pub struct Task {
     pub working_dir: Option<String>, // 自定义工作目录
     pub notification: Option<String>, // JSON 格式的任务级通知配置（TaskNotificationConfig）
     pub timeout: i64, // 执行超时（秒），0 表示不超时
+    pub target_type: String, // local/remote
+    pub target_agent_id: Option<i64>,
     pub last_run_at: Option<DateTime<Utc>>,
     pub last_run_duration: Option<i64>, // 毫秒
     pub next_run_at: Option<DateTime<Utc>>,
@@ -61,6 +65,12 @@ impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for Task {
             working_dir: row.try_get("working_dir").ok().flatten(),
             notification: row.try_get("notification").ok().flatten(),
             timeout: row.try_get::<Option<i64>, _>("timeout").ok().flatten().unwrap_or(0),
+            target_type: row
+                .try_get::<Option<String>, _>("target_type")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "local".to_string()),
+            target_agent_id: row.try_get("target_agent_id").ok().flatten(),
             last_run_at: row.try_get("last_run_at")?,
             last_run_duration: row.try_get("last_run_duration")?,
             next_run_at: row.try_get("next_run_at")?,
@@ -86,6 +96,8 @@ pub struct CreateTask {
     pub notification: Option<String>, // JSON 格式的任务级通知配置
     #[serde(default)]
     pub timeout: i64, // 执行超时（秒），0 表示不超时
+    pub target_type: Option<String>,
+    pub target_agent_id: Option<i64>,
 }
 
 // 用于接收前端输入的 cron，支持字符串或数组
@@ -120,6 +132,8 @@ pub struct UpdateTask {
     pub working_dir: Option<String>,
     pub notification: Option<String>, // JSON 格式的任务级通知配置
     pub timeout: Option<i64>, // 执行超时（秒），0 表示不超时
+    pub target_type: Option<String>,
+    pub target_agent_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]

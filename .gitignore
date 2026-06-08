@@ -8,3 +8,4 @@ Cargo.lock
 .claude/
 node_modules/
 dist/
+.codex/

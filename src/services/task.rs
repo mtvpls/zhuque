@@ -71,9 +71,10 @@ impl TaskService {
         let cron_json = serde_json::to_string(&cron_vec)?;
 
         let now = Utc::now();
+        let target_type = create.target_type.unwrap_or_else(|| "local".to_string());
         let result = sqlx::query(
-            "INSERT INTO tasks (name, command, cron, type, enabled, env, pre_command, post_command, group_id, working_dir, notification, timeout, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO tasks (name, command, cron, type, enabled, env, pre_command, post_command, group_id, working_dir, notification, timeout, target_type, target_agent_id, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&create.name)
         .bind(&create.command)
@@ -87,6 +88,8 @@ impl TaskService {
         .bind(&create.working_dir)
         .bind(&create.notification)
         .bind(create.timeout)
+        .bind(&target_type)
+        .bind(create.target_agent_id)
         .bind(now)
         .bind(now)
         .execute(&*pool)
@@ -154,6 +157,14 @@ impl TaskService {
             query.push_str(", timeout = ?");
             params.push(timeout.to_string());
         }
+        if let Some(target_type) = &update.target_type {
+            query.push_str(", target_type = ?");
+            params.push(target_type.clone());
+        }
+        if let Some(target_agent_id) = update.target_agent_id {
+            query.push_str(", target_agent_id = ?");
+            params.push(target_agent_id.to_string());
+        }
 
         query.push_str(" WHERE id = ?");
         params.push(id.to_string());
@@ -199,6 +210,12 @@ impl TaskService {
         }
         if let Some(timeout) = update.timeout {
             q = q.bind(timeout);
+        }
+        if let Some(target_type) = &update.target_type {
+            q = q.bind(target_type);
+        }
+        if let Some(target_agent_id) = update.target_agent_id {
+            q = q.bind(target_agent_id);
         }
 
         q = q.bind(id);

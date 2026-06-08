@@ -231,6 +231,16 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool> {
         .await
         .ok(); // 忽略错误，字段可能已存在
 
+    sqlx::query("ALTER TABLE tasks ADD COLUMN target_type TEXT NOT NULL DEFAULT 'local'")
+        .execute(&pool)
+        .await
+        .ok();
+
+    sqlx::query("ALTER TABLE tasks ADD COLUMN target_agent_id INTEGER")
+        .execute(&pool)
+        .await
+        .ok();
+
     // 数据库迁移：添加 duration 字段到 logs 表
     sqlx::query("ALTER TABLE logs ADD COLUMN duration INTEGER")
         .execute(&pool)
@@ -292,6 +302,98 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool> {
         .await?;
 
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_login_logs_created_at ON login_logs(created_at)")
+        .execute(&pool)
+        .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS remote_agents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            hostname TEXT,
+            os TEXT,
+            arch TEXT,
+            version TEXT,
+            status TEXT NOT NULL DEFAULT 'offline',
+            last_seen_at DATETIME,
+            registered_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            token_hash TEXT NOT NULL,
+            capabilities TEXT,
+            tags TEXT,
+            remark TEXT,
+            disabled BOOLEAN NOT NULL DEFAULT 0
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_remote_agents_status ON remote_agents(status)")
+        .execute(&pool)
+        .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS remote_agent_sessions (
+            id TEXT PRIMARY KEY,
+            agent_id INTEGER NOT NULL,
+            connected_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            disconnected_at DATETIME,
+            remote_addr TEXT,
+            FOREIGN KEY (agent_id) REFERENCES remote_agents(id) ON DELETE CASCADE
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS remote_commands (
+            id TEXT PRIMARY KEY,
+            agent_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'queued',
+            exit_code INTEGER,
+            output TEXT,
+            error TEXT,
+            timeout INTEGER,
+            created_by TEXT,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            started_at DATETIME,
+            finished_at DATETIME,
+            FOREIGN KEY (agent_id) REFERENCES remote_agents(id) ON DELETE CASCADE
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_remote_commands_agent_id ON remote_commands(agent_id)")
+        .execute(&pool)
+        .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_remote_commands_status ON remote_commands(status)")
+        .execute(&pool)
+        .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS remote_command_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            command_id TEXT NOT NULL,
+            stream TEXT NOT NULL,
+            line TEXT NOT NULL,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (command_id) REFERENCES remote_commands(id) ON DELETE CASCADE
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_remote_command_logs_command_id ON remote_command_logs(command_id)")
         .execute(&pool)
         .await?;
 

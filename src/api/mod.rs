@@ -6,6 +6,7 @@ pub mod env;
 pub mod log;
 pub mod login_log;
 pub mod notification;
+pub mod remote;
 pub mod script;
 pub mod subscription;
 pub mod system;
@@ -16,7 +17,7 @@ pub mod terminal;
 
 use crate::middleware::{auth_middleware, webhook_auth_middleware};
 use crate::scheduler::{Scheduler, SubscriptionScheduler, BackupScheduler};
-use crate::services::{AuthService, ConfigService, DependenceService, EnvService, LoginLogService, LogService, NotificationService, ScriptService, SubscriptionService, SystemLogCollector, TaskService, TaskGroupService, TotpService, UserService};
+use crate::services::{AuthService, ConfigService, DependenceService, EnvService, LoginLogService, LogService, NotificationService, RemoteService, ScriptService, SubscriptionService, SystemLogCollector, TaskService, TaskGroupService, TotpService, UserService};
 
 #[cfg(not(target_os = "android"))]
 use crate::services::TerminalService;
@@ -56,6 +57,7 @@ pub struct AppState {
     pub db_pool: Arc<RwLock<SqlitePool>>,
     pub system_log_collector: SystemLogCollector,
     pub notification_service: Arc<NotificationService>,
+    pub remote_service: Arc<RemoteService>,
 }
 
 impl AppState {
@@ -274,7 +276,22 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/system/logs/stream", get(system_log::stream_system_logs))
         // 通知配置
         .route("/api/notification/config", get(notification::get_config).post(notification::update_config))
-        .route("/api/notification/test", post(notification::test_channel));
+        .route("/api/notification/test", post(notification::test_channel))
+        // 远程机器管理
+        .route("/api/remote/agents", get(remote::list_agents).post(remote::create_agent))
+        .route("/api/remote/agents/:id", get(remote::get_agent))
+        .route("/api/remote/agents/:id/status", get(remote::get_agent_status))
+        .route("/api/remote/agents/:id/files", get(remote::list_files))
+        .route("/api/remote/agents/:id/files/delete", post(remote::delete_file))
+        .route("/api/remote/agents/:id/files/mkdir", post(remote::create_dir))
+        .route("/api/remote/agents/:id/files/rename", post(remote::rename_file))
+        .route("/api/remote/agents/:id/files/content", get(remote::read_file).post(remote::write_file))
+        .route("/api/remote/agents/:id/commands", post(remote::create_command))
+        .route("/api/remote/agents/:id/scripts/run", post(remote::run_script))
+        .route("/api/remote/commands", get(remote::list_commands))
+        .route("/api/remote/commands/:id", get(remote::get_command).delete(remote::kill_command))
+        .route("/api/remote/commands/:id/logs", get(remote::list_command_logs))
+        .route("/api/remote/commands/:id/logs/stream", get(remote::stream_command_logs));
 
     // 终端路由（仅非 Android 平台）
     #[cfg(not(target_os = "android"))]
@@ -301,6 +318,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/totp/verify", post(auth::verify_totp))
         .route("/api/notify/send", post(notification::script_notify))
+        .route("/api/remote/agent/register", post(remote::register_agent))
+        .route("/api/remote/agent/connect", get(remote::connect_agent))
         .merge(webhook_routes)
         .merge(protected_routes)
         .with_state(state)

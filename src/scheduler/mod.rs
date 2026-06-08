@@ -4,7 +4,7 @@ mod backup_scheduler;
 pub use subscription_scheduler::SubscriptionScheduler;
 pub use backup_scheduler::BackupScheduler;
 
-use crate::services::{Executor, LogService, TaskService};
+use crate::services::{Executor, LogService, RemoteService, TaskService};
 use anyhow::Result;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -29,6 +29,7 @@ pub struct Scheduler {
     task_service: Arc<TaskService>,
     log_service: Arc<LogService>,
     executor: Arc<Executor>,
+    remote_service: Arc<RemoteService>,
     job_ids: Arc<RwLock<Vec<(i64, uuid::Uuid)>>>, // (task_id, job_id)
 }
 
@@ -37,6 +38,7 @@ impl Scheduler {
         task_service: Arc<TaskService>,
         log_service: Arc<LogService>,
         executor: Arc<Executor>,
+        remote_service: Arc<RemoteService>,
     ) -> Result<Self> {
         let scheduler = JobScheduler::new().await?;
 
@@ -45,6 +47,7 @@ impl Scheduler {
             task_service,
             log_service,
             executor,
+            remote_service,
             job_ids: Arc::new(RwLock::new(Vec::new())),
         })
     }
@@ -133,6 +136,7 @@ impl Scheduler {
             let task_service = self.task_service.clone();
             let log_service = self.log_service.clone();
             let executor = self.executor.clone();
+            let remote_service = self.remote_service.clone();
             let task_clone = task.clone();
             let _cron_expr_clone = cron_expr.clone();
 
@@ -141,6 +145,7 @@ impl Scheduler {
                 let task_service = task_service.clone();
                 let log_service = log_service.clone();
                 let executor = executor.clone();
+                let remote_service = remote_service.clone();
 
                 Box::pin(async move {
                     info!("Running scheduled task: {}", task.name);
@@ -157,7 +162,7 @@ impl Scheduler {
                     let start_time = chrono::Utc::now();
 
                     // 执行任务（cron 调度处）
-                    let (_execution_id, output, status) = match executor.execute(&task).await {
+                    let (_execution_id, output, status) = match execute_task_by_target(&executor, &remote_service, &task).await {
                         Ok(result) => result,
                         Err(e) => {
                             error!("Task execution error: {}", e);
@@ -217,11 +222,12 @@ impl Scheduler {
         let task_service = self.task_service.clone();
         let log_service = self.log_service.clone();
         let executor = self.executor.clone();
+        let remote_service = self.remote_service.clone();
 
         tokio::spawn(async move {
             let start_time = chrono::Utc::now();
 
-            let (_execution_id, output, status) = match executor.execute(&task).await {
+            let (_execution_id, output, status) = match execute_task_by_target(&executor, &remote_service, &task).await {
                 Ok(result) => result,
                 Err(e) => {
                     error!("Task execution error: {}", e);
@@ -309,5 +315,38 @@ impl Scheduler {
     /// 列出所有活跃的执行
     pub async fn list_executions(&self) -> Vec<crate::services::executor::ExecutionInfo> {
         self.executor.list_executions().await
+    }
+}
+
+async fn execute_task_by_target(
+    executor: &Arc<Executor>,
+    remote_service: &Arc<RemoteService>,
+    task: &crate::models::Task,
+) -> anyhow::Result<(String, String, &'static str)> {
+    if task.target_type == "remote" {
+        let agent_id = task
+            .target_agent_id
+            .ok_or_else(|| anyhow::anyhow!("remote task missing target_agent_id"))?;
+        let env = task
+            .env
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<std::collections::HashMap<String, String>>(s).ok());
+        let (execution_id, output, status) = remote_service
+            .execute_task_command(
+                agent_id,
+                task.command.clone(),
+                task.working_dir.clone(),
+                env,
+                if task.timeout > 0 { Some(task.timeout) } else { None },
+            )
+            .await?;
+        let status = match status.as_str() {
+            "success" => "success",
+            "killed" => "killed",
+            _ => "failed",
+        };
+        Ok((execution_id, output, status))
+    } else {
+        executor.execute(task).await
     }
 }

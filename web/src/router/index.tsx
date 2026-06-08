@@ -13,6 +13,7 @@ import LoginLogs from '@/pages/LoginLogs';
 import Config from '@/pages/Config';
 import Terminal from '@/pages/Terminal';
 import Notifications from '@/pages/Notifications';
+import RemoteAgents from '@/pages/RemoteAgents';
 
 const router = createBrowserRouter([
   {
@@ -70,6 +71,10 @@ const router = createBrowserRouter([
       {
         path: 'terminal',
         element: <Terminal />,
+      },
+      {
+        path: 'remote',
+        element: <RemoteAgents />,
       },
     ],
   },

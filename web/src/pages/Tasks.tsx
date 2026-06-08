@@ -27,8 +27,10 @@ import { IconPlus, IconPlayArrow, IconEdit, IconDelete, IconInfoCircle, IconStop
 import { taskApi } from '@/api/task';
 import { logApi } from '@/api/log';
 import { notificationApi } from '@/api/notification';
+import { remoteApi } from '@/api/remote';
 import axios from 'axios';
 import type { Task, TaskNotificationConfig, ChannelConfig } from '@/types';
+import type { RemoteAgent } from '@/api/remote';
 
 const FormItem = Form.Item;
 const { Option } = Select;
@@ -76,6 +78,7 @@ const Tasks: React.FC = () => {
   const [form] = Form.useForm();
   const [isMobile, setIsMobile] = useState(window.innerWidth < 768);
   const [taskEnvFormat, setTaskEnvFormat] = useState<'json' | 'dotenv'>('json');
+  const [remoteAgents, setRemoteAgents] = useState<RemoteAgent[]>([]);
 
   // 分组相关状态
   const [groups, setGroups] = useState<any[]>([]);
@@ -114,6 +117,7 @@ const Tasks: React.FC = () => {
   useEffect(() => {
     loadGroups();
     loadWebhookToken();
+    loadRemoteAgents();
 
     // 使用SSE订阅运行中的任务
     const token = localStorage.getItem('token');
@@ -254,6 +258,14 @@ const Tasks: React.FC = () => {
     }
   };
 
+  const loadRemoteAgents = async () => {
+    try {
+      setRemoteAgents(await remoteApi.listAgents());
+    } catch (error) {
+      console.error('Failed to load remote agents:', error);
+    }
+  };
+
   const resetNotifState = (notifJson?: string | null) => {
     if (notifJson) {
       try {
@@ -339,6 +351,7 @@ const Tasks: React.FC = () => {
       enabled: true,
       cron: ['*/5 * * * *'],
       timeout: 0,
+      target_type: 'local',
     });
     setTaskEnvFormat('json');
     resetNotifState(null);
@@ -351,6 +364,7 @@ const Tasks: React.FC = () => {
     const formData = {
       ...task,
       cron: Array.isArray(task.cron) ? task.cron : [task.cron],
+      target_type: task.target_type || 'local',
     };
     form.setFieldsValue(formData);
     setTaskEnvFormat('json');
@@ -369,6 +383,13 @@ const Tasks: React.FC = () => {
 
       if (values.env && taskEnvFormat === 'dotenv') {
         values.env = parseDotEnvToJson(values.env);
+      }
+
+      if (!values.target_type) {
+        values.target_type = 'local';
+      }
+      if (values.target_type === 'local') {
+        values.target_agent_id = undefined;
       }
 
       // 构造任务级通知配置 JSON
@@ -597,6 +618,18 @@ const Tasks: React.FC = () => {
       render: (type: string) => getTaskTypeTag(type),
     },
     {
+      title: '目标',
+      dataIndex: 'target_type',
+      width: isMobile ? 80 : 140,
+      render: (targetType: string, record: Task) => {
+        if (targetType === 'remote') {
+          const agent = remoteAgents.find(item => item.id === record.target_agent_id);
+          return <Tag color="purple">{agent?.name || `远程 #${record.target_agent_id || '-'}`}</Tag>;
+        }
+        return <Tag color="gray">本机</Tag>;
+      },
+    },
+    {
       title: 'Cron表达式',
       dataIndex: 'cron',
       width: isMobile ? 120 : 200,
@@ -783,7 +816,7 @@ const Tasks: React.FC = () => {
           data={tasks}
           loading={loading}
           pagination={{ pageSize: 10 }}
-          scroll={{ x: isMobile ? 840 : 1410 }}
+          scroll={{ x: isMobile ? 920 : 1510 }}
           rowKey="id"
           rowClassName={(record: Task) => (!record.enabled ? 'task-row-disabled' : '')}
         />
@@ -870,7 +903,33 @@ const Tasks: React.FC = () => {
                     </Select>
                   </FormItem>
                 </Col>
+                <Col span={12}>
+                  <FormItem label="执行目标" field="target_type">
+                    <Select placeholder="请选择执行目标">
+                      <Option value="local">本机</Option>
+                      <Option value="remote">远程机器</Option>
+                    </Select>
+                  </FormItem>
+                </Col>
               </Row>
+
+              <Form.Item noStyle shouldUpdate>
+                {(values) => values.target_type === 'remote' ? (
+                  <FormItem
+                    label="远程机器"
+                    field="target_agent_id"
+                    rules={[{ required: true, message: '请选择远程机器' }]}
+                  >
+                    <Select placeholder="请选择远程机器" allowClear>
+                      {remoteAgents.map(agent => (
+                        <Option key={agent.id} value={agent.id}>
+                          {agent.name} ({agent.status})
+                        </Option>
+                      ))}
+                    </Select>
+                  </FormItem>
+                ) : null}
+              </Form.Item>
 
               <Form.Item noStyle shouldUpdate>
                 {(values) => {
