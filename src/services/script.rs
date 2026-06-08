@@ -7,6 +7,7 @@ use flate2::read::GzDecoder;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Cursor;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -222,6 +223,7 @@ impl ScriptService {
         tokio::fs::write(&full_path, content).await?;
 
         // 如果是.sh脚本，添加执行权限
+        #[cfg(unix)]
         if path.ends_with(".sh") {
             let metadata = tokio::fs::metadata(&full_path).await?;
             let mut permissions = metadata.permissions();
@@ -512,6 +514,7 @@ impl ScriptService {
         tokio::fs::write(&temp_file, content).await?;
 
         // 如果是shell脚本，添加执行权限
+        #[cfg(unix)]
         if script_type == "sh" {
             let metadata = tokio::fs::metadata(&temp_file).await?;
             let mut permissions = metadata.permissions();

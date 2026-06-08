@@ -13,6 +13,7 @@ use tokio::process::Command;
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, error, info};
 use uuid::Uuid;
+#[cfg(unix)]
 use libc;
 
 /// 辅助结构体：处理 \r 和 \n 作为行分隔符的读取器
@@ -151,6 +152,40 @@ impl Executor {
             || command.ends_with("/tsx")
             || command == "ts-node"
             || command.ends_with("/ts-node")
+    }
+
+    fn shell_command(command: &str) -> Command {
+        #[cfg(windows)]
+        {
+            let mut cmd = Command::new("cmd");
+            cmd.arg("/C").arg(command);
+            cmd
+        }
+
+        #[cfg(not(windows))]
+        {
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c").arg(command);
+            cmd.process_group(0);
+            cmd
+        }
+    }
+
+    async fn kill_process_tree(pid: u32) -> bool {
+        #[cfg(windows)]
+        {
+            Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .status()
+                .await
+                .map(|status| status.success())
+                .unwrap_or(false)
+        }
+
+        #[cfg(not(windows))]
+        {
+            unsafe { libc::kill(-(pid as i32), libc::SIGKILL) == 0 }
+        }
     }
 
     /// 根据任务获取工作目录
@@ -612,16 +647,13 @@ export default sendNotify;
         let adjusted_command = self.adjust_command_for_working_dir(&task.command, &working_dir);
         debug!("Adjusted command: {}", adjusted_command);
 
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg(&adjusted_command)
-            .current_dir(&working_dir)
+        let mut cmd = Self::shell_command(&adjusted_command);
+        cmd.current_dir(&working_dir)
             .env_clear()
             .envs(env_vars.clone())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0)
-            .spawn()?;
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn()?;
 
         // 注册进程
         let pid = child.id().ok_or_else(|| anyhow!("Failed to get process ID"))?;
@@ -654,7 +686,7 @@ export default sendNotify;
             Some(tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)).await;
                 timed_out_flag.store(true, Ordering::SeqCst);
-                unsafe { libc::kill(-(pid_to_kill as i32), libc::SIGKILL) };
+                Self::kill_process_tree(pid_to_kill).await;
             }))
         } else {
             None
@@ -854,8 +886,7 @@ export default sendNotify;
         let mut tasks = self.running_tasks.write().await;
 
         if let Some(pid) = tasks.remove(&task_id) {
-            let ret = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-            if ret == 0 {
+            if Self::kill_process_tree(pid).await {
                 Ok(())
             } else {
                 Err(anyhow!("Failed to kill process group {}: errno={}", pid, std::io::Error::last_os_error()))
@@ -890,8 +921,7 @@ export default sendNotify;
                 flag.store(true, Ordering::SeqCst);
             }
 
-            let ret = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-            let kill_ok = ret == 0;
+            let kill_ok = Self::kill_process_tree(pid).await;
 
             if kill_ok {
                 if let Some(info) = exec_info {
