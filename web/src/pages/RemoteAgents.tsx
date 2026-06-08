@@ -1,4 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { Terminal as XTerm } from 'xterm';
+import { FitAddon } from 'xterm-addon-fit';
+import { WebLinksAddon } from 'xterm-addon-web-links';
 import {
   Button,
   Empty,
@@ -16,6 +19,8 @@ import {
 } from '@arco-design/web-react';
 import {
   IconCode,
+  IconClose,
+  IconDelete,
   IconFile,
   IconFolder,
   IconPlayArrow,
@@ -24,6 +29,7 @@ import {
 } from '@arco-design/web-react/icon';
 import { remoteApi } from '@/api/remote';
 import type { RemoteAgent, RemoteCommand } from '@/api/remote';
+import 'xterm/css/xterm.css';
 import './RemoteAgents.css';
 
 const TabPane = Tabs.TabPane;
@@ -74,14 +80,27 @@ const RemoteAgents: React.FC = () => {
   const [createModalVisible, setCreateModalVisible] = useState(false);
   const [newAgentName, setNewAgentName] = useState('');
   const [creatingAgent, setCreatingAgent] = useState(false);
+  const [regeneratingToken, setRegeneratingToken] = useState(false);
   const [createdCommand, setCreatedCommand] = useState('');
+  const [createdCommandAgentId, setCreatedCommandAgentId] = useState<number | null>(null);
   const pageRef = useRef<HTMLElement | null>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
+  const terminalRef = useRef<HTMLDivElement | null>(null);
+  const terminalInstanceRef = useRef<XTerm | null>(null);
+  const terminalWsRef = useRef<WebSocket | null>(null);
+  const terminalFitRef = useRef<FitAddon | null>(null);
+  const [terminalConnected, setTerminalConnected] = useState(false);
 
   const selectedAgent = useMemo(
     () => agents.find((agent) => agent.id === selectedAgentId) || null,
     [agents, selectedAgentId]
   );
+  const selectedAgentToken = selectedAgent?.token_hash?.startsWith('$2') ? '' : selectedAgent?.token_hash || '';
+  const activeAgentCommand = createdCommandAgentId === selectedAgentId
+    ? createdCommand
+    : selectedAgent && selectedAgentToken
+      ? buildAgentCommand(selectedAgent.id, selectedAgentToken)
+      : '';
 
   useEffect(() => {
     loadAgents();
@@ -102,12 +121,16 @@ const RemoteAgents: React.FC = () => {
     }
 
     const handleResize = () => updateCompact();
+    const handleTerminalResize = () => fitRemoteTerminal();
     window.addEventListener('resize', handleResize);
+    window.addEventListener('resize', handleTerminalResize);
 
     return () => {
       window.removeEventListener('resize', handleResize);
+      window.removeEventListener('resize', handleTerminalResize);
       observer?.disconnect();
       eventSourceRef.current?.close();
+      disconnectRemoteTerminal();
     };
   }, []);
 
@@ -118,6 +141,7 @@ const RemoteAgents: React.FC = () => {
     setFileContent('');
     setSelectedFilePath('');
     setFileDirty(false);
+    disconnectRemoteTerminal();
   }, [selectedAgentId]);
 
   useEffect(() => {
@@ -126,6 +150,18 @@ const RemoteAgents: React.FC = () => {
     if (selectedAgent?.status !== 'online') return;
     const timer = window.setInterval(loadStatus, 10000);
     return () => window.clearInterval(timer);
+  }, [activeView, selectedAgentId, selectedAgent?.status]);
+
+  useEffect(() => {
+    if (activeView === 'terminal' && selectedAgent && selectedAgent.status === 'online') {
+      window.setTimeout(() => {
+        if (!terminalWsRef.current || terminalWsRef.current.readyState === WebSocket.CLOSED) {
+          connectRemoteTerminal();
+        } else {
+          fitRemoteTerminal();
+        }
+      }, 80);
+    }
   }, [activeView, selectedAgentId, selectedAgent?.status]);
 
   const loadAgents = async () => {
@@ -301,8 +337,9 @@ const RemoteAgents: React.FC = () => {
     }
   };
 
-  const buildAgentCommand = (agentId: number, token: string) =>
-    `.\\zhuque-agent.exe start --server ${getServerOrigin()} --agent-id ${agentId} --token ${token} --config .\\zhuque-agent.json --allowed-roots .`;
+  function buildAgentCommand(agentId: number, token: string) {
+    return `.\\zhuque-agent.exe start --server ${getServerOrigin()} --agent-id ${agentId} --token ${token} --allowed-roots .`;
+  }
 
   const createAgent = async () => {
     if (!newAgentName.trim()) {
@@ -314,6 +351,7 @@ const RemoteAgents: React.FC = () => {
       const created = await remoteApi.createAgent({ name: newAgentName.trim() });
       const commandText = buildAgentCommand(created.agent.id, created.token);
       setCreatedCommand(commandText);
+      setCreatedCommandAgentId(created.agent.id);
       setSelectedAgentId(created.agent.id);
       setActiveView('setup');
       await loadAgents();
@@ -325,6 +363,57 @@ const RemoteAgents: React.FC = () => {
     } finally {
       setCreatingAgent(false);
     }
+  };
+
+  const regenerateAgentToken = async () => {
+    if (!selectedAgentId) {
+      Message.warning('请选择远程机器');
+      return;
+    }
+    Modal.confirm({
+      title: '刷新接入 token',
+      content: '会生成新的连接 token，并替换当前机器保存的 token。当前已在线连接不会立刻断开，后续重连需要使用新命令。',
+      okText: '刷新 token',
+      onOk: async () => {
+        setRegeneratingToken(true);
+        try {
+          const result = await remoteApi.regenerateAgentToken(selectedAgentId);
+          const commandText = buildAgentCommand(result.agent.id, result.token);
+          setCreatedCommand(commandText);
+          setCreatedCommandAgentId(result.agent.id);
+          setActiveView('setup');
+          Message.success('已刷新接入命令');
+        } catch (error: any) {
+          Message.error(error.response?.data?.error || '生成接入命令失败');
+        } finally {
+          setRegeneratingToken(false);
+        }
+      },
+    });
+  };
+
+  const deleteAgent = (agent: RemoteAgent) => {
+    Modal.confirm({
+      title: '移除远程机器',
+      content: `确定移除 ${agent.name}？相关命令记录会一起删除，在线 agent 连接也会失效。`,
+      okText: '移除',
+      okButtonProps: { status: 'danger' },
+      onOk: async () => {
+        try {
+          await remoteApi.deleteAgent(agent.id);
+          if (selectedAgentId === agent.id) {
+            setSelectedAgentId(null);
+            setCreatedCommand('');
+            setCreatedCommandAgentId(null);
+            disconnectRemoteTerminal();
+          }
+          await loadAgents();
+          Message.success('远程机器已移除');
+        } catch (error: any) {
+          Message.error(error.response?.data?.error || '移除远程机器失败');
+        }
+      },
+    });
   };
 
   const parentPath = (path: string) => {
@@ -437,6 +526,113 @@ const RemoteAgents: React.FC = () => {
     URL.revokeObjectURL(url);
   };
 
+  const fitRemoteTerminal = () => {
+    const fitAddon = terminalFitRef.current;
+    const term = terminalInstanceRef.current;
+    const ws = terminalWsRef.current;
+    if (!fitAddon || !term) return;
+    window.setTimeout(() => {
+      try {
+        fitAddon.fit();
+        if (ws?.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'resize', rows: term.rows, cols: term.cols }));
+        }
+      } catch {
+        // xterm fit can fail briefly while the tab is hidden.
+      }
+    }, 50);
+  };
+
+  const connectRemoteTerminal = () => {
+    if (!selectedAgentId || !terminalRef.current) return;
+    disconnectRemoteTerminal();
+
+    const isMobile = window.innerWidth <= 768;
+    const term = new XTerm({
+      cursorBlink: true,
+      fontSize: isMobile ? 12 : 14,
+      fontFamily: 'Menlo, Monaco, Consolas, "Courier New", monospace',
+      scrollback: 3000,
+      convertEol: true,
+      theme: {
+        background: '#15181d',
+        foreground: '#d7dde8',
+        cursor: '#ffffff',
+        selectionBackground: '#2f6feb66',
+      },
+    });
+    const fitAddon = new FitAddon();
+    term.loadAddon(fitAddon);
+    term.loadAddon(new WebLinksAddon());
+    term.open(terminalRef.current);
+    terminalInstanceRef.current = term;
+    terminalFitRef.current = fitAddon;
+
+    const token = localStorage.getItem('token');
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const ws = new WebSocket(
+      `${protocol}//${window.location.host}/api/remote/agents/${selectedAgentId}/terminal/connect${token ? `?token=${token}` : ''}`
+    );
+    terminalWsRef.current = ws;
+
+    ws.onopen = () => {
+      setTerminalConnected(true);
+      fitRemoteTerminal();
+    };
+    ws.onmessage = async (event) => {
+      if (typeof event.data === 'string') {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === 'session') return;
+          if (data.type === 'closed') {
+            if (data.error) term.writeln(`\r\nError: ${data.error}`);
+            setTerminalConnected(false);
+            return;
+          }
+        } catch {
+          term.write(event.data);
+          return;
+        }
+      }
+      if (event.data instanceof Blob) {
+        term.write(await event.data.text());
+      } else if (event.data instanceof ArrayBuffer) {
+        term.write(new TextDecoder().decode(event.data));
+      }
+    };
+    ws.onerror = () => {
+      Message.error('远程终端连接失败');
+      setTerminalConnected(false);
+    };
+    ws.onclose = () => {
+      setTerminalConnected(false);
+    };
+    term.onData((data) => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'input', data }));
+      }
+    });
+
+    fitRemoteTerminal();
+  };
+
+  const disconnectRemoteTerminal = (dispose = true) => {
+    if (terminalWsRef.current) {
+      terminalWsRef.current.close();
+      terminalWsRef.current = null;
+    }
+    setTerminalConnected(false);
+    if (dispose && terminalInstanceRef.current) {
+      terminalInstanceRef.current.dispose();
+      terminalInstanceRef.current = null;
+      terminalFitRef.current = null;
+    }
+  };
+
+  const clearRemoteTerminal = () => {
+    terminalInstanceRef.current?.clear();
+  };
+
   const formatBytes = (value?: number) => {
     if (!value && value !== 0) return '-';
     const units = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -497,10 +693,18 @@ const RemoteAgents: React.FC = () => {
   ];
 
   const renderAgentCard = (agent: RemoteAgent) => (
-    <button
+    <div
       key={agent.id}
+      role="button"
+      tabIndex={0}
       className={`remote-agent-card ${agent.id === selectedAgentId ? 'is-selected' : ''}`}
       onClick={() => setSelectedAgentId(agent.id)}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          setSelectedAgentId(agent.id);
+        }
+      }}
     >
       <span className="remote-agent-main">
         <span className="remote-agent-name">{agent.name}</span>
@@ -510,7 +714,17 @@ const RemoteAgents: React.FC = () => {
         <Tag color={statusColor(agent.status)}>{agent.status}</Tag>
         <span>{agent.os || '-'} / {agent.arch || '-'}</span>
       </span>
-    </button>
+      <Button
+        size="mini"
+        status="danger"
+        onClick={(event) => {
+          event.stopPropagation();
+          deleteAgent(agent);
+        }}
+      >
+        移除
+      </Button>
+    </div>
   );
 
   const renderAgentSelector = () => {
@@ -592,7 +806,7 @@ const RemoteAgents: React.FC = () => {
         <div className="remote-setup-head">
           <Typography.Title heading={6} className="remote-setup-title">接入远程机器</Typography.Title>
           <Typography.Text type="secondary">
-            远程机器需要先注册 agent，再保持 agent 在线。注册成功后这里会自动出现机器。
+            创建机器后生成一条带 token 的启动命令，在远程机器执行即可上线。
           </Typography.Text>
         </div>
 
@@ -600,9 +814,9 @@ const RemoteAgents: React.FC = () => {
           <div className="remote-setup-step">
             <span className="remote-step-index">1</span>
             <div>
-              <div className="remote-step-title">创建远程机器</div>
+              <div className="remote-step-title">创建机器并生成 token</div>
               <Typography.Text type="secondary">
-                在本页面点击“创建”，服务端会创建机器并分配专属连接 token。
+                每台机器使用独立 token，控制面板会保存并展示该机器的接入命令。
               </Typography.Text>
             </div>
           </div>
@@ -610,26 +824,33 @@ const RemoteAgents: React.FC = () => {
           <div className="remote-setup-step">
             <span className="remote-step-index">2</span>
             <div>
-              <div className="remote-step-title">分发 agent 到远程机器</div>
+              <div className="remote-step-title">复制一键接入命令</div>
               <Typography.Text type="secondary">
-                使用与服务端同版本的 `zhuque-agent` 二进制，不建议在生产机器临时拉源码构建。
+                命令包含 server、agent id、token、配置文件和允许访问目录。`--allowed-roots` 可按生产机器目录调整。
               </Typography.Text>
-              {renderCommandLine('scp zhuque-agent.exe worker-1:C:\\zhuque\\zhuque-agent.exe')}
+              {activeAgentCommand ? renderCommandLine(activeAgentCommand) : (
+                <Space wrap>
+                  {!selectedAgent ? (
+                    <Button type="primary" onClick={() => setCreateModalVisible(true)}>
+                      创建机器并生成命令
+                    </Button>
+                  ) : (
+                    <Button type="primary" loading={regeneratingToken} onClick={regenerateAgentToken}>
+                      刷新接入 token
+                    </Button>
+                  )}
+                </Space>
+              )}
             </div>
           </div>
 
           <div className="remote-setup-step">
             <span className="remote-step-index">3</span>
             <div>
-              <div className="remote-step-title">执行一键接入命令</div>
+              <div className="remote-step-title">在远程机器执行</div>
               <Typography.Text type="secondary">
-                复制创建后生成的一条命令，在远程机器执行即可上线。`--allowed-roots` 控制文件页可访问目录，多个目录用英文分号分隔。
+                确保远程机器上已有同版本 `zhuque-agent` 二进制，然后执行上面的命令。
               </Typography.Text>
-              {createdCommand ? renderCommandLine(createdCommand) : (
-                <Button type="primary" onClick={() => setCreateModalVisible(true)}>
-                  创建机器
-                </Button>
-              )}
             </div>
           </div>
         </div>
@@ -809,6 +1030,51 @@ const RemoteAgents: React.FC = () => {
     </div>
   );
 
+  const renderTerminal = () => (
+    <div className="remote-terminal">
+      {!selectedAgent ? renderSetupGuide() : (
+        <>
+          <div className="remote-toolbar remote-terminal-toolbar">
+            <Space size="small" wrap>
+              <Button
+                type="primary"
+                icon={<IconRefresh />}
+                onClick={connectRemoteTerminal}
+                disabled={terminalConnected || selectedAgent.status !== 'online'}
+              >
+                重连
+              </Button>
+              <Button icon={<IconDelete />} onClick={clearRemoteTerminal}>
+                清屏
+              </Button>
+              <Button
+                status="danger"
+                icon={<IconClose />}
+                onClick={() => disconnectRemoteTerminal()}
+                disabled={!terminalConnected}
+              >
+                断开
+              </Button>
+            </Space>
+            <div className="remote-terminal-status">
+              <span className={`remote-terminal-dot ${terminalConnected ? 'is-connected' : ''}`} />
+              <span>{terminalConnected ? '已连接' : selectedAgent.status === 'online' ? '未连接' : '机器离线'}</span>
+            </div>
+          </div>
+          <div className="remote-terminal-surface">
+            {selectedAgent.status === 'online' ? (
+              <div ref={terminalRef} className="remote-terminal-content" />
+            ) : (
+              <div className="remote-empty-panel">
+                <Empty description="机器在线后可打开远程终端" />
+              </div>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  );
+
   const renderFiles = () => (
     <div className="remote-files">
       {!selectedAgent ? renderSetupGuide() : (
@@ -944,6 +1210,7 @@ const RemoteAgents: React.FC = () => {
             {isCompact && <TabPane key="machines" title="机器">{renderMobileAgentList()}</TabPane>}
             <TabPane key="setup" title="接入">{renderSetupGuide()}</TabPane>
             <TabPane key="execute" title="执行">{renderExecute()}</TabPane>
+            <TabPane key="terminal" title="终端">{renderTerminal()}</TabPane>
             <TabPane key="logs" title="日志">{renderLogs()}</TabPane>
             <TabPane key="files" title="文件">{renderFiles()}</TabPane>
             <TabPane key="monitor" title="状态">{renderMonitor()}</TabPane>
@@ -965,9 +1232,9 @@ const RemoteAgents: React.FC = () => {
           onChange={setNewAgentName}
           placeholder="例如: worker-1"
         />
-        {createdCommand ? (
+        {activeAgentCommand ? (
           <div className="remote-created-command">
-            {renderCommandLine(createdCommand)}
+            {renderCommandLine(activeAgentCommand)}
           </div>
         ) : null}
       </Modal>

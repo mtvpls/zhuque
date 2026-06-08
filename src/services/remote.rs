@@ -4,8 +4,7 @@ use crate::models::{
     RemoteCommandLog, RemoteServerMessage,
 };
 use anyhow::{anyhow, Result};
-use bcrypt::{hash, verify, DEFAULT_COST};
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use rand::{rngs::OsRng, RngCore};
 use sqlx::SqlitePool;
 use std::collections::HashMap;
@@ -25,6 +24,7 @@ pub struct RemoteService {
     sessions: Arc<RwLock<HashMap<i64, RemoteSession>>>,
     log_channels: Arc<RwLock<HashMap<String, broadcast::Sender<String>>>>,
     pending_requests: Arc<RwLock<HashMap<String, oneshot::Sender<serde_json::Value>>>>,
+    terminal_channels: Arc<RwLock<HashMap<String, mpsc::UnboundedSender<RemoteAgentMessage>>>>,
 }
 
 impl RemoteService {
@@ -34,6 +34,7 @@ impl RemoteService {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             log_channels: Arc::new(RwLock::new(HashMap::new())),
             pending_requests: Arc::new(RwLock::new(HashMap::new())),
+            terminal_channels: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -59,7 +60,6 @@ impl RemoteService {
         }
 
         let token = Self::new_token();
-        let token_hash = hash(&token, DEFAULT_COST)?;
         let capabilities = payload
             .capabilities
             .as_ref()
@@ -81,7 +81,7 @@ impl RemoteService {
         .bind(payload.arch)
         .bind(payload.version)
         .bind(now)
-        .bind(token_hash)
+        .bind(&token)
         .bind(capabilities)
         .bind(tags)
         .execute(&*pool)
@@ -95,7 +95,6 @@ impl RemoteService {
 
     pub async fn create_agent(&self, payload: CreateRemoteAgentRequest) -> Result<CreateRemoteAgentResponse> {
         let token = Self::new_token();
-        let token_hash = hash(&token, DEFAULT_COST)?;
         let now = Utc::now();
         let pool = self.pool.read().await;
         let result = sqlx::query(
@@ -107,7 +106,7 @@ impl RemoteService {
         )
         .bind(payload.name)
         .bind(now)
-        .bind(token_hash)
+        .bind(&token)
         .bind(payload.remark)
         .execute(&*pool)
         .await?;
@@ -118,6 +117,26 @@ impl RemoteService {
             .get_agent(id)
             .await?
             .ok_or_else(|| anyhow!("agent not found after create"))?;
+        Ok(CreateRemoteAgentResponse { agent, token })
+    }
+
+    pub async fn regenerate_agent_token(&self, agent_id: i64) -> Result<CreateRemoteAgentResponse> {
+        let token = Self::new_token();
+        let pool = self.pool.read().await;
+        let result = sqlx::query("UPDATE remote_agents SET token_hash = ? WHERE id = ?")
+            .bind(&token)
+            .bind(agent_id)
+            .execute(&*pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(anyhow!("agent not found"));
+        }
+        drop(pool);
+
+        let agent = self
+            .get_agent(agent_id)
+            .await?
+            .ok_or_else(|| anyhow!("agent not found after token regeneration"))?;
         Ok(CreateRemoteAgentResponse { agent, token })
     }
 
@@ -133,7 +152,7 @@ impl RemoteService {
             return Err(anyhow!("agent is disabled"));
         }
 
-        if !verify(token, &agent.token_hash)? {
+        if token != agent.token_hash {
             return Err(anyhow!("invalid agent token"));
         }
 
@@ -181,6 +200,7 @@ impl RemoteService {
     }
 
     pub async fn detach_session(&self, agent_id: i64, session_id: &str) -> Result<()> {
+        let mut detached_current_session = false;
         {
             let mut sessions = self.sessions.write().await;
             if sessions
@@ -189,7 +209,12 @@ impl RemoteService {
                 .unwrap_or(false)
             {
                 sessions.remove(&agent_id);
+                detached_current_session = true;
             }
+        }
+
+        if !detached_current_session {
+            return Ok(());
         }
 
         let now = Utc::now();
@@ -209,6 +234,7 @@ impl RemoteService {
     }
 
     pub async fn list_agents(&self) -> Result<Vec<RemoteAgent>> {
+        self.mark_stale_agents_offline().await?;
         let pool = self.pool.read().await;
         Ok(sqlx::query_as::<_, RemoteAgent>(
             "SELECT * FROM remote_agents ORDER BY id DESC",
@@ -218,11 +244,25 @@ impl RemoteService {
     }
 
     pub async fn get_agent(&self, id: i64) -> Result<Option<RemoteAgent>> {
+        self.mark_stale_agents_offline().await?;
         let pool = self.pool.read().await;
         Ok(sqlx::query_as::<_, RemoteAgent>("SELECT * FROM remote_agents WHERE id = ?")
             .bind(id)
             .fetch_optional(&*pool)
             .await?)
+    }
+
+    pub async fn delete_agent(&self, agent_id: i64) -> Result<()> {
+        self.sessions.write().await.remove(&agent_id);
+        let pool = self.pool.read().await;
+        let result = sqlx::query("DELETE FROM remote_agents WHERE id = ?")
+            .bind(agent_id)
+            .execute(&*pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(anyhow!("agent not found"));
+        }
+        Ok(())
     }
 
     pub async fn create_command(
@@ -508,6 +548,68 @@ impl RemoteService {
         Self::await_pending(rx).await
     }
 
+    pub async fn open_terminal(
+        &self,
+        agent_id: i64,
+        rows: u16,
+        cols: u16,
+    ) -> Result<(String, mpsc::UnboundedReceiver<RemoteAgentMessage>)> {
+        let terminal_id = Uuid::new_v4().to_string();
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.terminal_channels
+            .write()
+            .await
+            .insert(terminal_id.clone(), tx);
+
+        if let Err(error) = self
+            .send_to_agent(
+                agent_id,
+                RemoteServerMessage::TerminalOpen {
+                    terminal_id: terminal_id.clone(),
+                    rows,
+                    cols,
+                },
+            )
+            .await
+        {
+            self.terminal_channels.write().await.remove(&terminal_id);
+            return Err(error);
+        }
+
+        Ok((terminal_id, rx))
+    }
+
+    pub async fn send_terminal_input(&self, agent_id: i64, terminal_id: String, data: String) -> Result<()> {
+        self.send_to_agent(
+            agent_id,
+            RemoteServerMessage::TerminalInput { terminal_id, data },
+        )
+        .await
+    }
+
+    pub async fn resize_terminal(&self, agent_id: i64, terminal_id: String, rows: u16, cols: u16) -> Result<()> {
+        self.send_to_agent(
+            agent_id,
+            RemoteServerMessage::TerminalResize {
+                terminal_id,
+                rows,
+                cols,
+            },
+        )
+        .await
+    }
+
+    pub async fn close_terminal(&self, agent_id: i64, terminal_id: &str) -> Result<()> {
+        self.terminal_channels.write().await.remove(terminal_id);
+        self.send_to_agent(
+            agent_id,
+            RemoteServerMessage::TerminalClose {
+                terminal_id: terminal_id.to_string(),
+            },
+        )
+        .await
+    }
+
     pub async fn get_command(&self, id: &str) -> Result<Option<RemoteCommand>> {
         let pool = self.pool.read().await;
         Ok(sqlx::query_as::<_, RemoteCommand>("SELECT * FROM remote_commands WHERE id = ?")
@@ -678,6 +780,34 @@ impl RemoteService {
                 )
                 .await;
             }
+            RemoteAgentMessage::TerminalOpened { terminal_id } => {
+                self.forward_terminal_message(
+                    &terminal_id,
+                    RemoteAgentMessage::TerminalOpened { terminal_id: terminal_id.clone() },
+                )
+                .await;
+            }
+            RemoteAgentMessage::TerminalOutput { terminal_id, data } => {
+                self.forward_terminal_message(
+                    &terminal_id,
+                    RemoteAgentMessage::TerminalOutput {
+                        terminal_id: terminal_id.clone(),
+                        data,
+                    },
+                )
+                .await;
+            }
+            RemoteAgentMessage::TerminalClosed { terminal_id, error } => {
+                self.forward_terminal_message(
+                    &terminal_id,
+                    RemoteAgentMessage::TerminalClosed {
+                        terminal_id: terminal_id.clone(),
+                        error,
+                    },
+                )
+                .await;
+                self.terminal_channels.write().await.remove(&terminal_id);
+            }
         }
 
         Ok(())
@@ -712,6 +842,16 @@ impl RemoteService {
             .map_err(|_| anyhow!("agent session is closed"))
     }
 
+    async fn mark_stale_agents_offline(&self) -> Result<()> {
+        let cutoff = Utc::now() - Duration::seconds(70);
+        let pool = self.pool.read().await;
+        sqlx::query("UPDATE remote_agents SET status = 'offline' WHERE status = 'online' AND last_seen_at < ?")
+            .bind(cutoff)
+            .execute(&*pool)
+            .await?;
+        Ok(())
+    }
+
     async fn register_pending_request(&self, request_id: &str) -> oneshot::Receiver<serde_json::Value> {
         let (tx, rx) = oneshot::channel();
         self.pending_requests
@@ -724,6 +864,12 @@ impl RemoteService {
     async fn resolve_pending_request(&self, request_id: &str, value: serde_json::Value) {
         if let Some(tx) = self.pending_requests.write().await.remove(request_id) {
             let _ = tx.send(value);
+        }
+    }
+
+    async fn forward_terminal_message(&self, terminal_id: &str, message: RemoteAgentMessage) {
+        if let Some(tx) = self.terminal_channels.read().await.get(terminal_id) {
+            let _ = tx.send(message);
         }
     }
 

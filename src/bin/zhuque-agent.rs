@@ -2,12 +2,21 @@ use anyhow::{anyhow, Result};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+#[cfg(not(target_os = "android"))]
+use std::io::{Read, Write};
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+#[cfg(not(target_os = "android"))]
+struct TerminalSession {
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+}
 
 #[derive(Debug, Deserialize)]
 struct RegisterResponse {
@@ -61,6 +70,22 @@ enum ServerMessage {
     FileMkdir { request_id: String, path: String },
     #[serde(rename = "file.rename")]
     FileRename { request_id: String, from: String, to: String },
+    #[serde(rename = "terminal.open")]
+    TerminalOpen {
+        terminal_id: String,
+        rows: u16,
+        cols: u16,
+    },
+    #[serde(rename = "terminal.input")]
+    TerminalInput { terminal_id: String, data: String },
+    #[serde(rename = "terminal.resize")]
+    TerminalResize {
+        terminal_id: String,
+        rows: u16,
+        cols: u16,
+    },
+    #[serde(rename = "terminal.close")]
+    TerminalClose { terminal_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +140,15 @@ enum AgentMessage {
         success: bool,
         error: Option<String>,
     },
+    #[serde(rename = "terminal.opened")]
+    TerminalOpened { terminal_id: String },
+    #[serde(rename = "terminal.output")]
+    TerminalOutput { terminal_id: String, data: String },
+    #[serde(rename = "terminal.closed")]
+    TerminalClosed {
+        terminal_id: String,
+        error: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -127,7 +161,7 @@ async fn main() -> Result<()> {
         Some("run") => run(&args).await,
         _ => {
             eprintln!(
-                "Usage:\n  zhuque-agent start --server http://127.0.0.1:3000 --agent-id <id> --token <agent-token> [--config zhuque-agent.json] [--allowed-roots <paths>]\n  zhuque-agent register --server http://127.0.0.1:3000 --token <register-token> --name <name>\n  zhuque-agent run --server http://127.0.0.1:3000 --agent-id <id> --token <agent-token> [--allowed-roots <paths>]"
+                "Usage:\n  zhuque-agent start --server http://127.0.0.1:3000 --agent-id <id> --token <agent-token> [--allowed-roots <paths>]\n  zhuque-agent register --server http://127.0.0.1:3000 --token <register-token> --name <name>\n  zhuque-agent run --server http://127.0.0.1:3000 --agent-id <id> --token <agent-token> [--allowed-roots <paths>]"
             );
             Ok(())
         }
@@ -143,31 +177,21 @@ async fn register(args: &[String]) -> Result<()> {
 
 async fn start(args: &[String]) -> Result<()> {
     let server = arg(args, "--server")?;
-    let config_path = arg_optional(args, "--config").unwrap_or_else(|| "zhuque-agent.json".to_string());
-
-    if let Ok(credentials) = load_credentials(&config_path).await {
-        println!("using saved agent_id={}", credentials.agent_id);
-        return run_agent(&server, credentials.agent_id, &credentials.token).await;
-    }
 
     if let Some(agent_id_raw) = arg_optional(args, "--agent-id") {
         let token = arg(args, "--token")?;
         let agent_id = parse_agent_id(&agent_id_raw)?;
-        let credentials = AgentCredentials { agent_id, token };
-        save_credentials(&config_path, &credentials).await?;
-        println!("saved credentials to {}", config_path);
-        return run_agent(&server, credentials.agent_id, &credentials.token).await;
+        return run_agent(&server, agent_id, &token).await;
     }
 
-    let data = register_agent(args).await?;
-    let credentials = AgentCredentials {
-        agent_id: data.agent_id,
-        token: data.token,
-    };
-    save_credentials(&config_path, &credentials).await?;
-    println!("registered agent_id={}", data.agent_id);
-    println!("saved credentials to {}", config_path);
-    run_agent(&server, credentials.agent_id, &credentials.token).await
+    if let Some(config_path) = arg_optional(args, "--config") {
+        if let Ok(credentials) = load_credentials(&config_path).await {
+            println!("using saved agent_id={}", credentials.agent_id);
+            return run_agent(&server, credentials.agent_id, &credentials.token).await;
+        }
+    }
+
+    Err(anyhow!("missing --agent-id and --token: create a machine in the web console and copy the generated command"))
 }
 
 async fn register_agent(args: &[String]) -> Result<RegisterResponse> {
@@ -183,8 +207,8 @@ async fn register_agent(args: &[String]) -> Result<RegisterResponse> {
         capabilities: serde_json::json!({
             "command": true,
             "status": true,
-            "file": false,
-            "terminal": false
+            "file": true,
+            "terminal": true
         }),
         tags: Vec::new(),
     };
@@ -218,6 +242,8 @@ async fn run_agent(server: &str, agent_id: i64, token: &str) -> Result<()> {
     let (writer, mut reader) = socket.split();
     let writer = Arc::new(Mutex::new(writer));
     let running_commands: Arc<Mutex<HashMap<String, u32>>> = Arc::new(Mutex::new(HashMap::new()));
+    #[cfg(not(target_os = "android"))]
+    let terminal_sessions: Arc<Mutex<HashMap<String, TerminalSession>>> = Arc::new(Mutex::new(HashMap::new()));
 
     send(
         &writer,
@@ -229,8 +255,8 @@ async fn run_agent(server: &str, agent_id: i64, token: &str) -> Result<()> {
             capabilities: serde_json::json!({
                 "command": true,
                 "status": true,
-                "file": false,
-                "terminal": false
+                "file": true,
+                "terminal": true
             }),
         },
     )
@@ -371,6 +397,72 @@ async fn run_agent(server: &str, agent_id: i64, token: &str) -> Result<()> {
                     ServerMessage::CommandKill { command_id } => {
                         if let Some(pid) = running_commands.lock().await.remove(&command_id) {
                             let _ = kill_process(pid).await;
+                        }
+                    }
+                    ServerMessage::TerminalOpen {
+                        terminal_id,
+                        rows,
+                        cols,
+                    } => {
+                        #[cfg(not(target_os = "android"))]
+                        {
+                            let terminal_writer = writer.clone();
+                            let terminal_sessions = terminal_sessions.clone();
+                            tokio::spawn(async move {
+                                let _ = open_terminal_session(
+                                    terminal_writer,
+                                    terminal_sessions,
+                                    terminal_id,
+                                    rows,
+                                    cols,
+                                )
+                                .await;
+                            });
+                        }
+                        #[cfg(target_os = "android")]
+                        {
+                            let _ = send(
+                                &writer,
+                                AgentMessage::TerminalClosed {
+                                    terminal_id,
+                                    error: Some("terminal is not supported on Android".to_string()),
+                                },
+                            )
+                            .await;
+                        }
+                    }
+                    ServerMessage::TerminalInput { terminal_id, data } => {
+                        #[cfg(not(target_os = "android"))]
+                        {
+                            if let Some(session) = terminal_sessions.lock().await.get(&terminal_id) {
+                                let mut writer = session.writer.lock().await;
+                                let _ = writer.write_all(data.as_bytes());
+                                let _ = writer.flush();
+                            }
+                        }
+                    }
+                    ServerMessage::TerminalResize {
+                        terminal_id,
+                        rows,
+                        cols,
+                    } => {
+                        #[cfg(not(target_os = "android"))]
+                        {
+                            if let Some(session) = terminal_sessions.lock().await.get(&terminal_id) {
+                                let master = session.master.lock().await;
+                                let _ = master.resize(portable_pty::PtySize {
+                                    rows,
+                                    cols,
+                                    pixel_width: 0,
+                                    pixel_height: 0,
+                                });
+                            }
+                        }
+                    }
+                    ServerMessage::TerminalClose { terminal_id } => {
+                        #[cfg(not(target_os = "android"))]
+                        {
+                            close_terminal_session(terminal_sessions.clone(), &terminal_id).await;
                         }
                     }
                 }
@@ -570,6 +662,175 @@ where
     Ok(())
 }
 
+#[cfg(not(target_os = "android"))]
+async fn open_terminal_session<W>(
+    ws_writer: Arc<Mutex<W>>,
+    terminal_sessions: Arc<Mutex<HashMap<String, TerminalSession>>>,
+    terminal_id: String,
+    rows: u16,
+    cols: u16,
+) -> Result<()>
+where
+    W: SinkExt<Message> + Unpin + Send + 'static,
+    <W as futures::Sink<Message>>::Error: std::fmt::Debug,
+{
+    let pty_system = portable_pty::native_pty_system();
+    let pair = match pty_system.openpty(portable_pty::PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    }) {
+        Ok(pair) => pair,
+        Err(error) => {
+            send(
+                &ws_writer,
+                AgentMessage::TerminalClosed {
+                    terminal_id,
+                    error: Some(format!("failed to create pty: {}", error)),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let shell = if cfg!(windows) {
+        "powershell.exe".to_string()
+    } else {
+        std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
+    };
+    let mut command = portable_pty::CommandBuilder::new(shell);
+    command.env("TERM", "xterm-256color");
+    if let Ok(current_dir) = std::env::current_dir() {
+        command.cwd(current_dir);
+    }
+
+    let child = match pair.slave.spawn_command(command) {
+        Ok(child) => child,
+        Err(error) => {
+            send(
+                &ws_writer,
+                AgentMessage::TerminalClosed {
+                    terminal_id,
+                    error: Some(format!("failed to spawn shell: {}", error)),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let mut reader = match pair.master.try_clone_reader() {
+        Ok(reader) => reader,
+        Err(error) => {
+            send(
+                &ws_writer,
+                AgentMessage::TerminalClosed {
+                    terminal_id,
+                    error: Some(format!("failed to clone pty reader: {}", error)),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let writer = match pair.master.take_writer() {
+        Ok(writer) => writer,
+        Err(error) => {
+            send(
+                &ws_writer,
+                AgentMessage::TerminalClosed {
+                    terminal_id,
+                    error: Some(format!("failed to open pty writer: {}", error)),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let master = Arc::new(Mutex::new(pair.master));
+    terminal_sessions.lock().await.insert(
+        terminal_id.clone(),
+        TerminalSession {
+            writer: Arc::new(Mutex::new(writer)),
+            master,
+            child,
+        },
+    );
+
+    send(
+        &ws_writer,
+        AgentMessage::TerminalOpened {
+            terminal_id: terminal_id.clone(),
+        },
+    )
+    .await?;
+
+    let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let read_terminal_id = terminal_id.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut buffer = [0u8; 8192];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(size) if size > 0 => {
+                    let text = String::from_utf8_lossy(&buffer[..size]).to_string();
+                    if output_tx.send(text).is_err() {
+                        break;
+                    }
+                }
+                Ok(_) => break,
+                Err(error) => {
+                    let _ = output_tx.send(format!("\r\n[terminal read error] {}\r\n", error));
+                    break;
+                }
+            }
+        }
+    });
+
+    let output_writer = ws_writer.clone();
+    let output_sessions = terminal_sessions.clone();
+    tokio::spawn(async move {
+        while let Some(data) = output_rx.recv().await {
+            if send(
+                &output_writer,
+                AgentMessage::TerminalOutput {
+                    terminal_id: read_terminal_id.clone(),
+                    data,
+                },
+            )
+            .await
+            .is_err()
+            {
+                break;
+            }
+        }
+        close_terminal_session(output_sessions, &read_terminal_id).await;
+        let _ = send(
+            &output_writer,
+            AgentMessage::TerminalClosed {
+                terminal_id: read_terminal_id,
+                error: None,
+            },
+        )
+        .await;
+    });
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "android"))]
+async fn close_terminal_session(
+    terminal_sessions: Arc<Mutex<HashMap<String, TerminalSession>>>,
+    terminal_id: &str,
+) {
+    if let Some(mut session) = terminal_sessions.lock().await.remove(terminal_id) {
+        let _ = session.child.kill();
+    }
+}
+
 async fn send<W>(writer: &Arc<Mutex<W>>, message: AgentMessage) -> Result<()>
 where
     W: SinkExt<Message> + Unpin + Send,
@@ -649,12 +910,6 @@ fn arg_optional(args: &[String], name: &str) -> Option<String> {
 async fn load_credentials(path: &str) -> Result<AgentCredentials> {
     let content = tokio::fs::read_to_string(path).await?;
     Ok(serde_json::from_str(&content)?)
-}
-
-async fn save_credentials(path: &str, credentials: &AgentCredentials) -> Result<()> {
-    let content = serde_json::to_string_pretty(&credentials)?;
-    tokio::fs::write(path, content).await?;
-    Ok(())
 }
 
 fn parse_agent_id(value: &str) -> Result<i64> {

@@ -146,6 +146,22 @@ pub enum RemoteServerMessage {
     FileMkdir { request_id: String, path: String },
     #[serde(rename = "file.rename")]
     FileRename { request_id: String, from: String, to: String },
+    #[serde(rename = "terminal.open")]
+    TerminalOpen {
+        terminal_id: String,
+        rows: u16,
+        cols: u16,
+    },
+    #[serde(rename = "terminal.input")]
+    TerminalInput { terminal_id: String, data: String },
+    #[serde(rename = "terminal.resize")]
+    TerminalResize {
+        terminal_id: String,
+        rows: u16,
+        cols: u16,
+    },
+    #[serde(rename = "terminal.close")]
+    TerminalClose { terminal_id: String },
     #[serde(rename = "status.request")]
     StatusRequest { request_id: String },
 }
@@ -200,6 +216,15 @@ pub enum RemoteAgentMessage {
     FileActionResult {
         request_id: String,
         success: bool,
+        error: Option<String>,
+    },
+    #[serde(rename = "terminal.opened")]
+    TerminalOpened { terminal_id: String },
+    #[serde(rename = "terminal.output")]
+    TerminalOutput { terminal_id: String, data: String },
+    #[serde(rename = "terminal.closed")]
+    TerminalClosed {
+        terminal_id: String,
         error: Option<String>,
     },
 }

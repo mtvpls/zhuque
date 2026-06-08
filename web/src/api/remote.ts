@@ -10,6 +10,7 @@ export interface RemoteAgent {
   status: string;
   last_seen_at?: string;
   registered_at: string;
+  token_hash: string;
   capabilities?: string;
   tags?: string;
   remark?: string;
@@ -48,6 +49,9 @@ export const remoteApi = {
   listAgents: () => request.get<RemoteAgent[]>('/remote/agents'),
   createAgent: (payload: { name: string; remark?: string }) =>
     request.post<CreateRemoteAgentResponse>('/remote/agents', payload),
+  deleteAgent: (agentId: number) => request.delete(`/remote/agents/${agentId}`),
+  regenerateAgentToken: (agentId: number) =>
+    request.post<CreateRemoteAgentResponse>(`/remote/agents/${agentId}/token`),
   getStatus: (agentId: number) => request.get<any>(`/remote/agents/${agentId}/status`),
   listFiles: (agentId: number, path: string) =>
     request.get<any>(`/remote/agents/${agentId}/files`, { params: { path } }),

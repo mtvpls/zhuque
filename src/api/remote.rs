@@ -37,6 +37,15 @@ pub struct FileQuery {
     pub path: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum RemoteTerminalClientMessage {
+    #[serde(rename = "input")]
+    Input { data: String },
+    #[serde(rename = "resize")]
+    Resize { rows: u16, cols: u16 },
+}
+
 pub async fn register_agent(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -67,10 +76,122 @@ pub async fn connect_agent(
     ws.on_upgrade(move |socket| handle_agent_socket(socket, state, query))
 }
 
+pub async fn connect_terminal(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+    Path(agent_id): Path<i64>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_terminal_socket(socket, state, agent_id))
+}
+
+async fn handle_terminal_socket(socket: WebSocket, state: Arc<AppState>, agent_id: i64) {
+    let (mut ws_sender, mut ws_receiver) = socket.split();
+    let (terminal_id, mut terminal_rx) = match state.remote_service.open_terminal(agent_id, 24, 80).await {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = ws_sender
+                .send(Message::Text(format!("Error: {}", error)))
+                .await;
+            return;
+        }
+    };
+
+    let _ = ws_sender
+        .send(Message::Text(format!(
+            r#"{{"type":"session","id":"{}"}}"#,
+            terminal_id
+        )))
+        .await;
+
+    let write_terminal_id = terminal_id.clone();
+    let write_task = tokio::spawn(async move {
+        while let Some(message) = terminal_rx.recv().await {
+            match message {
+                RemoteAgentMessage::TerminalOpened { .. } => {}
+                RemoteAgentMessage::TerminalOutput { data, .. } => {
+                    if ws_sender.send(Message::Text(data)).await.is_err() {
+                        break;
+                    }
+                }
+                RemoteAgentMessage::TerminalClosed { error, .. } => {
+                    let close_message = serde_json::json!({
+                        "type": "closed",
+                        "error": error,
+                    })
+                    .to_string();
+                    let _ = ws_sender.send(Message::Text(close_message)).await;
+                    let _ = ws_sender.close().await;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        tracing::info!("Remote terminal write task finished: {}", write_terminal_id);
+    });
+
+    let read_state = state.clone();
+    let read_terminal_id = terminal_id.clone();
+    let read_task = tokio::spawn(async move {
+        while let Some(msg) = ws_receiver.next().await {
+            match msg {
+                Ok(Message::Text(text)) => {
+                    if let Ok(message) = serde_json::from_str::<RemoteTerminalClientMessage>(&text) {
+                        let result = match message {
+                            RemoteTerminalClientMessage::Input { data } => {
+                                read_state
+                                    .remote_service
+                                    .send_terminal_input(agent_id, read_terminal_id.clone(), data)
+                                    .await
+                            }
+                            RemoteTerminalClientMessage::Resize { rows, cols } => {
+                                read_state
+                                    .remote_service
+                                    .resize_terminal(agent_id, read_terminal_id.clone(), rows, cols)
+                                    .await
+                            }
+                        };
+                        if let Err(error) = result {
+                            tracing::warn!("Failed to forward remote terminal message: {}", error);
+                            break;
+                        }
+                    }
+                }
+                Ok(Message::Binary(data)) => {
+                    let text = String::from_utf8_lossy(&data).to_string();
+                    if let Err(error) = read_state
+                        .remote_service
+                        .send_terminal_input(agent_id, read_terminal_id.clone(), text)
+                        .await
+                    {
+                        tracing::warn!("Failed to forward remote terminal binary input: {}", error);
+                        break;
+                    }
+                }
+                Ok(Message::Close(_)) => break,
+                Err(error) => {
+                    tracing::warn!("Remote terminal websocket error: {}", error);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+
+    tokio::select! {
+        _ = write_task => {}
+        _ = read_task => {}
+    }
+
+    if let Err(error) = state.remote_service.close_terminal(agent_id, &terminal_id).await {
+        tracing::warn!("Failed to close remote terminal {}: {}", terminal_id, error);
+    }
+}
+
 async fn handle_agent_socket(socket: WebSocket, state: Arc<AppState>, query: AgentConnectQuery) {
+    let agent_id = query.agent_id;
     if let Err(e) = state
         .remote_service
-        .authenticate_agent(query.agent_id, &query.token)
+        .authenticate_agent(agent_id, &query.token)
         .await
     {
         tracing::warn!("Remote agent auth failed: {}", e);
@@ -81,7 +202,7 @@ async fn handle_agent_socket(socket: WebSocket, state: Arc<AppState>, query: Age
     let (tx, mut rx) = mpsc::unbounded_channel();
     let session_id = match state
         .remote_service
-        .attach_session(query.agent_id, tx, None)
+        .attach_session(agent_id, tx, None)
         .await
     {
         Ok(id) => id,
@@ -105,7 +226,6 @@ async fn handle_agent_socket(socket: WebSocket, state: Arc<AppState>, query: Age
     });
 
     let read_state = state.clone();
-    let read_session_id = session_id.clone();
     let read_task = tokio::spawn(async move {
         while let Some(msg) = ws_receiver.next().await {
             match msg {
@@ -114,7 +234,7 @@ async fn handle_agent_socket(socket: WebSocket, state: Arc<AppState>, query: Age
                         Ok(message) => {
                             if let Err(e) = read_state
                                 .remote_service
-                                .handle_agent_message(query.agent_id, message)
+                                .handle_agent_message(agent_id, message)
                                 .await
                             {
                                 tracing::error!("Failed to handle agent message: {}", e);
@@ -131,19 +251,19 @@ async fn handle_agent_socket(socket: WebSocket, state: Arc<AppState>, query: Age
                 _ => {}
             }
         }
-
-        if let Err(e) = read_state
-            .remote_service
-            .detach_session(query.agent_id, &read_session_id)
-            .await
-        {
-            tracing::error!("Failed to detach remote session: {}", e);
-        }
     });
 
     tokio::select! {
         _ = write_task => {}
         _ = read_task => {}
+    }
+
+    if let Err(e) = state
+        .remote_service
+        .detach_session(agent_id, &session_id)
+        .await
+    {
+        tracing::error!("Failed to detach remote session: {}", e);
     }
 }
 
@@ -184,6 +304,44 @@ pub async fn get_agent(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
     Ok(Json(agent))
+}
+
+pub async fn delete_agent(
+    State(state): State<Arc<AppState>>,
+    Path(agent_id): Path<i64>,
+) -> Result<impl IntoResponse, StatusCode> {
+    state
+        .remote_service
+        .delete_agent(agent_id)
+        .await
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(|e| {
+            tracing::error!("Failed to delete remote agent: {}", e);
+            if e.to_string().contains("not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        })
+}
+
+pub async fn regenerate_agent_token(
+    State(state): State<Arc<AppState>>,
+    Path(agent_id): Path<i64>,
+) -> Result<impl IntoResponse, StatusCode> {
+    state
+        .remote_service
+        .regenerate_agent_token(agent_id)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            tracing::error!("Failed to regenerate remote agent token: {}", e);
+            if e.to_string().contains("not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        })
 }
 
 pub async fn create_command(
