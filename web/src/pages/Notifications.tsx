@@ -60,8 +60,17 @@ const CHANNEL_TYPES = [
 
 const typeLabel = (t: string) => CHANNEL_TYPES.find(c => c.value === t)?.label ?? t;
 const typeColor = (t: string) => CHANNEL_TYPES.find(c => c.value === t)?.color ?? 'gray';
-const createChannelId = () => globalThis.crypto?.randomUUID?.()
-  ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+const createChannelId = () => {
+  if (typeof globalThis.crypto?.randomUUID === 'function') {
+    return globalThis.crypto.randomUUID();
+  }
+
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (char) => {
+    const random = Math.floor(Math.random() * 16);
+    const value = char === 'x' ? random : (random & 0x3) | 0x8;
+    return value.toString(16);
+  });
+};
 
 // ─── 各渠道默认配置 ────────────────────────────────────────────────────────────
 
