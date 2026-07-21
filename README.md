@@ -336,8 +336,8 @@ docker run -d \
     --name zhuque \
     -p 3000:3000 \
     -v "$(pwd)/data:/app/data" \
-    -e JWT_SECRET=your_jwt_secret_key \
-    -e WEBHOOK_TOKEN=your_webhook_token \
+    -e JWT_SECRET='your_jwt_secret_key' \
+    -e WEBHOOK_TOKEN='your_webhook_token' \
     -e DATA_DIR=/app/data \
     -e PORT=3000 \
     -e RUST_LOG=info \
