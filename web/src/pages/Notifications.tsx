@@ -60,6 +60,8 @@ const CHANNEL_TYPES = [
 
 const typeLabel = (t: string) => CHANNEL_TYPES.find(c => c.value === t)?.label ?? t;
 const typeColor = (t: string) => CHANNEL_TYPES.find(c => c.value === t)?.color ?? 'gray';
+const createChannelId = () => globalThis.crypto?.randomUUID?.()
+  ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 
 // ─── 各渠道默认配置 ────────────────────────────────────────────────────────────
 
@@ -412,7 +414,7 @@ const Notifications: React.FC = () => {
   const handleModalOk = () => {
     if (!modalName.trim()) { Message.warning('请填写渠道名称'); return; }
     const entry: ChannelConfig = {
-      id:      editingId ?? crypto.randomUUID(),
+      id:      editingId ?? createChannelId(),
       name:    modalName.trim(),
       type:    modalType,
       enabled: modalEnabled,
