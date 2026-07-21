@@ -60,12 +60,13 @@
 使用预构建的 Docker 镜像快速启动：
 
 ```bash
-docker run -d 
-  --name zhuque 
-  -p 3000:3000 
-  -v $(pwd)/data:/app/data 
-  -e TZ=Asia/Shanghai 
-  ghcr.io/mtvpls/zhuque:latest
+docker run -d \
+    --name zhuque \
+    -p 3000:3000 \
+    -v "$(pwd)/data:/app/data" \
+    -e TZ=Asia/Shanghai \
+    --restart unless-stopped \
+    ghcr.io/mtvpls/zhuque:latest
 ```
 
 首次访问 `http://localhost:3000` 会自动跳转到初始设置页面，设置管理员账号和密码。
@@ -114,14 +115,14 @@ npm run dev
 #### 方式一：Docker 镜像（推荐）
 
 ```bash
-docker run -d 
-  --name zhuque 
-  -p 3000:3000 
-  -v $(pwd)/data:/app/data 
-  -e RUST_LOG=info 
-  -e TZ=Asia/Shanghai 
-  --restart unless-stopped 
-  ghcr.io/mtvpls/zhuque:latest
+docker run -d \
+    --name zhuque \
+    -p 3000:3000 \
+    -v "$(pwd)/data:/app/data" \
+    -e RUST_LOG=info \
+    -e TZ=Asia/Shanghai \
+    --restart unless-stopped \
+    ghcr.io/mtvpls/zhuque:latest
 ```
 
 > **首次启动：** 访问 `http://localhost:3000` 会自动跳转到初始设置页面，请设置管理员账号和强密码。
@@ -331,18 +332,18 @@ sendNotify('标题', '内容');
 **Docker 运行示例：**
 
 ```bash
-docker run -d 
-  --name zhuque 
-  -p 3000:3000 
-  -v $(pwd)/data:/app/data 
-  -e JWT_SECRET=your_jwt_secret_key 
-  -e WEBHOOK_TOKEN=your_webhook_token 
-  -e DATA_DIR=/app/data 
-  -e PORT=3000 
-  -e RUST_LOG=info 
-  -e TZ=Asia/Shanghai 
-  --restart unless-stopped 
-  ghcr.io/mtvpls/zhuque:latest
+docker run -d \
+    --name zhuque \
+    -p 3000:3000 \
+    -v "$(pwd)/data:/app/data" \
+    -e JWT_SECRET=your_jwt_secret_key \
+    -e WEBHOOK_TOKEN=your_webhook_token \
+    -e DATA_DIR=/app/data \
+    -e PORT=3000 \
+    -e RUST_LOG=info \
+    -e TZ=Asia/Shanghai \
+    --restart unless-stopped \
+    ghcr.io/mtvpls/zhuque:latest
 ```
 
 **重要提示：**
