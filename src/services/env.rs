@@ -109,6 +109,10 @@ impl EnvService {
         let mut query = String::from("UPDATE env_vars SET updated_at = ?");
         let mut has_update = false;
 
+        if update.key.is_some() {
+            query.push_str(", key = ?");
+            has_update = true;
+        }
         if update.value.is_some() {
             query.push_str(", value = ?");
             has_update = true;
@@ -131,6 +135,9 @@ impl EnvService {
 
         let mut q = sqlx::query(&query).bind(Utc::now());
 
+        if let Some(key) = &update.key {
+            q = q.bind(key);
+        }
         if let Some(value) = &update.value {
             q = q.bind(value);
         }
@@ -180,6 +187,7 @@ impl EnvService {
                 self.update(
                     id,
                     UpdateEnvVar {
+                        key: None,
                         value: Some(var.value),
                         remark: None,
                         enabled: None,
@@ -231,5 +239,70 @@ impl EnvService {
         }
         let result = q.execute(&*pool).await?;
         Ok(result.rows_affected() as usize)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn test_service() -> EnvService {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE env_vars (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                key TEXT NOT NULL UNIQUE,
+                value TEXT NOT NULL,
+                remark TEXT,
+                enabled BOOLEAN NOT NULL DEFAULT 1,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        EnvService::new(Arc::new(RwLock::new(pool)))
+    }
+
+    #[tokio::test]
+    async fn update_can_rename_key() {
+        let service = test_service().await;
+        let created = service
+            .create(CreateEnvVar {
+                key: "OLD_KEY".to_string(),
+                value: "value".to_string(),
+                remark: None,
+                enabled: Some(true),
+            })
+            .await
+            .unwrap();
+
+        let updated = service
+            .update(
+                created.id,
+                UpdateEnvVar {
+                    key: Some("NEW_KEY".to_string()),
+                    value: Some("updated".to_string()),
+                    remark: None,
+                    enabled: None,
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(updated.key, "NEW_KEY");
+        assert_eq!(updated.value, "updated");
+        assert!(service.get_by_key("OLD_KEY").await.unwrap().is_none());
+        assert_eq!(
+            service.get_by_key("NEW_KEY").await.unwrap().unwrap().id,
+            created.id
+        );
     }
 }
