@@ -34,6 +34,7 @@ import {
 } from '@arco-design/web-react/icon';
 import Editor from '@monaco-editor/react';
 import axios from 'axios';
+import { copyTextToClipboard } from '@/utils/clipboard';
 
 interface ScriptFile {
   name: string;
@@ -458,15 +459,15 @@ const Scripts: React.FC = () => {
     }
   };
 
-  const handleCopyPath = (file: ScriptFile) => {
+  const handleCopyPath = async (file: ScriptFile) => {
     if (file.isDirectory) return;
 
-    // 复制文件路径到剪贴板
-    navigator.clipboard.writeText(file.path).then(() => {
+    try {
+      await copyTextToClipboard(file.path);
       Message.success('路径已复制到剪贴板');
-    }).catch(() => {
+    } catch {
       Message.error('复制失败');
-    });
+    }
   };
 
   const handleDownload = async (file: ScriptFile) => {

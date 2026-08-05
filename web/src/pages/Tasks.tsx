@@ -29,6 +29,7 @@ import { logApi } from '@/api/log';
 import { notificationApi } from '@/api/notification';
 import axios from 'axios';
 import type { Task, TaskNotificationConfig, ChannelConfig } from '@/types';
+import { copyTextToClipboard } from '@/utils/clipboard';
 
 const FormItem = Form.Item;
 const { Option } = Select;
@@ -278,11 +279,15 @@ const Tasks: React.FC = () => {
     setWebhookVisible(true);
   };
 
-  const copyWebhookUrl = () => {
+  const copyWebhookUrl = async () => {
     if (currentWebhookTaskId) {
       const url = `${window.location.origin}/api/webhook/tasks/${currentWebhookTaskId}/trigger`;
-      navigator.clipboard.writeText(url);
-      Message.success('Webhook URL已复制到剪贴板');
+      try {
+        await copyTextToClipboard(url);
+        Message.success('Webhook URL已复制到剪贴板');
+      } catch {
+        Message.error('复制失败');
+      }
     }
   };
 
