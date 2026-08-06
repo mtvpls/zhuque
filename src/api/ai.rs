@@ -1,20 +1,23 @@
 use crate::api::AppState;
-use crate::models::AiConfig;
+use crate::models::{AiConfig, Claims};
 use axum::{
-    extract::State,
+    extract::{ws::{Message, WebSocket, WebSocketUpgrade}, Path, Query, State},
     http::StatusCode,
     response::{sse::{Event, KeepAlive, Sse}, IntoResponse},
     Json,
 };
-use futures::{stream::Stream, StreamExt};
+use futures::{sink::SinkExt, stream::{Stream, StreamExt}};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{convert::Infallible, process::Stdio, sync::Arc, time::Duration};
+use once_cell::sync::Lazy;
+use std::{collections::HashMap, convert::Infallible, process::Stdio, sync::Arc, time::Duration};
 use tokio::process::Command;
+use tokio::sync::{broadcast, RwLock};
+use tokio_util::sync::CancellationToken;
 use tokio::time::timeout;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AiChatRequest {
     pub mode: String,
     pub prompt: String,
@@ -27,9 +30,10 @@ pub struct AiChatRequest {
     pub history: Vec<AiHistoryMessage>,
     #[serde(default)]
     pub allow_commands: bool,
+    pub session_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AiHistoryMessage {
     pub role: String,
     pub content: String,
@@ -368,6 +372,7 @@ async fn run_workspace_command(
     command: &str,
     timeout_secs: Option<u64>,
     working_directory: Option<&str>,
+    cancel: Option<&CancellationToken>,
 ) -> Result<Value, String> {
     if command.trim().is_empty() {
         return Err("命令不能为空".to_string());
@@ -397,10 +402,13 @@ async fn run_workspace_command(
             .await
             .map_err(|_| "命令执行超时".to_string())?
             .map_err(|e| format!("命令执行失败: {e}"))?,
-        None => process
-            .output()
-            .await
-            .map_err(|e| format!("命令执行失败: {e}"))?,
+        None => match cancel {
+            Some(token) => tokio::select! {
+                _ = token.cancelled() => return Err("命令已取消".to_string()),
+                result = process.output() => result.map_err(|e| format!("命令执行失败: {e}"))?,
+            },
+            None => process.output().await.map_err(|e| format!("命令执行失败: {e}"))?,
+        },
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout).chars().take(120000).collect::<String>();
@@ -419,6 +427,7 @@ async fn execute_agent_tool(
     arguments: &Value,
     allow_commands: bool,
     attached_directory: Option<&str>,
+    cancel: Option<&CancellationToken>,
 ) -> Result<Value, String> {
     match name {
         "list_dir" => {
@@ -478,10 +487,238 @@ async fn execute_agent_tool(
         "run_command" if allow_commands => {
             let command = argument_string(arguments, "command")?;
             let timeout_secs = arguments.get("timeout_secs").and_then(Value::as_u64);
-            run_workspace_command(&state.script_service, &command, timeout_secs, attached_directory).await
+            run_workspace_command(&state.script_service, &command, timeout_secs, attached_directory, cancel).await
         }
         "run_script" | "run_command" => Err("用户未允许执行命令或脚本".to_string()),
         _ => Err(format!("未知工具: {name}")),
+    }
+}
+
+
+#[derive(Debug)]
+struct AiJob {
+    session_id: Option<String>,
+    user_key: String,
+    sender: broadcast::Sender<String>,
+    events: RwLock<Vec<String>>,
+    cancel: CancellationToken,
+}
+
+static AI_JOBS: Lazy<RwLock<HashMap<String, Arc<AiJob>>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+#[derive(Debug, Deserialize)]
+pub struct AgentWsQuery {
+    job_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum AgentWsMessage {
+    #[serde(rename = "start")]
+    Start { request: AiChatRequest },
+    #[serde(rename = "cancel")]
+    Cancel,
+}
+
+async fn publish_job(job: &Arc<AiJob>, payload: Value) {
+    let sequence = {
+        let mut events = job.events.write().await;
+        let sequence = events.len() as u64 + 1;
+        let message = json!({ "seq": sequence, "event": payload }).to_string();
+        events.push(message.clone());
+        let _ = job.sender.send(message);
+        sequence
+    };
+    let _ = sequence;
+}
+
+async fn run_agent_job(state: Arc<AppState>, request: AiChatRequest, job: Arc<AiJob>) {
+    if let Some(title) = store_session_message(&state, request.session_id.as_deref(), &job.user_key, "user", &request.prompt).await {
+        publish_job(&job, json!({"type":"session_title","title":title})).await;
+    }
+    let config = match state.config_service.get_ai_config().await {
+        Ok(config) if config.enabled && !config.api_key.trim().is_empty() && !config.model.trim().is_empty() => config,
+        Ok(_) => {
+            publish_job(&job, json!({"type":"error","message":"AI 尚未配置，请先在系统配置中填写 Provider、API Key 和模型"})).await;
+            set_session_job(&state, request.session_id.as_deref(), &job.user_key, None).await;
+            publish_job(&job, json!({"type":"done"})).await;
+            return;
+        }
+        Err(error) => {
+            publish_job(&job, json!({"type":"error","message":error.to_string()})).await;
+            set_session_job(&state, request.session_id.as_deref(), &job.user_key, None).await;
+            publish_job(&job, json!({"type":"done"})).await;
+            return;
+        }
+    };
+    let base_url = config.base_url.trim_end_matches('/');
+    let endpoint = if base_url.ends_with("/chat/completions") {
+        base_url.to_string()
+    } else {
+        format!("{base_url}/chat/completions")
+    };
+    let client = match Client::builder().build() {
+        Ok(client) => client,
+        Err(error) => {
+            publish_job(&job, json!({"type":"error","message":error.to_string()})).await;
+            set_session_job(&state, request.session_id.as_deref(), &job.user_key, None).await;
+            publish_job(&job, json!({"type":"done"})).await;
+            return;
+        }
+    };
+    let system = format!(
+        "你是 Zhuque 的脚本工作区 Agent。你可以浏览目录、读取文件、搜索代码{}。先使用工具获取必要上下文，不要猜测文件内容。当用户要求修改时，最后必须只返回合法 JSON，不要 Markdown 或额外文字。JSON 格式：{{\"summary\":\"简短说明\",\"files\":[{{\"path\":\"工作区相对路径\",\"operation\":\"update|create|delete\",\"content\":\"文件完整内容\"}}]}}。修改多个文件时全部放入 files。所有路径必须是工作区相对路径。附加目录存在时，所有工具路径都必须限制在该目录内；工具 path 为空表示附加目录根目录，禁止回到工作区根目录。{}",
+        if request.allow_commands { "，并可执行脚本和命令" } else { "" },
+        if request.allow_commands { "执行命令前确认命令不会破坏用户文件。" } else { "当前未授权执行命令或脚本。" },
+    );
+    let context = format!(
+        "模式: {}\n当前文件名: {}\n当前路径: {}\n当前附加目录: {}\n当前文件内容:\n{}\n\n最近执行输出:\n{}\n\n用户请求:\n{}",
+        request.mode,
+        request.file_name.as_deref().unwrap_or("未选择文件"),
+        request.file_path.as_deref().unwrap_or(""),
+        request.directory_path.as_deref().unwrap_or("未附加目录"),
+        request.file_content.as_deref().unwrap_or("未提供"),
+        request.execution_output.as_deref().unwrap_or("未提供"),
+        request.prompt,
+    );
+    let mut messages = vec![json!({"role":"system","content":system})];
+    for item in request.history.iter().rev().take(12).collect::<Vec<_>>().into_iter().rev() {
+        if (item.role == "user" || item.role == "assistant") && !item.content.trim().is_empty() {
+            messages.push(json!({"role":item.role,"content":item.content.chars().take(12000).collect::<String>()}));
+        }
+    }
+    messages.push(json!({"role":"user","content":context}));
+    let tools = agent_tools(request.allow_commands);
+    let mut final_content = String::new();
+
+    loop {
+        if job.cancel.is_cancelled() {
+            publish_job(&job, json!({"type":"cancelled","message":"任务已取消"})).await;
+            set_session_job(&state, request.session_id.as_deref(), &job.user_key, None).await;
+            publish_job(&job, json!({"type":"done"})).await;
+            return;
+        }
+        let response = match call_agent_provider(&client, &endpoint, &config.api_key, &config.model, &messages, &tools).await {
+            Ok(value) => value,
+            Err(error) => {
+                publish_job(&job, json!({"type":"error","message":error})).await;
+                set_session_job(&state, request.session_id.as_deref(), &job.user_key, None).await;
+                publish_job(&job, json!({"type":"done"})).await;
+                return;
+            }
+        };
+        let tool_calls = response.get("tool_calls").and_then(Value::as_array).cloned().unwrap_or_default();
+        messages.push(response.clone());
+        if tool_calls.is_empty() {
+            final_content = response.get("content").and_then(Value::as_str).unwrap_or("").to_string();
+            break;
+        }
+        for call in tool_calls {
+            let call_id = call.get("id").and_then(Value::as_str).unwrap_or("tool-call");
+            let function = call.get("function").cloned().unwrap_or(Value::Null);
+            let name = function.get("name").and_then(Value::as_str).unwrap_or("");
+            let arguments = match function.get("arguments") {
+                Some(Value::String(raw)) => serde_json::from_str::<Value>(raw).unwrap_or(Value::Object(Default::default())),
+                Some(value @ Value::Object(_)) => value.clone(),
+                _ => Value::Object(Default::default()),
+            };
+            publish_job(&job, json!({"type":"tool_call","tool":name,"arguments":arguments})).await;
+            let result = execute_agent_tool(&state, name, &arguments, request.allow_commands, request.directory_path.as_deref(), Some(&job.cancel)).await;
+            let (content, success) = match result {
+                Ok(value) => (value.to_string(), true),
+                Err(error) => (json!({"error":error}).to_string(), false),
+            };
+            publish_job(&job, json!({"type":"tool_result","tool":name,"success":success,"result":content.chars().take(6000).collect::<String>()})).await;
+            messages.push(json!({"role":"tool","tool_call_id":call_id,"content":content}));
+        }
+    }
+    if let Some(result) = parse_agent_result(&final_content) {
+        publish_job(&job, json!({"type":"changes","summary":result.summary,"files":result.files})).await;
+    } else {
+        publish_job(&job, json!({"type":"text","content":final_content})).await;
+    }
+    let _ = store_session_message(&state, request.session_id.as_deref(), &job.user_key, "assistant", &final_content).await;
+    set_session_job(&state, request.session_id.as_deref(), &job.user_key, None).await;
+    publish_job(&job, json!({"type":"done"})).await;
+}
+
+pub async fn agent_ws(
+    ws: WebSocketUpgrade,
+    Query(query): Query<AgentWsQuery>,
+    State(state): State<Arc<AppState>>,
+    Claims { sub, .. }: Claims,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_agent_ws(socket, query.job_id, state, sub))
+}
+
+async fn handle_agent_ws(socket: WebSocket, requested_job_id: Option<String>, state: Arc<AppState>, user_key: String) {
+    let (mut sender, mut receiver) = socket.split();
+    let job = if let Some(job_id) = requested_job_id {
+        match AI_JOBS.read().await.get(&job_id).filter(|job| job.user_key == user_key).cloned() {
+            Some(job) => Some(job),
+            None => {
+                let _ = sender.send(Message::Text(json!({"type":"error","message":"后台任务不存在或已过期"}).to_string().into())).await;
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let job = match job {
+        Some(job) => job,
+        None => {
+            let Some(Ok(Message::Text(message))) = receiver.next().await else { return; };
+            let Ok(AgentWsMessage::Start { request }) = serde_json::from_str::<AgentWsMessage>(&message) else {
+                let _ = sender.send(Message::Text(json!({"type":"error","message":"首条 WebSocket 消息必须是 start"}).to_string().into())).await;
+                return;
+            };
+            let job_id = uuid::Uuid::new_v4().to_string();
+            let (job_sender, _) = broadcast::channel(256);
+            let job = Arc::new(AiJob { session_id: request.session_id.clone(), user_key: user_key.clone(), sender: job_sender, events: RwLock::new(Vec::new()), cancel: CancellationToken::new() });
+            set_session_job(&state, request.session_id.as_deref(), &user_key, Some(&job_id)).await;
+            AI_JOBS.write().await.insert(job_id.clone(), job.clone());
+            publish_job(&job, json!({"type":"job_started","job_id":job_id})).await;
+            let job_for_task = job.clone();
+            tokio::spawn(run_agent_job(state, request, job_for_task));
+            job
+        }
+    };
+    let mut events = job.sender.subscribe();
+    let replay = job.events.read().await.clone();
+    let mut last_sequence = 0u64;
+    for message in replay {
+        if let Ok(value) = serde_json::from_str::<Value>(&message) {
+            last_sequence = value.get("seq").and_then(Value::as_u64).unwrap_or(last_sequence);
+        }
+        if sender.send(Message::Text(message.into())).await.is_err() { return; }
+    }
+    loop {
+        tokio::select! {
+            incoming = receiver.next() => {
+                match incoming {
+                    Some(Ok(Message::Text(message))) => {
+                        if matches!(serde_json::from_str::<AgentWsMessage>(&message), Ok(AgentWsMessage::Cancel)) {
+                            job.cancel.cancel();
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => return,
+                    _ => {}
+                }
+            }
+            event = events.recv() => {
+                match event {
+                    Ok(message) => {
+                        let sequence = serde_json::from_str::<Value>(&message).ok().and_then(|v| v.get("seq").and_then(Value::as_u64)).unwrap_or(0);
+                        if sequence <= last_sequence { continue; }
+                        last_sequence = sequence;
+                        if sender.send(Message::Text(message.into())).await.is_err() { return; }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        }
     }
 }
 
@@ -599,7 +836,7 @@ pub async fn agent(
                     "arguments": arguments,
                 }).to_string()));
 
-                let result = execute_agent_tool(&state, name, &arguments, request.allow_commands, request.directory_path.as_deref()).await;
+                let result = execute_agent_tool(&state, name, &arguments, request.allow_commands, request.directory_path.as_deref(), None).await;
                 let (content, success) = match result {
                     Ok(value) => (value.to_string(), true),
                     Err(error) => (json!({"error": error}).to_string(), false),
@@ -675,6 +912,144 @@ async fn call_agent_provider(
 
 fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+}
+
+#[derive(Debug, Serialize)]
+pub struct AiSessionSummary {
+    id: String,
+    title: String,
+    directory_path: Option<String>,
+    file_path: Option<String>,
+    active_job_id: Option<String>,
+    updated_at: String,
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct AiStoredMessage {
+    role: String,
+    content: String,
+}
+
+pub async fn list_sessions(
+    State(state): State<Arc<AppState>>,
+    Claims { sub, .. }: Claims,
+) -> Result<Json<Vec<AiSessionSummary>>, (StatusCode, String)> {
+    let pool = state.db_pool.read().await;
+    let rows = sqlx::query_as::<_, AiSessionSummaryRow>(
+        "SELECT id, title, directory_path, file_path, active_job_id, CAST(updated_at AS TEXT) AS updated_at FROM ai_sessions WHERE user_key = ? ORDER BY updated_at DESC"
+    ).bind(sub).fetch_all(&*pool).await.map_err(internal_error)?;
+    Ok(Json(rows.into_iter().map(Into::into).collect()))
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct AiSessionSummaryRow {
+    id: String, title: String, directory_path: Option<String>, file_path: Option<String>, active_job_id: Option<String>, updated_at: String,
+}
+impl From<AiSessionSummaryRow> for AiSessionSummary {
+    fn from(row: AiSessionSummaryRow) -> Self { Self { id: row.id, title: row.title, directory_path: row.directory_path, file_path: row.file_path, active_job_id: row.active_job_id, updated_at: row.updated_at } }
+}
+
+pub async fn create_session(
+    State(state): State<Arc<AppState>>,
+    Claims { sub, .. }: Claims,
+) -> Result<Json<AiSessionSummary>, (StatusCode, String)> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let pool = state.db_pool.read().await;
+    sqlx::query("INSERT INTO ai_sessions (id, user_key, title) VALUES (?, ?, '新会话')").bind(&id).bind(sub).execute(&*pool).await.map_err(internal_error)?;
+    let row = sqlx::query_as::<_, AiSessionSummaryRow>("SELECT id, title, directory_path, file_path, active_job_id, CAST(updated_at AS TEXT) AS updated_at FROM ai_sessions WHERE id = ?").bind(&id).fetch_one(&*pool).await.map_err(internal_error)?;
+    Ok(Json(row.into()))
+}
+
+pub async fn get_session_messages(
+    State(state): State<Arc<AppState>>,
+    Claims { sub, .. }: Claims,
+    Path(session_id): Path<String>,
+) -> Result<Json<Vec<AiStoredMessage>>, (StatusCode, String)> {
+    let pool = state.db_pool.read().await;
+    let owns: Option<(String,)> = sqlx::query_as("SELECT id FROM ai_sessions WHERE id = ? AND user_key = ?").bind(&session_id).bind(sub).fetch_optional(&*pool).await.map_err(internal_error)?;
+    if owns.is_none() { return Err((StatusCode::NOT_FOUND, "AI 会话不存在".into())); }
+    let rows = sqlx::query_as::<_, AiStoredMessage>("SELECT role, content FROM ai_messages WHERE session_id = ? ORDER BY id").bind(session_id).fetch_all(&*pool).await.map_err(internal_error)?;
+    Ok(Json(rows))
+}
+
+
+pub async fn delete_session(
+    State(state): State<Arc<AppState>>,
+    Claims { sub, .. }: Claims,
+    Path(session_id): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let pool = state.db_pool.read().await;
+    let active_job: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT active_job_id FROM ai_sessions WHERE id = ? AND user_key = ?",
+    )
+    .bind(&session_id)
+    .bind(&sub)
+    .fetch_optional(&*pool)
+    .await
+    .map_err(internal_error)?;
+
+    let Some((active_job_id,)) = active_job else {
+        return Err((StatusCode::NOT_FOUND, "AI 会话不存在".into()));
+    };
+
+    if let Some(job_id) = active_job_id {
+        if let Some(job) = AI_JOBS.read().await.get(&job_id).cloned() {
+            job.cancel.cancel();
+        }
+    }
+
+    sqlx::query("DELETE FROM ai_messages WHERE session_id = ?")
+        .bind(&session_id)
+        .execute(&*pool)
+        .await
+        .map_err(internal_error)?;
+    sqlx::query("DELETE FROM ai_sessions WHERE id = ? AND user_key = ?")
+        .bind(&session_id)
+        .bind(&sub)
+        .execute(&*pool)
+        .await
+        .map_err(internal_error)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn set_session_job(state: &AppState, session_id: Option<&str>, user_key: &str, job_id: Option<&str>) {
+    let Some(session_id) = session_id.filter(|value| !value.is_empty()) else { return; };
+    let pool = state.db_pool.read().await;
+    let _ = sqlx::query("UPDATE ai_sessions SET active_job_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_key = ?")
+        .bind(job_id).bind(session_id).bind(user_key).execute(&*pool).await;
+}
+
+async fn store_session_message(state: &AppState, session_id: Option<&str>, user_key: &str, role: &str, content: &str) -> Option<String> {
+    let Some(session_id) = session_id.filter(|value| !value.is_empty()) else { return None; };
+    let pool = state.db_pool.read().await;
+    let _ = sqlx::query("INSERT INTO ai_messages (session_id, role, content) SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM ai_sessions WHERE id = ? AND user_key = ?)")
+        .bind(session_id).bind(role).bind(content).bind(session_id).bind(user_key).execute(&*pool).await;
+    if role == "user" {
+        let trimmed = content.trim();
+        let first_line = trimmed.split(['\n', '\r']).next().unwrap_or("").trim();
+        let end = first_line
+            .char_indices()
+            .find(|(_, character)| matches!(character, '。' | '！' | '？' | '.' | '!' | '?'))
+            .map(|(index, character)| index + character.len_utf8())
+            .unwrap_or(first_line.len());
+        let title: String = first_line[..end].chars().take(40).collect();
+        let title = if title.trim().is_empty() { "未命名会话".to_string() } else { title };
+        let changed = sqlx::query(
+            "UPDATE ai_sessions SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_key = ? AND title = '新会话' AND NOT EXISTS (SELECT 1 FROM ai_messages WHERE session_id = ? AND role = 'user' AND id < (SELECT MAX(id) FROM ai_messages WHERE session_id = ? AND role = 'user'))",
+        )
+        .bind(&title).bind(session_id).bind(user_key).bind(session_id).bind(session_id)
+        .execute(&*pool).await
+        .map(|result| result.rows_affected() > 0)
+        .unwrap_or(false);
+        if changed {
+            return Some(title);
+        }
+    } else {
+        let _ = sqlx::query("UPDATE ai_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_key = ?")
+            .bind(session_id).bind(user_key).execute(&*pool).await;
+    }
+    None
 }
 
 pub async fn config(

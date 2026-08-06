@@ -237,6 +237,32 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool> {
         .await
         .ok(); // 忽略错误，字段可能已存在
 
+    // AI 多会话与消息记录
+    sqlx::query(r#"
+        CREATE TABLE IF NOT EXISTS ai_sessions (
+            id TEXT PRIMARY KEY,
+            user_key TEXT NOT NULL,
+            title TEXT NOT NULL DEFAULT '新会话',
+            directory_path TEXT,
+            file_path TEXT,
+            active_job_id TEXT,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    "#).execute(&pool).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_ai_sessions_user_updated ON ai_sessions(user_key, updated_at DESC)").execute(&pool).await?;
+    sqlx::query(r#"
+        CREATE TABLE IF NOT EXISTS ai_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (session_id) REFERENCES ai_sessions(id) ON DELETE CASCADE
+        )
+    "#).execute(&pool).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_ai_messages_session ON ai_messages(session_id, id)").execute(&pool).await?;
+
     // 执行增量压缩回收空间
     sqlx::query("PRAGMA incremental_vacuum")
         .execute(&pool)
@@ -248,6 +274,16 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool> {
         r#"
         INSERT OR IGNORE INTO system_configs (key, value, description)
         VALUES ('log_retention_days', '30', '日志保留天数')
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .ok();
+
+    sqlx::query(
+        r#"
+        INSERT OR IGNORE INTO system_configs (key, value, description)
+        VALUES ('ai_session_retention_days', '7', 'AI 会话无活动保留天数')
         "#,
     )
     .execute(&pool)

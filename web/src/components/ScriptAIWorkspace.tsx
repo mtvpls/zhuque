@@ -10,14 +10,18 @@ import {
 } from '@arco-design/web-react';
 import {
   IconCheck,
+  IconArrowLeft,
   IconCode,
+  IconDelete,
   IconClose,
   IconCopy,
   IconFile,
   IconFolder,
+  IconHistory,
   IconInfoCircle,
   IconLoading,
   IconPlayArrow,
+  IconPlus,
   IconRefresh,
   IconRobot,
   IconSend,
@@ -58,6 +62,25 @@ interface ConversationMessage {
   content: string;
 }
 
+interface AiSession {
+  id: string;
+  title: string;
+  active_job_id?: string | null;
+  updated_at: string;
+}
+
+const formatSessionTime = (value: string) => {
+  const timestamp = new Date(value.replace(' ', 'T') + 'Z');
+  if (Number.isNaN(timestamp.getTime())) return value;
+  return timestamp.toLocaleString('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
+};
+
 type FeedItem =
   | { kind: 'event'; event: AgentEvent }
   | { kind: 'message'; message: ConversationMessage };
@@ -82,17 +105,61 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
   const [draftChanges, setDraftChanges] = useState<AgentFileChange[] | null>(null);
   const [running, setRunning] = useState(false);
   const [conversation, setConversation] = useState<ConversationMessage[]>([]);
+  const [sessions, setSessions] = useState<AiSession[]>([]);
+  const [sessionId, setSessionId] = useState<string | null>(null);
   const [permissionMode, setPermissionMode] = useState<PermissionMode>('ask');
   const [pendingPermission, setPendingPermission] = useState<'command' | 'change' | null>(null);
   const [pendingRequest, setPendingRequest] = useState('');
+  const [showSessions, setShowSessions] = useState(false);
   const [contextEnabled, setContextEnabled] = useState(Boolean(filePath || fileName));
   const [workspaceWidth, setWorkspaceWidth] = useState(360);
   const resizeState = useRef<{ startX: number; startWidth: number } | null>(null);
-  const abortController = useRef<AbortController | null>(null);
+  const socketRef = useRef<WebSocket | null>(null);
+  const storedJobs = JSON.parse(localStorage.getItem('script-ai-active-jobs') || '{}') as Record<string, string>;
+  const sessionJobsRef = useRef<Record<string, string>>(storedJobs);
+  const jobIdRef = useRef<string | null>(null);
+  const activeRequestRef = useRef('');
+  const assistantTextRef = useRef('');
+  const reconnectTimerRef = useRef<number | null>(null);
+  const keepSubscribedRef = useRef(false);
+  const lastSequenceRef = useRef(0);
+  const sessionIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     setContextEnabled(!aiDirectoryPath && Boolean(filePath || fileName));
   }, [aiDirectoryPath, filePath, fileName]);
+
+  useEffect(() => {
+    if (!visible) return;
+    const headers = { Authorization: `Bearer ${localStorage.getItem('token') || ''}` };
+    void (async () => {
+      const response = await fetch('/api/ai/sessions', { headers });
+      if (!response.ok) return;
+      let list = await response.json() as AiSession[];
+      if (list.length === 0) {
+        const created = await fetch('/api/ai/sessions', { method: 'POST', headers });
+        if (created.ok) list = [await created.json() as AiSession];
+      }
+      setSessions(list);
+      for (const session of list) {
+        if (session.active_job_id) sessionJobsRef.current[session.id] = session.active_job_id;
+      }
+      localStorage.setItem('script-ai-active-jobs', JSON.stringify(sessionJobsRef.current));
+      setSessionId((current) => current && list.some((item) => item.id === current) ? current : list[0]?.id || null);
+    })().catch(() => undefined);
+  }, [visible]);
+
+  useEffect(() => {
+    if (!sessionId || !visible) return;
+    void fetch(`/api/ai/sessions/${encodeURIComponent(sessionId)}/messages`, {
+      headers: { Authorization: `Bearer ${localStorage.getItem('token') || ''}` },
+    }).then(async (response) => {
+      if (!response.ok) return;
+      const messages = await response.json() as ConversationMessage[];
+      setConversation(messages);
+      setFeedItems(messages.map((message) => ({ kind: 'message' as const, message })));
+    }).catch(() => undefined);
+  }, [sessionId, visible]);
 
   const groupedFeed = useMemo<FeedGroup[]>(() => {
     const groups: FeedGroup[] = [];
@@ -150,16 +217,124 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
       .trim();
   };
 
-  const handleSubmit = async (approvedCommand = false) => {
+  const connectJob = (jobId?: string, startRequest?: Record<string, unknown>, socketSessionId = sessionIdRef.current) => {
+    const token = localStorage.getItem('token') || '';
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const query = `token=${encodeURIComponent(token)}${jobId ? `&job_id=${encodeURIComponent(jobId)}` : ''}`;
+    const socket = new WebSocket(`${protocol}//${window.location.host}/api/ai/ws?${query}`);
+    socketRef.current = socket;
+    assistantTextRef.current = '';
+    keepSubscribedRef.current = true;
+
+    socket.onopen = () => {
+      if (startRequest) {
+        socket.send(JSON.stringify({ type: 'start', request: startRequest }));
+      }
+      setRunning(true);
+    };
+
+    socket.onmessage = (message) => {
+      try {
+        const envelope = JSON.parse(message.data) as { event?: Record<string, unknown>; seq?: number };
+        if (typeof envelope.seq === 'number' && envelope.seq <= lastSequenceRef.current) return;
+        if (typeof envelope.seq === 'number') lastSequenceRef.current = envelope.seq;
+        if (socketSessionId !== sessionIdRef.current) return;
+        const payload = (envelope.event || envelope) as Record<string, any>;
+        const type = String(payload.type || '');
+        const tool = typeof payload.tool === 'string' ? payload.tool : 'unknown';
+        if (type === 'session_title') {
+          const title = typeof payload.title === 'string' ? payload.title : '';
+          if (title && socketSessionId) {
+            setSessions((previous) => previous.map((session) => (
+              session.id === socketSessionId ? { ...session, title } : session
+            )));
+          }
+        } else if (type === 'job_started') {
+          const id = typeof payload.job_id === 'string' ? payload.job_id : null;
+          if (id) {
+            jobIdRef.current = id;
+            if (socketSessionId) {
+              sessionJobsRef.current[socketSessionId] = id;
+              localStorage.setItem('script-ai-active-jobs', JSON.stringify(sessionJobsRef.current));
+            }
+          }
+        } else if (type === 'tool_call') {
+          addEvent('调用工具 · ' + tool, payload.arguments ? JSON.stringify(payload.arguments) : undefined);
+        } else if (type === 'tool_result') {
+          const result = typeof payload.result === 'string' ? payload.result : '';
+          addEvent('工具完成 · ' + tool, result.slice(0, 1600) || (payload.success ? '无输出' : '执行失败'), payload.success ? 'success' : 'error');
+        } else if (type === 'text') {
+          assistantTextRef.current += typeof payload.content === 'string' ? payload.content : '';
+        } else if (type === 'changes') {
+          const changes = (Array.isArray(payload.files) ? payload.files : []).filter((change): change is AgentFileChange => {
+            const item = change as AgentFileChange;
+            return Boolean(item && typeof item.path === 'string' &&
+              (item.operation === 'update' || item.operation === 'create' || item.operation === 'delete') &&
+              (item.operation === 'delete' || typeof item.content === 'string'));
+          });
+          setDraftChanges(changes);
+          assistantTextRef.current = String(payload.summary || '已生成多文件修改提案，请检查 Diff。');
+          addEvent('生成多文件修改提案', changes.length + ' 个文件等待应用', 'warning');
+        } else if (type === 'cancelled') {
+          addEvent('任务已取消', String(payload.message || '当前任务已停止'), 'warning');
+        } else if (type === 'error') {
+          const errorMessage = String(payload.message || '无法连接 AI Agent');
+          addEvent('Agent 请求失败', errorMessage, 'error');
+          if (errorMessage.includes('后台任务不存在') && socketSessionId) {
+            delete sessionJobsRef.current[socketSessionId];
+            localStorage.setItem('script-ai-active-jobs', JSON.stringify(sessionJobsRef.current));
+            if (socketSessionId === sessionIdRef.current) {
+              jobIdRef.current = null;
+              keepSubscribedRef.current = false;
+            }
+          }
+        } else if (type === 'done') {
+          const finalAssistantMessage = assistantTextRef.current || 'Agent 已完成。';
+          const request = activeRequestRef.current;
+          if (request) {
+            setConversation((previous) => [...previous, { role: 'user', content: request }, { role: 'assistant', content: finalAssistantMessage }]);
+            setFeedItems((previous) => [...previous, { kind: 'message', message: { role: 'assistant', content: finalAssistantMessage } }]);
+          }
+          activeRequestRef.current = '';
+          if (socketSessionId) {
+            delete sessionJobsRef.current[socketSessionId];
+            localStorage.setItem('script-ai-active-jobs', JSON.stringify(sessionJobsRef.current));
+          }
+          if (socketSessionId === sessionIdRef.current) jobIdRef.current = null;
+          keepSubscribedRef.current = false;
+          setRunning(false);
+          socket.close();
+        }
+      } catch (error: any) {
+        addEvent('Agent 事件解析失败', error?.message || '无效事件', 'error');
+      }
+    };
+
+    socket.onerror = () => {
+      addEvent('AI 连接异常', '任务仍在服务端运行，重新打开工作台后会继续接收结果', 'warning');
+    };
+    socket.onclose = () => {
+      if (socketRef.current === socket) socketRef.current = null;
+      if (keepSubscribedRef.current && jobIdRef.current) {
+        setRunning(true);
+        reconnectTimerRef.current = window.setTimeout(() => {
+          reconnectTimerRef.current = null;
+          if (keepSubscribedRef.current && socketSessionId === sessionIdRef.current && jobIdRef.current && !socketRef.current) connectJob(jobIdRef.current, undefined, socketSessionId);
+        }, 1000);
+      } else if (jobIdRef.current) {
+        setRunning(false);
+      }
+    };
+    return socket;
+  };
+
+  const handleSubmit = (approvedCommand = false) => {
     const request = (approvedCommand ? pendingRequest : prompt).trim();
     if (!request || running) return;
     if (!approvedCommand && permissionMode !== 'session' && looksLikeCommandRequest(request)) {
       setPendingRequest(request);
       setPendingPermission('command');
-      setFeedItems((previous) => [
-        ...previous,
-        { kind: 'message', message: { role: 'user', content: request } },
-      ]);
+      setFeedItems((previous) => [...previous, { kind: 'message', message: { role: 'user', content: request } }]);
       return;
     }
 
@@ -168,140 +343,47 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
     setRunning(true);
     setPrompt('');
     setDraftChanges(null);
-    const controller = new AbortController();
-    abortController.current = controller;
+    keepSubscribedRef.current = true;
+    sessionIdRef.current = sessionId;
+    lastSequenceRef.current = 0;
+    activeRequestRef.current = request;
+    assistantTextRef.current = '';
     if (!approvedCommand) {
-      setFeedItems((previous) => [
-        ...previous,
-        { kind: 'message', message: { role: 'user', content: request } },
-      ]);
+      setFeedItems((previous) => [...previous, { kind: 'message', message: { role: 'user', content: request } }]);
     }
     addEvent('准备工作区上下文', aiDirectoryPath || filePath || fileName || '未选择文件');
-
-    try {
-      const token = localStorage.getItem('token');
-      const response = await fetch('/api/ai/agent', {
-        method: 'POST',
-        headers: {
-          Authorization: 'Bearer ' + token,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          mode: 'agent',
-          prompt: request,
-          file_name: contextEnabled ? fileName : undefined,
-          file_path: contextEnabled ? filePath : undefined,
-          file_content: contextEnabled ? fileContent : undefined,
-          execution_output: contextEnabled ? executionOutput : undefined,
-          directory_path: aiDirectoryPath,
-          history: conversation.slice(-12),
-          allow_commands: approvedCommand || permissionMode === 'session',
-        }),
-        signal: controller.signal,
-      });
-
-      if (!response.ok) throw new Error(await response.text() || 'AI Agent 请求失败');
-      if (!response.body) throw new Error('AI Agent 没有返回事件流');
-
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      let streamedText = '';
-      let assistantMessage = '';
-
-      const consumeLine = (line: string) => {
-        if (!line.startsWith('data:')) return;
-        const raw = line.slice(5).trim();
-        if (!raw) return;
-
-        const payload = JSON.parse(raw) as {
-          type?: string;
-          tool?: string;
-          success?: boolean;
-          message?: string;
-          result?: string;
-          content?: string;
-          summary?: string;
-          files?: AgentFileChange[];
-          arguments?: unknown;
-        };
-
-        if (payload.type === 'tool_call') {
-          addEvent(
-            '调用工具 · ' + (payload.tool || 'unknown'),
-            payload.arguments ? JSON.stringify(payload.arguments) : undefined,
-            'neutral',
-          );
-        } else if (payload.type === 'tool_result') {
-          const resultDetail = payload.result
-            ? payload.result.slice(0, 1600)
-            : (payload.success ? '无输出' : '执行失败');
-          addEvent(
-            '工具完成 · ' + (payload.tool || 'unknown'),
-            resultDetail,
-            payload.success ? 'success' : 'error',
-          );
-        } else if (payload.type === 'text') {
-          streamedText += payload.content || '';
-          assistantMessage = streamedText;
-        } else if (payload.type === 'changes') {
-          const changes = (payload.files || []).filter((change) =>
-            change &&
-            typeof change.path === 'string' &&
-            (change.operation === 'update' || change.operation === 'create' || change.operation === 'delete') &&
-            (change.operation === 'delete' || typeof change.content === 'string'),
-          );
-          setDraftChanges(changes);
-          assistantMessage = payload.summary || '已生成多文件修改提案，请检查 Diff。';
-          addEvent('生成多文件修改提案', changes.length + ' 个文件等待应用', 'warning');
-        } else if (payload.type === 'error') {
-          throw new Error(payload.message || 'Agent 执行失败');
-        }
-      };
-
-      while (true) {
-        const result = await reader.read();
-        if (result.done) break;
-        buffer += decoder.decode(result.value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-        for (const line of lines) {
-          try {
-            consumeLine(line.trimEnd());
-          } catch (error) {
-            throw error instanceof Error ? error : new Error('Agent 事件解析失败');
-          }
-        }
-      }
-      if (buffer.trim()) consumeLine(buffer.trim());
-
-      const finalAssistantMessage = assistantMessage || streamedText || 'Agent 已完成。';
-      setConversation((previous) => [
-        ...previous,
-        { role: 'user', content: request },
-        { role: 'assistant', content: finalAssistantMessage },
-      ]);
-      setFeedItems((previous) => [
-        ...previous,
-        { kind: 'message', message: { role: 'assistant', content: finalAssistantMessage } },
-      ]);
-    } catch (error: any) {
-      setPendingPermission(null);
-      if (error?.name === 'AbortError') {
-        addEvent('已手动中断 AI 请求', '当前请求已停止', 'warning');
-      } else {
-        addEvent('Agent 请求失败', error.message || '无法连接 AI Agent', 'error');
-      }
-    } finally {
-      if (abortController.current === controller) abortController.current = null;
-      setRunning(false);
-    }
+    connectJob(undefined, {
+      mode: 'agent',
+      prompt: request,
+      file_name: contextEnabled ? fileName : undefined,
+      file_path: contextEnabled ? filePath : undefined,
+      file_content: contextEnabled ? fileContent : undefined,
+      execution_output: contextEnabled ? executionOutput : undefined,
+      directory_path: aiDirectoryPath,
+      history: conversation.slice(-12),
+      allow_commands: approvedCommand || permissionMode === 'session',
+      session_id: sessionId,
+    });
   };
 
   const stopAgent = () => {
-    if (!running || !abortController.current) return;
-    abortController.current.abort();
+    if (!running || !socketRef.current || socketRef.current.readyState !== WebSocket.OPEN) return;
+    socketRef.current.send(JSON.stringify({ type: 'cancel' }));
   };
+
+  useEffect(() => {
+    sessionIdRef.current = sessionId;
+    jobIdRef.current = sessionId ? sessionJobsRef.current[sessionId] || null : null;
+    keepSubscribedRef.current = visible;
+    if (visible && sessionId && jobIdRef.current && !socketRef.current) connectJob(jobIdRef.current, undefined, sessionId);
+    return () => {
+      keepSubscribedRef.current = false;
+      if (reconnectTimerRef.current !== null) window.clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+      socketRef.current?.close();
+      socketRef.current = null;
+    };
+  }, [visible, sessionId]);
 
   const applyDraft = async (remember = false) => {
     if (!draftChanges || draftChanges.length === 0) return;
@@ -359,6 +441,57 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
     document.body.style.userSelect = 'none';
   };
 
+  const selectSession = (value: string) => {
+    keepSubscribedRef.current = false;
+    socketRef.current?.close();
+    socketRef.current = null;
+    sessionIdRef.current = value;
+    jobIdRef.current = sessionJobsRef.current[value] || null;
+    lastSequenceRef.current = 0;
+    activeRequestRef.current = '';
+    setRunning(false);
+    setSessionId(value);
+    setDraftChanges(null);
+    setPendingPermission(null);
+    setPendingRequest('');
+    setShowSessions(false);
+  };
+
+  const createSession = async () => {
+    const response = await fetch('/api/ai/sessions', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + (localStorage.getItem('token') || '') },
+    });
+    if (!response.ok) return;
+    const created = await response.json() as AiSession;
+    setSessions((previous) => [created, ...previous]);
+    selectSession(created.id);
+    setConversation([]);
+    setFeedItems([]);
+    setDraftChanges(null);
+  };
+
+  const deleteSession = async (session: AiSession) => {
+    if (!window.confirm('确定删除这个 AI 会话及其聊天记录吗？')) return;
+    const response = await fetch('/api/ai/sessions/' + encodeURIComponent(session.id), {
+      method: 'DELETE',
+      headers: { Authorization: 'Bearer ' + (localStorage.getItem('token') || '') },
+    });
+    if (!response.ok) return;
+    const remaining = sessions.filter((item) => item.id !== session.id);
+    setSessions(remaining);
+    delete sessionJobsRef.current[session.id];
+    localStorage.setItem('script-ai-active-jobs', JSON.stringify(sessionJobsRef.current));
+    if (session.id !== sessionId) return;
+    socketRef.current?.close();
+    socketRef.current = null;
+    if (remaining.length > 0) {
+      selectSession(remaining[0].id);
+    } else {
+      await createSession();
+    }
+  };
+
   if (!visible) return null;
 
   return (
@@ -401,6 +534,14 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
           <Button
             type="text"
             size="small"
+            icon={<IconHistory />}
+            onClick={() => setShowSessions(true)}
+            aria-label="切换会话"
+            title="切换会话"
+          />
+          <Button
+            type="text"
+            size="small"
             icon={<IconClose />}
             onClick={onClose}
             aria-label="关闭 AI 工作台"
@@ -409,6 +550,66 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
         </Space>
       </div>
 
+      {showSessions ? (
+        <div className="script-ai-sessions-page">
+          <div className="script-ai-sessions-header">
+            <Button
+              type="text"
+              size="small"
+              icon={<IconArrowLeft />}
+              onClick={() => setShowSessions(false)}
+              aria-label="返回当前会话"
+              title="返回当前会话"
+            />
+            <strong>AI 会话</strong>
+            <Button
+              type="text"
+              size="small"
+              icon={<IconPlus />}
+              onClick={() => { void createSession(); }}
+              aria-label="新建会话"
+              title="新建会话"
+            />
+          </div>
+          <div className="script-ai-session-list">
+            {sessions.map((session) => (
+              <div
+                key={session.id}
+                className={'script-ai-session-item' + (session.id === sessionId ? ' active' : '')}
+                onClick={() => selectSession(session.id)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    selectSession(session.id);
+                  }
+                }}
+                role="button"
+                tabIndex={0}
+              >
+                <span className="script-ai-session-main">
+                  <strong>{session.title || '未命名会话'}</strong>
+                  <small>{formatSessionTime(session.updated_at)}</small>
+                </span>
+                <span className="script-ai-session-actions">
+                  {session.active_job_id && <IconLoading spin />}
+                  <Button
+                    type="text"
+                    size="small"
+                    icon={<IconDelete />}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void deleteSession(session);
+                    }}
+                    aria-label={'删除会话 ' + (session.title || '未命名会话')}
+                    title="删除会话"
+                  />
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : (
+        <>
       <div className="script-ai-context">
         <div className="script-ai-context-row script-ai-context-main-row">
           <div className="script-ai-section-label">当前上下文</div>
@@ -562,6 +763,8 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
           </Space>
         </div>
       </div>
+        </>
+      )}
     </aside>
   );
 };

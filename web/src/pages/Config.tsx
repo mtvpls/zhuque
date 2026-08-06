@@ -57,6 +57,7 @@ const Config: React.FC = () => {
   const [globalLoading, setGlobalLoading] = useState(false);
   const [loadingText, setLoadingText] = useState('');
   const [logRetentionDays, setLogRetentionDays] = useState(30);
+  const [aiSessionRetentionDays, setAiSessionRetentionDays] = useState(7);
   const [cleanupLoading, setCleanupLoading] = useState(false);
   const [activeTab, setActiveTab] = useState<string>('mirror');
   const [systemInfo, setSystemInfo] = useState<SystemInfo | null>(null);
@@ -92,6 +93,7 @@ const Config: React.FC = () => {
     loadConfig();
     loadAiConfig();
     loadLogRetentionConfig();
+    loadAiSessionRetentionConfig();
     loadAutoBackupConfig();
     if (activeTab === 'system') {
       loadSystemInfo();
@@ -190,6 +192,20 @@ const Config: React.FC = () => {
     } catch (error) {
       // 如果配置不存在，使用默认值30天
       setLogRetentionDays(30);
+    }
+  };
+
+  const loadAiSessionRetentionConfig = async () => {
+    try {
+      const token = localStorage.getItem('token');
+      const res = await axios.get('/api/configs/ai_session_retention_days', {
+        headers: { Authorization: 'Bearer ' + token },
+      });
+      if (res.data && res.data.value) {
+        setAiSessionRetentionDays(parseInt(res.data.value, 10) || 7);
+      }
+    } catch {
+      setAiSessionRetentionDays(7);
     }
   };
 
@@ -368,6 +384,21 @@ const Config: React.FC = () => {
       Message.success('保存成功');
     } catch (error: any) {
       Message.error(error.response?.data?.error || '保存失败');
+    }
+  };
+
+  const handleSaveAiSessionRetention = async () => {
+    try {
+      const token = localStorage.getItem('token');
+      await axios.put('/api/configs/ai_session_retention_days', {
+        value: aiSessionRetentionDays.toString(),
+        description: 'AI 会话无活动保留天数',
+      }, {
+        headers: { Authorization: 'Bearer ' + token },
+      });
+      Message.success('AI 会话清理设置已保存');
+    } catch (error: any) {
+      Message.error(error.response?.data?.error || '保存 AI 会话清理设置失败');
     }
   };
 
@@ -890,6 +921,29 @@ const Config: React.FC = () => {
                         max={365}
                       />
                       <Button type="primary" onClick={handleSaveLogRetention}>
+                        保存设置
+                      </Button>
+                    </Space>
+                  </div>
+                </div>
+
+                <div style={{ marginTop: 20 }}>
+                  <Typography.Title heading={6}>AI 会话自动清理</Typography.Title>
+                  <Typography.Text type="secondary">
+                    与日志清理任务同时执行，自动删除超过保留天数且没有运行任务的会话
+                  </Typography.Text>
+                  <div style={{ marginTop: 12 }}>
+                    <Space>
+                      <Input
+                        type="number"
+                        value={aiSessionRetentionDays.toString()}
+                        onChange={(value) => setAiSessionRetentionDays(parseInt(value, 10) || 7)}
+                        style={{ width: 120 }}
+                        suffix="天"
+                        min={1}
+                        max={365}
+                      />
+                      <Button type="primary" onClick={handleSaveAiSessionRetention}>
                         保存设置
                       </Button>
                     </Space>

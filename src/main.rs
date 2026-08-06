@@ -178,6 +178,7 @@ async fn main() -> Result<()> {
     let log_service_cleanup = log_service.clone();
     let login_log_service_cleanup = login_log_service.clone();
     let config_service_cleanup = config_service.clone();
+    let db_pool_cleanup = shared_pool.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(86400)); // 每24小时
         loop {
@@ -201,6 +202,23 @@ async fn main() -> Result<()> {
             match login_log_service_cleanup.delete_old_logs(retention_days).await {
                 Ok(count) => info!("Deleted {} old login log entries", count),
                 Err(e) => error!("Failed to delete old login logs: {}", e),
+            }
+
+            // 与日志清理共用定时器，清理长期未活跃且没有运行任务的 AI 会话
+            let session_retention_days = match config_service_cleanup.get_by_key("ai_session_retention_days").await {
+                Ok(Some(config)) => config.value.parse::<i64>().unwrap_or(7).max(1),
+                _ => 7,
+            };
+            info!("Running AI session cleanup, retention days: {}", session_retention_days);
+            let pool = db_pool_cleanup.read().await;
+            match sqlx::query(
+                "DELETE FROM ai_sessions WHERE active_job_id IS NULL AND updated_at < datetime('now', '-' || ? || ' days')",
+            )
+            .bind(session_retention_days)
+            .execute(&*pool)
+            .await {
+                Ok(result) => info!("Deleted {} inactive AI sessions", result.rows_affected()),
+                Err(e) => error!("Failed to delete inactive AI sessions: {}", e),
             }
         }
     });

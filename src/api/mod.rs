@@ -242,8 +242,12 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/backup/restore", post(backup::restore_backup))
         // AI 配置与服务端代理
         .route("/api/ai/config", get(ai::config).post(ai::update_config))
+        .route("/api/ai/sessions", get(ai::list_sessions).post(ai::create_session))
+        .route("/api/ai/sessions/:id", delete(ai::delete_session))
+        .route("/api/ai/sessions/:id/messages", get(ai::get_session_messages))
         .route("/api/ai/chat", post(ai::chat))
         .route("/api/ai/agent", post(ai::agent))
+        .route("/api/ai/ws", get(ai::agent_ws))
         // 系统配置管理
         .route("/api/configs", get(config::list_configs))
         .route(
