@@ -40,7 +40,7 @@ const Terminal: React.FC = () => {
   const fullscreenIntentRef = useRef(false);
   const [connected, setConnected] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const [isMobile, setIsMobile] = useState(false);
+  const [, setIsMobile] = useState(false);
   const [, setModifierVersion] = useState(0);
 
   const sendInput = (data: string) => {

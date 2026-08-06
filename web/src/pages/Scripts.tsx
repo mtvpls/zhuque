@@ -31,10 +31,12 @@ import {
   IconMenuUnfold,
   IconCopy,
   IconDragArrow,
+  IconRobot,
 } from '@arco-design/web-react/icon';
 import Editor from '@monaco-editor/react';
 import axios from 'axios';
 import { copyTextToClipboard } from '@/utils/clipboard';
+import ScriptAIWorkspace, { type AgentFileChange } from '@/components/ScriptAIWorkspace';
 
 interface ScriptFile {
   name: string;
@@ -74,6 +76,8 @@ const Scripts: React.FC = () => {
   const [isUploading, setIsUploading] = useState(false);
   const [archiveUploadProgress, setArchiveUploadProgress] = useState(0);
   const [isArchiveUploading, setIsArchiveUploading] = useState(false);
+  const [aiVisible, setAiVisible] = useState(false);
+  const [aiDirectoryPath, setAiDirectoryPath] = useState<string | undefined>();
   const [form] = Form.useForm();
   const [folderForm] = Form.useForm();
   const [renameForm] = Form.useForm();
@@ -533,6 +537,38 @@ const Scripts: React.FC = () => {
     setIsEditing(false);
   };
 
+  const handleApplyAIChanges = async (changes: AgentFileChange[]) => {
+    const token = localStorage.getItem('token');
+    await Promise.all(changes.map(async (change) => {
+      if (change.operation === 'delete') {
+        await axios.delete('/api/scripts/' + change.path, {
+          headers: { Authorization: 'Bearer ' + token },
+        });
+        return;
+      }
+
+      await axios.put('/api/scripts/' + change.path, change.content || '', {
+        headers: {
+          Authorization: 'Bearer ' + token,
+          'Content-Type': 'text/plain',
+        },
+      });
+    }));
+
+    const currentChange = changes.find((change) => change.path === selectedFile?.path);
+    if (currentChange?.operation === 'delete') {
+      setSelectedFile(null);
+      setFileContent('');
+      setHasUnsavedChanges(false);
+      setIsEditing(false);
+    } else if (currentChange && currentChange.content !== undefined) {
+      setFileContent(currentChange.content);
+      setHasUnsavedChanges(false);
+      setIsEditing(false);
+    }
+    await loadFiles();
+  };
+
   const handleDebugRun = async () => {
     if (!selectedFile || isDebugRunning) return;
 
@@ -706,6 +742,20 @@ const Scripts: React.FC = () => {
                           <Space>
                             <IconCopy />
                             复制路径
+                          </Space>
+                        </Menu.Item>
+                      )}
+                      {file.isDirectory && (
+                        <Menu.Item
+                          key="attachAiDirectory"
+                          onClick={() => {
+                            setAiDirectoryPath(file.path);
+                            setAiVisible(true);
+                          }}
+                        >
+                          <Space>
+                            <IconRobot />
+                            附加目录到 AI
                           </Space>
                         </Menu.Item>
                       )}
@@ -946,7 +996,7 @@ const Scripts: React.FC = () => {
 
       {/* 右侧编辑器 */}
       <Card
-        style={{ flex: 1, display: 'flex', flexDirection: 'column' }}
+        style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}
         bodyStyle={{ flex: 1, overflow: 'hidden', padding: 0 }}
         title={
           <Space>
@@ -970,8 +1020,17 @@ const Scripts: React.FC = () => {
           </Space>
         }
         extra={
-          selectedFile && (
+          (
             <Space>
+              <Button
+                type={aiVisible ? 'primary' : 'outline'}
+                size="small"
+                icon={<IconRobot />}
+                onClick={() => setAiVisible((visible) => !visible)}
+              >
+                AI 工作台
+              </Button>
+              {selectedFile && (<>
               {!isEditing && !isDebugging && (
                 <>
                   <Button
@@ -1079,6 +1138,7 @@ const Scripts: React.FC = () => {
                   </Button>
                 </>
               )}
+              </>)}
             </Space>
           )
         }
@@ -1178,6 +1238,18 @@ const Scripts: React.FC = () => {
           </div>
         )}
       </Card>
+
+      <ScriptAIWorkspace
+        visible={aiVisible}
+        fileName={selectedFile?.name}
+        filePath={selectedFile?.path}
+        fileContent={fileContent}
+        executionOutput={logContent}
+        aiDirectoryPath={aiDirectoryPath}
+        onClose={() => setAiVisible(false)}
+        onRemoveDirectoryContext={() => setAiDirectoryPath(undefined)}
+        onApplyChanges={handleApplyAIChanges}
+      />
 
       {/* 新建文件 */}
       <Modal

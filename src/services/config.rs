@@ -1,4 +1,4 @@
-use crate::models::{SystemConfig, CreateSystemConfig, UpdateSystemConfig, MirrorConfig, AutoBackupConfig};
+use crate::models::{SystemConfig, CreateSystemConfig, UpdateSystemConfig, MirrorConfig, AutoBackupConfig, AiConfig};
 use anyhow::Result;
 use sqlx::SqlitePool;
 use std::process::Command;
@@ -243,6 +243,32 @@ impl ConfigService {
         info!("Loading mirror configuration on startup...");
         let config = self.get_mirror_config().await?;
         self.apply_mirror_config(&config).await?;
+        Ok(())
+    }
+
+    pub async fn get_ai_config(&self) -> Result<AiConfig> {
+        if let Some(config) = self.get_by_key("ai").await? {
+            Ok(serde_json::from_str(&config.value)?)
+        } else {
+            Ok(AiConfig::default())
+        }
+    }
+
+    pub async fn update_ai_config(&self, config: &AiConfig) -> Result<()> {
+        let value = serde_json::to_string(config)?;
+        let update = UpdateSystemConfig {
+            value,
+            description: Some("AI Provider 配置".to_string()),
+        };
+        if self.get_by_key("ai").await?.is_some() {
+            self.update("ai", update).await?;
+        } else {
+            self.create(CreateSystemConfig {
+                key: "ai".to_string(),
+                value: update.value,
+                description: update.description,
+            }).await?;
+        }
         Ok(())
     }
 

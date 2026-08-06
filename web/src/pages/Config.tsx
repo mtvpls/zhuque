@@ -77,6 +77,8 @@ const Config: React.FC = () => {
     total: 0,
   });
   const [isMobile, setIsMobile] = useState(window.innerWidth <= 768);
+  const [aiForm] = Form.useForm();
+  const [aiLoading, setAiLoading] = useState(false);
 
   useEffect(() => {
     const handleResize = () => {
@@ -88,6 +90,7 @@ const Config: React.FC = () => {
 
   useEffect(() => {
     loadConfig();
+    loadAiConfig();
     loadLogRetentionConfig();
     loadAutoBackupConfig();
     if (activeTab === 'system') {
@@ -144,6 +147,34 @@ const Config: React.FC = () => {
       form.setFieldsValue(res.data);
     } catch (error: any) {
       Message.error('加载配置失败');
+    }
+  };
+
+  const loadAiConfig = async () => {
+    try {
+      const token = localStorage.getItem('token');
+      const res = await axios.get('/api/ai/config', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      aiForm.setFieldsValue(res.data);
+    } catch (error) {
+      Message.error('加载 AI 配置失败');
+    }
+  };
+
+  const handleSaveAiConfig = async () => {
+    try {
+      const values = await aiForm.validate();
+      setAiLoading(true);
+      const token = localStorage.getItem('token');
+      await axios.post('/api/ai/config', values, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      Message.success('AI 配置已保存');
+    } catch (error: any) {
+      Message.error(error.response?.data || '保存 AI 配置失败');
+    } finally {
+      setAiLoading(false);
     }
   };
 
@@ -625,6 +656,39 @@ const Config: React.FC = () => {
                   </div>
                 </Space>
               </div>
+            </div>
+          </TabPane>
+
+          <TabPane key="ai" title="AI 配置">
+            <div style={{ padding: '16px 24px', maxWidth: 760 }}>
+              <div style={{ marginBottom: 20, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div>
+                  <Typography.Title heading={6} style={{ margin: 0 }}>AI Provider</Typography.Title>
+                  <Typography.Text type="secondary">
+                    API Key 只保存在 Zhuque 服务端，脚本页通过服务端代理访问模型。
+                  </Typography.Text>
+                </div>
+                <Button type="primary" icon={<IconSave />} loading={aiLoading} onClick={handleSaveAiConfig}>
+                  保存配置
+                </Button>
+              </div>
+              <Form form={aiForm} layout="vertical">
+                <FormItem label="启用 AI" field="enabled" triggerPropName="checked">
+                  <Switch />
+                </FormItem>
+                <FormItem label="Provider 名称" field="provider" rules={[{ required: true, message: '请输入 Provider 名称' }]}>
+                  <Input placeholder="OpenAI Compatible / DeepSeek / Ollama" />
+                </FormItem>
+                <FormItem label="Base URL" field="base_url" rules={[{ required: true, message: '请输入 Base URL' }]} extra="服务端会请求 Base URL/chat/completions">
+                  <Input placeholder="https://api.openai.com/v1" />
+                </FormItem>
+                <FormItem label="API Key" field="api_key" extra="不会发送到浏览器，也不会加入脚本上下文">
+                  <Input.Password placeholder="sk-..." />
+                </FormItem>
+                <FormItem label="模型名称" field="model" rules={[{ required: true, message: '请输入模型名称' }]}>
+                  <Input placeholder="gpt-4o-mini / deepseek-chat / qwen-plus" />
+                </FormItem>
+              </Form>
             </div>
           </TabPane>
 

@@ -52,7 +52,28 @@ pub struct PythonMirror {
     pub index_url: Option<String>, // pip index
 }
 
-// 自动备份配置
+// AI Provider 配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiConfig {
+    pub enabled: bool,
+    pub provider: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+}
+
+impl Default for AiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: "OpenAI Compatible".to_string(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: String::new(),
+            model: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutoBackupConfig {
     pub enabled: bool,

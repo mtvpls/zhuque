@@ -1,3 +1,4 @@
+pub mod ai;
 pub mod auth;
 pub mod backup;
 pub mod config;
@@ -239,6 +240,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // 备份管理
         .route("/api/backup", get(backup::create_backup))
         .route("/api/backup/restore", post(backup::restore_backup))
+        // AI 配置与服务端代理
+        .route("/api/ai/config", get(ai::config).post(ai::update_config))
+        .route("/api/ai/chat", post(ai::chat))
+        .route("/api/ai/agent", post(ai::agent))
         // 系统配置管理
         .route("/api/configs", get(config::list_configs))
         .route(

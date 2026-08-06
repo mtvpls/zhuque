@@ -9,7 +9,7 @@ use std::fs::File;
 use std::io::Cursor;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use tar::Archive;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
@@ -150,6 +150,7 @@ impl ScriptService {
 
     /// 列出指定目录下的直接子项（文件和文件夹）
     pub async fn list_dir(&self, dir_path: &str) -> Result<Vec<ScriptFile>> {
+        self.validate_path(dir_path)?;
         let target_path = if dir_path.is_empty() {
             self.base_path.clone()
         } else {
@@ -368,7 +369,15 @@ impl ScriptService {
     }
 
     fn validate_path(&self, path: &str) -> Result<()> {
-        if path.contains("..") || path.starts_with('/') {
+        let candidate = Path::new(path);
+        if candidate.is_absolute()
+            || candidate.components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+        {
             return Err(anyhow!("Invalid path"));
         }
         Ok(())
