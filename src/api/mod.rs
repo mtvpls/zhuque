@@ -16,11 +16,16 @@ pub mod task_group;
 pub mod terminal;
 
 use crate::middleware::{auth_middleware, webhook_auth_middleware};
-use crate::scheduler::{Scheduler, SubscriptionScheduler, BackupScheduler};
-use crate::services::{AuthService, ConfigService, DependenceService, EnvService, LoginLogService, LogService, NotificationService, ScriptService, SubscriptionService, SystemLogCollector, TaskService, TaskGroupService, TotpService, UserService};
+use crate::scheduler::{BackupScheduler, Scheduler, SubscriptionScheduler};
+use crate::services::{
+    AuthService, ConfigService, DependenceService, EnvService, LogService, LoginLogService,
+    NotificationService, ScriptService, SubscriptionService, SystemLogCollector, TaskGroupService,
+    TaskService, TotpService, UserService,
+};
 
 #[cfg(not(target_os = "android"))]
 use crate::services::TerminalService;
+use anyhow::Result;
 use axum::{
     extract::DefaultBodyLimit,
     http::{StatusCode, Uri},
@@ -30,10 +35,9 @@ use axum::{
     Json, Router,
 };
 use serde_json::json;
+use sqlx::SqlitePool;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use sqlx::SqlitePool;
-use anyhow::Result;
 use tower_http::services::ServeDir;
 
 pub struct AppState {
@@ -99,7 +103,7 @@ async fn not_found() -> impl IntoResponse {
         Json(json!({
             "error": "Not Found",
             "message": "The requested resource was not found"
-        }))
+        })),
     )
 }
 
@@ -109,8 +113,9 @@ async fn spa_fallback(uri: Uri) -> impl IntoResponse {
     if path.starts_with("/api/") {
         return (
             StatusCode::NOT_FOUND,
-            axum::response::Html("API endpoint not found".to_string())
-        ).into_response();
+            axum::response::Html("API endpoint not found".to_string()),
+        )
+            .into_response();
     }
 
     let static_dir = std::path::PathBuf::from("./web/dist");
@@ -120,15 +125,19 @@ async fn spa_fallback(uri: Uri) -> impl IntoResponse {
         Ok(content) => axum::response::Html(content).into_response(),
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to load index.html"
-        ).into_response(),
+            "Failed to load index.html",
+        )
+            .into_response(),
     }
 }
 
 pub fn create_router(state: Arc<AppState>) -> Router {
     // Webhook路由（使用webhook token认证）
     let webhook_routes = Router::new()
-        .route("/api/webhook/tasks/:id/trigger", post(task::webhook_trigger_task))
+        .route(
+            "/api/webhook/tasks/:id/trigger",
+            post(task::webhook_trigger_task),
+        )
         .layer(middleware::from_fn(webhook_auth_middleware));
 
     // 需要认证的路由
@@ -136,7 +145,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // 任务管理
         .route("/api/tasks", get(task::list_tasks).post(task::create_task))
         .route("/api/tasks/running", get(task::list_running_tasks))
-        .route("/api/tasks/running/stream", get(task::subscribe_running_tasks))
+        .route(
+            "/api/tasks/running/stream",
+            get(task::subscribe_running_tasks),
+        )
         .route(
             "/api/tasks/:id",
             get(task::get_task)
@@ -154,7 +166,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // 日志管理
         .route("/api/logs", get(log::list_logs))
         .route("/api/logs/:id", get(log::get_log))
-        .route("/api/logs/task/:task_id/latest", get(log::get_latest_log_by_task))
+        .route(
+            "/api/logs/task/:task_id/latest",
+            get(log::get_latest_log_by_task),
+        )
         .route("/api/logs/cleanup/:days", delete(log::delete_old_logs))
         // 登录日志管理
         .route("/api/login-logs", get(login_log::list_login_logs))
@@ -163,7 +178,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/env",
             get(env::list_env_vars).post(env::create_env_var),
         )
-        .route("/api/env/batch", post(env::batch_import_env_vars).delete(env::batch_delete_env_vars))
+        .route(
+            "/api/env/batch",
+            post(env::batch_import_env_vars).delete(env::batch_delete_env_vars),
+        )
         .route(
             "/api/env/:id",
             get(env::get_env_var)
@@ -242,9 +260,15 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/backup/restore", post(backup::restore_backup))
         // AI 配置与服务端代理
         .route("/api/ai/config", get(ai::config).post(ai::update_config))
-        .route("/api/ai/sessions", get(ai::list_sessions).post(ai::create_session))
+        .route(
+            "/api/ai/sessions",
+            get(ai::list_sessions).post(ai::create_session),
+        )
         .route("/api/ai/sessions/:id", delete(ai::delete_session))
-        .route("/api/ai/sessions/:id/messages", get(ai::get_session_messages))
+        .route(
+            "/api/ai/sessions/:id/messages",
+            get(ai::get_session_messages).post(ai::compress_session),
+        )
         .route("/api/ai/chat", post(ai::chat))
         .route("/api/ai/agent", post(ai::agent))
         .route("/api/ai/ws", get(ai::agent_ws))
@@ -258,12 +282,27 @@ pub fn create_router(state: Arc<AppState>) -> Router {
                 .delete(config::delete_config),
         )
         .route("/api/configs/mirror/config", get(config::get_mirror_config))
-        .route("/api/configs/mirror/config", post(config::update_mirror_config))
+        .route(
+            "/api/configs/mirror/config",
+            post(config::update_mirror_config),
+        )
         // 自动备份配置
-        .route("/api/configs/auto-backup/config", get(config::get_auto_backup_config))
-        .route("/api/configs/auto-backup/config", post(config::update_auto_backup_config))
-        .route("/api/configs/auto-backup/test", post(config::test_webdav_connection))
-        .route("/api/configs/auto-backup/backup-now", post(config::backup_now))
+        .route(
+            "/api/configs/auto-backup/config",
+            get(config::get_auto_backup_config),
+        )
+        .route(
+            "/api/configs/auto-backup/config",
+            post(config::update_auto_backup_config),
+        )
+        .route(
+            "/api/configs/auto-backup/test",
+            post(config::test_webdav_connection),
+        )
+        .route(
+            "/api/configs/auto-backup/backup-now",
+            post(config::backup_now),
+        )
         // 订阅管理
         .route(
             "/api/subscriptions",
@@ -275,19 +314,32 @@ pub fn create_router(state: Arc<AppState>) -> Router {
                 .put(subscription::update_subscription)
                 .delete(subscription::delete_subscription),
         )
-        .route("/api/subscriptions/:id/run", post(subscription::run_subscription))
+        .route(
+            "/api/subscriptions/:id/run",
+            post(subscription::run_subscription),
+        )
         // 系统信息
         .route("/api/system/info", get(system::get_system_info))
-        .route("/api/system/webhook-config", get(system::get_webhook_config))
+        .route(
+            "/api/system/webhook-config",
+            get(system::get_webhook_config),
+        )
         .route("/api/system/logs", get(system_log::get_system_logs))
-        .route("/api/system/logs/stream", get(system_log::stream_system_logs))
+        .route(
+            "/api/system/logs/stream",
+            get(system_log::stream_system_logs),
+        )
         // 通知配置
-        .route("/api/notification/config", get(notification::get_config).post(notification::update_config))
+        .route(
+            "/api/notification/config",
+            get(notification::get_config).post(notification::update_config),
+        )
         .route("/api/notification/test", post(notification::test_channel));
 
     // 终端路由（仅非 Android 平台）
     #[cfg(not(target_os = "android"))]
-    let protected_routes = protected_routes.route("/api/terminal/connect", get(terminal::connect_terminal));
+    let protected_routes =
+        protected_routes.route("/api/terminal/connect", get(terminal::connect_terminal));
 
     let protected_routes = protected_routes
         // TOTP管理
@@ -295,7 +347,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/auth/totp/setup", post(auth::setup_totp))
         .route("/api/auth/totp/enable", post(auth::enable_totp))
         .route("/api/auth/totp/disable", post(auth::disable_totp))
-        .route("/api/auth/totp/regenerate-backup-codes", post(auth::regenerate_backup_codes))
+        .route(
+            "/api/auth/totp/regenerate-backup-codes",
+            post(auth::regenerate_backup_codes),
+        )
         // 修改密码
         .route("/api/auth/password", post(auth::change_password))
         .layer(middleware::from_fn_with_state(

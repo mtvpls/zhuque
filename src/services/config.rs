@@ -1,10 +1,12 @@
-use crate::models::{SystemConfig, CreateSystemConfig, UpdateSystemConfig, MirrorConfig, AutoBackupConfig, AiConfig};
+use crate::models::{
+    AiConfig, AutoBackupConfig, CreateSystemConfig, MirrorConfig, SystemConfig, UpdateSystemConfig,
+};
 use anyhow::Result;
 use sqlx::SqlitePool;
 use std::process::Command;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{info, error};
+use tracing::{error, info};
 
 pub struct ConfigService {
     pool: Arc<RwLock<SqlitePool>>,
@@ -17,19 +19,18 @@ impl ConfigService {
 
     pub async fn get_by_key(&self, key: &str) -> Result<Option<SystemConfig>> {
         let pool = self.pool.read().await;
-        let config = sqlx::query_as::<_, SystemConfig>(
-            "SELECT * FROM system_configs WHERE key = ?"
-        )
-        .bind(key)
-        .fetch_optional(&*pool)
-        .await?;
+        let config =
+            sqlx::query_as::<_, SystemConfig>("SELECT * FROM system_configs WHERE key = ?")
+                .bind(key)
+                .fetch_optional(&*pool)
+                .await?;
         Ok(config)
     }
 
     pub async fn list(&self) -> Result<Vec<SystemConfig>> {
         let pool = self.pool.read().await;
         let configs = sqlx::query_as::<_, SystemConfig>(
-            "SELECT * FROM system_configs ORDER BY created_at DESC"
+            "SELECT * FROM system_configs ORDER BY created_at DESC",
         )
         .fetch_all(&*pool)
         .await?;
@@ -38,14 +39,13 @@ impl ConfigService {
 
     pub async fn create(&self, config: CreateSystemConfig) -> Result<SystemConfig> {
         let pool = self.pool.read().await;
-        let result = sqlx::query(
-            "INSERT INTO system_configs (key, value, description) VALUES (?, ?, ?)"
-        )
-        .bind(&config.key)
-        .bind(&config.value)
-        .bind(&config.description)
-        .execute(&*pool)
-        .await?;
+        let result =
+            sqlx::query("INSERT INTO system_configs (key, value, description) VALUES (?, ?, ?)")
+                .bind(&config.key)
+                .bind(&config.value)
+                .bind(&config.description)
+                .execute(&*pool)
+                .await?;
 
         let id = result.last_insert_rowid();
         drop(pool);
@@ -53,7 +53,11 @@ impl ConfigService {
         Ok(created.unwrap())
     }
 
-    pub async fn update(&self, key: &str, update: UpdateSystemConfig) -> Result<Option<SystemConfig>> {
+    pub async fn update(
+        &self,
+        key: &str,
+        update: UpdateSystemConfig,
+    ) -> Result<Option<SystemConfig>> {
         let pool = self.pool.read().await;
         sqlx::query(
             "UPDATE system_configs SET value = ?, description = ?, updated_at = CURRENT_TIMESTAMP WHERE key = ?"
@@ -79,12 +83,10 @@ impl ConfigService {
 
     async fn get_by_id(&self, id: i64) -> Result<Option<SystemConfig>> {
         let pool = self.pool.read().await;
-        let config = sqlx::query_as::<_, SystemConfig>(
-            "SELECT * FROM system_configs WHERE id = ?"
-        )
-        .bind(id)
-        .fetch_optional(&*pool)
-        .await?;
+        let config = sqlx::query_as::<_, SystemConfig>("SELECT * FROM system_configs WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&*pool)
+            .await?;
         Ok(config)
     }
 
@@ -109,17 +111,23 @@ impl ConfigService {
         self.apply_mirror_config(&mirror_config).await?;
 
         if let Some(_) = self.get_by_key("mirror").await? {
-            let updated = self.update("mirror", UpdateSystemConfig {
-                value,
-                description: Some("镜像源配置".to_string()),
-            }).await?;
+            let updated = self
+                .update(
+                    "mirror",
+                    UpdateSystemConfig {
+                        value,
+                        description: Some("镜像源配置".to_string()),
+                    },
+                )
+                .await?;
             Ok(updated.unwrap())
         } else {
             self.create(CreateSystemConfig {
                 key: "mirror".to_string(),
                 value,
                 description: Some("镜像源配置".to_string()),
-            }).await
+            })
+            .await
         }
     }
 
@@ -141,7 +149,10 @@ impl ConfigService {
                             info!("npm registry configured successfully");
                         }
                         Ok(out) => {
-                            error!("Failed to set npm registry: {}", String::from_utf8_lossy(&out.stderr));
+                            error!(
+                                "Failed to set npm registry: {}",
+                                String::from_utf8_lossy(&out.stderr)
+                            );
                         }
                         Err(e) => {
                             error!("npm command not found or failed: {}", e);
@@ -169,7 +180,12 @@ impl ConfigService {
                         let pip_config_content = format!(
                             "[global]\nindex-url = {}\n[install]\ntrusted-host = {}\n",
                             index_url,
-                            index_url.replace("https://", "").replace("http://", "").split('/').next().unwrap_or("")
+                            index_url
+                                .replace("https://", "")
+                                .replace("http://", "")
+                                .split('/')
+                                .next()
+                                .unwrap_or("")
                         );
 
                         match std::fs::write(&pip_config_file, pip_config_content) {
@@ -198,9 +214,7 @@ impl ConfigService {
                         Ok(_) => {
                             info!("APT sources updated successfully");
                             // 更新软件包列表
-                            let _ = Command::new("apt-get")
-                                .arg("update")
-                                .output();
+                            let _ = Command::new("apt-get").arg("update").output();
                         }
                         Err(e) => {
                             error!("Failed to update APT sources (may need root): {}", e);
@@ -222,10 +236,7 @@ impl ConfigService {
                         Ok(_) => {
                             info!("YUM sources updated successfully");
                             // 清理缓存
-                            let _ = Command::new("yum")
-                                .arg("clean")
-                                .arg("all")
-                                .output();
+                            let _ = Command::new("yum").arg("clean").arg("all").output();
                         }
                         Err(e) => {
                             error!("Failed to update YUM sources (may need root): {}", e);
@@ -248,14 +259,14 @@ impl ConfigService {
 
     pub async fn get_ai_config(&self) -> Result<AiConfig> {
         if let Some(config) = self.get_by_key("ai").await? {
-            Ok(serde_json::from_str(&config.value)?)
+            Ok(serde_json::from_str::<AiConfig>(&config.value)?.normalized())
         } else {
             Ok(AiConfig::default())
         }
     }
 
     pub async fn update_ai_config(&self, config: &AiConfig) -> Result<()> {
-        let value = serde_json::to_string(config)?;
+        let value = serde_json::to_string(&config.normalized())?;
         let update = UpdateSystemConfig {
             value,
             description: Some("AI Provider 配置".to_string()),
@@ -267,7 +278,8 @@ impl ConfigService {
                 key: "ai".to_string(),
                 value: update.value,
                 description: update.description,
-            }).await?;
+            })
+            .await?;
         }
         Ok(())
     }
@@ -287,16 +299,21 @@ impl ConfigService {
         let value = serde_json::to_string(config)?;
 
         if self.get_by_key("auto_backup").await?.is_some() {
-            self.update("auto_backup", UpdateSystemConfig {
-                value,
-                description: Some("自动备份配置".to_string()),
-            }).await?;
+            self.update(
+                "auto_backup",
+                UpdateSystemConfig {
+                    value,
+                    description: Some("自动备份配置".to_string()),
+                },
+            )
+            .await?;
         } else {
             self.create(CreateSystemConfig {
                 key: "auto_backup".to_string(),
                 value,
                 description: Some("自动备份配置".to_string()),
-            }).await?;
+            })
+            .await?;
         }
 
         Ok(())

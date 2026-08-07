@@ -3,6 +3,7 @@ import {
   Card,
   Form,
   Input,
+  InputNumber,
   Button,
   Message,
   Space,
@@ -713,11 +714,27 @@ const Config: React.FC = () => {
                 <FormItem label="Base URL" field="base_url" rules={[{ required: true, message: '请输入 Base URL' }]} extra="服务端会请求 Base URL/chat/completions">
                   <Input placeholder="https://api.openai.com/v1" />
                 </FormItem>
-                <FormItem label="API Key" field="api_key" extra="不会发送到浏览器，也不会加入脚本上下文">
+                <FormItem label="API Key" field="api_key">
                   <Input.Password placeholder="sk-..." />
                 </FormItem>
                 <FormItem label="模型名称" field="model" rules={[{ required: true, message: '请输入模型名称' }]}>
                   <Input placeholder="gpt-4o-mini / deepseek-chat / qwen-plus" />
+                </FormItem>
+                <FormItem
+                  label="最大上下文长度（Token）"
+                  field="context_window_tokens"
+                  rules={[{ required: true, message: '请输入最大上下文长度' }]}
+                  extra="取值 8192–131072，默认 131072（128K）。"
+                >
+                  <InputNumber min={8192} max={131072} step={1024} style={{ width: '100%' }} />
+                </FormItem>
+                <FormItem
+                  label="自动压缩触发比例（%）"
+                  field="compression_ratio"
+                  rules={[{ required: true, message: '请输入自动压缩触发比例' }]}
+                  extra="上下文达到该比例时自动调用模型生成摘要并压缩历史，默认 90%。"
+                >
+                  <InputNumber min={10} max={95} step={1} suffix="%" style={{ width: '100%' }} />
                 </FormItem>
               </Form>
             </div>

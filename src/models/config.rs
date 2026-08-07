@@ -60,6 +60,27 @@ pub struct AiConfig {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    #[serde(default = "default_ai_context_window_tokens")]
+    pub context_window_tokens: u32,
+    #[serde(default = "default_ai_compression_ratio")]
+    pub compression_ratio: u8,
+}
+
+fn default_ai_context_window_tokens() -> u32 {
+    131_072
+}
+
+fn default_ai_compression_ratio() -> u8 {
+    90
+}
+
+impl AiConfig {
+    pub fn normalized(&self) -> Self {
+        let mut value = self.clone();
+        value.context_window_tokens = value.context_window_tokens.clamp(8_192, 131_072);
+        value.compression_ratio = value.compression_ratio.clamp(10, 95);
+        value
+    }
 }
 
 impl Default for AiConfig {
@@ -70,6 +91,8 @@ impl Default for AiConfig {
             base_url: "https://api.openai.com/v1".to_string(),
             api_key: String::new(),
             model: String::new(),
+            context_window_tokens: default_ai_context_window_tokens(),
+            compression_ratio: default_ai_compression_ratio(),
         }
     }
 }
@@ -81,8 +104,8 @@ pub struct AutoBackupConfig {
     pub webdav_username: String,
     pub webdav_password: String,
     pub cron: String,
-    pub remote_path: Option<String>,        // WebDAV 远程路径，默认为根目录
-    pub max_backups: Option<u32>,           // 最大保留备份数量，None 表示不限制
+    pub remote_path: Option<String>, // WebDAV 远程路径，默认为根目录
+    pub max_backups: Option<u32>,    // 最大保留备份数量，None 表示不限制
 }
 
 impl Default for AutoBackupConfig {
@@ -94,7 +117,7 @@ impl Default for AutoBackupConfig {
             webdav_password: String::new(),
             cron: "0 2 * * *".to_string(), // 默认每天凌晨2点（5字段格式）
             remote_path: None,
-            max_backups: Some(10),         // 默认保留10个备份
+            max_backups: Some(10), // 默认保留10个备份
         }
     }
 }
@@ -191,7 +214,9 @@ pub struct WebhookConfig {
     pub body_template: String,
 }
 
-fn default_method() -> String { "POST".to_string() }
+fn default_method() -> String {
+    "POST".to_string()
+}
 
 impl Default for WebhookConfig {
     fn default() -> Self {

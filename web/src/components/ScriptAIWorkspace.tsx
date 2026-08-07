@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import {
   Alert,
   Button,
@@ -69,6 +70,12 @@ interface AiSession {
   updated_at: string;
 }
 
+const estimateContextTokens = (parts: Array<string | undefined>) => {
+  const characters = parts.reduce((total, part) => total + (part?.length || 0), 0);
+  const messageOverhead = parts.filter((part) => Boolean(part?.trim())).length * 4;
+  return Math.ceil(characters / 4) + messageOverhead;
+};
+
 const formatSessionTime = (value: string) => {
   const timestamp = new Date(value.replace(' ', 'T') + 'Z');
   if (Number.isNaN(timestamp.getTime())) return value;
@@ -101,11 +108,14 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
   onApplyChanges,
 }) => {
   const [prompt, setPrompt] = useState('');
+  const [commandSuggestionsVisible, setCommandSuggestionsVisible] = useState(true);
   const [feedItems, setFeedItems] = useState<FeedItem[]>([]);
   const [draftChanges, setDraftChanges] = useState<AgentFileChange[] | null>(null);
   const [running, setRunning] = useState(false);
   const [conversation, setConversation] = useState<ConversationMessage[]>([]);
   const [sessions, setSessions] = useState<AiSession[]>([]);
+  const [loadingSession, setLoadingSession] = useState(false);
+  const [providerContextTokens, setProviderContextTokens] = useState<number | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [permissionMode, setPermissionMode] = useState<PermissionMode>('ask');
   const [pendingPermission, setPendingPermission] = useState<'command' | 'change' | null>(null);
@@ -113,6 +123,7 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
   const [showSessions, setShowSessions] = useState(false);
   const [contextEnabled, setContextEnabled] = useState(Boolean(filePath || fileName));
   const [workspaceWidth, setWorkspaceWidth] = useState(360);
+  const [isMobileViewport, setIsMobileViewport] = useState(() => window.matchMedia('(max-width: 1024px), (hover: none) and (pointer: coarse)').matches);
   const resizeState = useRef<{ startX: number; startWidth: number } | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const storedJobs = JSON.parse(localStorage.getItem('script-ai-active-jobs') || '{}') as Record<string, string>;
@@ -124,14 +135,33 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
   const keepSubscribedRef = useRef(false);
   const lastSequenceRef = useRef(0);
   const sessionIdRef = useRef<string | null>(null);
+  const feedRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     setContextEnabled(!aiDirectoryPath && Boolean(filePath || fileName));
   }, [aiDirectoryPath, filePath, fileName]);
 
   useEffect(() => {
+    const media = window.matchMedia('(max-width: 1024px), (hover: none) and (pointer: coarse)');
+    const updateViewport = () => setIsMobileViewport(media.matches);
+    updateViewport();
+    media.addEventListener('change', updateViewport);
+    return () => media.removeEventListener('change', updateViewport);
+  }, []);
+
+  useEffect(() => {
+    if (!visible || !isMobileViewport) return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.body.style.overflow = previousOverflow;
+    };
+  }, [visible, isMobileViewport]);
+
+  useEffect(() => {
     if (!visible) return;
     const headers = { Authorization: `Bearer ${localStorage.getItem('token') || ''}` };
+    setLoadingSession(true);
     void (async () => {
       const response = await fetch('/api/ai/sessions', { headers });
       if (!response.ok) return;
@@ -146,11 +176,12 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
       }
       localStorage.setItem('script-ai-active-jobs', JSON.stringify(sessionJobsRef.current));
       setSessionId((current) => current && list.some((item) => item.id === current) ? current : list[0]?.id || null);
-    })().catch(() => undefined);
+    })().catch(() => undefined).finally(() => setLoadingSession(false));
   }, [visible]);
 
   useEffect(() => {
     if (!sessionId || !visible) return;
+    setLoadingSession(true);
     void fetch(`/api/ai/sessions/${encodeURIComponent(sessionId)}/messages`, {
       headers: { Authorization: `Bearer ${localStorage.getItem('token') || ''}` },
     }).then(async (response) => {
@@ -158,7 +189,7 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
       const messages = await response.json() as ConversationMessage[];
       setConversation(messages);
       setFeedItems(messages.map((message) => ({ kind: 'message' as const, message })));
-    }).catch(() => undefined);
+    }).catch(() => undefined).finally(() => setLoadingSession(false));
   }, [sessionId, visible]);
 
   const groupedFeed = useMemo<FeedGroup[]>(() => {
@@ -177,6 +208,21 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
     }
     return groups;
   }, [feedItems]);
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => {
+      const feed = feedRef.current;
+      if (feed) feed.scrollTop = feed.scrollHeight;
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [feedItems, running, draftChanges]);
+
+  const currentContextTokens = useMemo(() => estimateContextTokens([
+    ...conversation.map((message) => message.content),
+    prompt,
+    contextEnabled ? fileContent : undefined,
+    contextEnabled ? executionOutput : undefined,
+  ]), [conversation, prompt, contextEnabled, fileContent, executionOutput]);
 
   const hasDiff = Boolean(draftChanges && draftChanges.length > 0);
   const currentChange = draftChanges?.find((change) => change.path === filePath);
@@ -242,7 +288,12 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
         const payload = (envelope.event || envelope) as Record<string, any>;
         const type = String(payload.type || '');
         const tool = typeof payload.tool === 'string' ? payload.tool : 'unknown';
-        if (type === 'session_title') {
+        if (type === 'context_usage') {
+          const tokens = Number(payload.tokens);
+          if (payload.source === 'provider' && Number.isFinite(tokens) && tokens > 0) {
+            setProviderContextTokens(Math.round(tokens));
+          }
+        } else if (type === 'session_title') {
           const title = typeof payload.title === 'string' ? payload.title : '';
           if (title && socketSessionId) {
             setSessions((previous) => previous.map((session) => (
@@ -331,6 +382,12 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
   const handleSubmit = (approvedCommand = false) => {
     const request = (approvedCommand ? pendingRequest : prompt).trim();
     if (!request || running) return;
+    if (!approvedCommand && /^\/(compress|compact)$/i.test(request)) {
+      setPrompt('');
+      setCommandSuggestionsVisible(false);
+      void compressSession();
+      return;
+    }
     if (!approvedCommand && permissionMode !== 'session' && looksLikeCommandRequest(request)) {
       setPendingRequest(request);
       setPendingPermission('command');
@@ -341,6 +398,7 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
     setPendingPermission(null);
     setPendingRequest('');
     setRunning(true);
+    setProviderContextTokens(null);
     setPrompt('');
     setDraftChanges(null);
     keepSubscribedRef.current = true;
@@ -360,7 +418,7 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
       file_content: contextEnabled ? fileContent : undefined,
       execution_output: contextEnabled ? executionOutput : undefined,
       directory_path: aiDirectoryPath,
-      history: conversation.slice(-12),
+      history: conversation,
       allow_commands: approvedCommand || permissionMode === 'session',
       session_id: sessionId,
     });
@@ -369,6 +427,74 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
   const stopAgent = () => {
     if (!running || !socketRef.current || socketRef.current.readyState !== WebSocket.OPEN) return;
     socketRef.current.send(JSON.stringify({ type: 'cancel' }));
+  };
+  const compressSession = async () => {
+    if (!sessionId || running || conversation.length < 2) return;
+    const confirmed = window.confirm('压缩当前会话的历史上下文？压缩后将用摘要替换旧消息，无法恢复原始历史。');
+    if (!confirmed) return;
+    setFeedItems((previous) => [...previous, {
+      kind: 'event' as const,
+      event: { id: Date.now(), label: '开始压缩上下文', detail: `正在整理当前 ${conversation.length} 条历史消息并生成摘要`, tone: 'warning' as const },
+    }]);
+    try {
+      const response = await fetch(`/api/ai/sessions/${encodeURIComponent(sessionId)}/messages`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${localStorage.getItem('token') || ''}`,
+          Accept: 'application/json',
+        },
+      });
+      const responseText = await response.text();
+      let result: {
+        messages?: ConversationMessage[];
+        before_tokens?: number;
+        after_tokens?: number;
+        before_messages?: number;
+        after_messages?: number;
+        compressed?: boolean;
+        token_source?: string;
+        error?: string;
+      };
+      try {
+        result = JSON.parse(responseText) as typeof result;
+      } catch {
+        const preview = responseText.replace(/\s+/g, ' ').trim().slice(0, 180);
+        throw new Error(`压缩接口返回了非 JSON 响应（HTTP ${response.status}）：${preview || '响应为空'}`);
+      }
+      if (!response.ok || !Array.isArray(result.messages)) throw new Error(result.error || `压缩失败（HTTP ${response.status}）`);
+      const beforeTokens = result.before_tokens || 0;
+      const afterTokens = result.after_tokens || 0;
+      const ratio = beforeTokens > 0 ? Math.round((1 - afterTokens / beforeTokens) * 100) : 0;
+      const didCompress = result.compressed === true && afterTokens < beforeTokens;
+      const beforeMessages = result.before_messages || 0;
+      const afterMessages = result.after_messages || 0;
+      const tokenSource = result.token_source === 'provider+estimate' ? 'Provider usage 校准' : '本地估算（Provider 未返回 usage）';
+      setConversation(result.messages);
+      setFeedItems((previous) => [
+        ...previous.filter((item) => item.kind === 'event'),
+        {
+          kind: 'event' as const,
+          event: {
+            id: Date.now(),
+            label: '上下文压缩结束',
+            detail: didCompress
+              ? `已将 ${beforeMessages} 条消息压缩为 ${afterMessages} 条，约 ${beforeTokens} → ${afterTokens} tokens（减少 ${Math.max(0, ratio)}%，${tokenSource}）`
+              : `当前历史没有发生有效压缩：${beforeMessages} 条消息，约 ${beforeTokens} → ${afterTokens} tokens（${tokenSource}）`,
+            tone: didCompress ? 'success' as const : 'warning' as const,
+          },
+        },
+        ...result.messages!.map((message) => ({ kind: 'message' as const, message })),
+      ]);
+      if (didCompress) Message.success('当前会话已压缩');
+      else Message.warning('当前历史没有发生有效压缩');
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : '压缩失败';
+      setFeedItems((previous) => [...previous, {
+        kind: 'event' as const,
+        event: { id: Date.now(), label: '上下文压缩结束', detail, tone: 'error' as const },
+      }]);
+      Message.error(detail);
+    }
   };
 
   useEffect(() => {
@@ -494,11 +620,26 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
 
   if (!visible) return null;
 
-  return (
+  return createPortal(
     <aside
       className="script-ai-workspace"
       aria-label="AI 脚本工作台"
-      style={{ width: workspaceWidth }}
+      style={isMobileViewport ? {
+        position: 'fixed',
+        zIndex: 2147483647,
+        top: 0,
+        right: 0,
+        bottom: 0,
+        left: 0,
+        width: '100vw',
+        maxWidth: '100vw',
+        height: '100dvh',
+        minHeight: '100dvh',
+        margin: 0,
+        border: 0,
+        borderRadius: 0,
+        boxShadow: 'none',
+      } : { width: workspaceWidth }}
     >
       <div
         className="script-ai-resize-handle"
@@ -652,14 +793,16 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
         )}
       </div>
 
-      <div className="script-ai-feed">
+      <div className="script-ai-feed" ref={feedRef}>
+        {loadingSession && (
+          <div className="script-ai-session-loading"><IconLoading spin /> 正在加载会话...</div>
+        )}
         <Alert
           type="info"
           icon={<IconInfoCircle />}
           content="描述你的脚本修改需求，AI 会协助分析并生成修改方案。"
           className="script-ai-notice"
         />
-
         {groupedFeed.length > 0 && (
           <div className="script-ai-feed-items">
             {groupedFeed.map((group, index) => group.kind === 'events' ? (
@@ -734,9 +877,32 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
       </div>
 
       <div className="script-ai-composer">
+        {commandSuggestionsVisible && prompt.trimStart().startsWith('/') && !prompt.includes(' ') && !running && (
+          <div className="script-ai-command-suggestions" role="listbox" aria-label="可用指令">
+            {['/compress'].filter((command) => command.startsWith(prompt.trim())).map((command) => (
+              <button
+                key={command}
+                type="button"
+                role="option"
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => {
+                  setPrompt(command);
+                  setCommandSuggestionsVisible(false);
+                }}
+              >
+                <code>{command}</code>
+                <span>压缩当前会话上下文</span>
+              </button>
+            ))}
+          </div>
+        )}
         <Input.TextArea
           value={prompt}
-          onChange={setPrompt}
+          onChange={(value) => {
+            setPrompt(value);
+            setProviderContextTokens(null);
+            setCommandSuggestionsVisible(value.trimStart().startsWith('/') && !value.includes(' '));
+          }}
           autoSize={{ minRows: 3, maxRows: 6 }}
           placeholder="描述任务，例如：找到所有重试逻辑，统一改成指数退避并运行相关脚本。"
           onPressEnter={(event) => {
@@ -747,7 +913,11 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
           }}
         />
         <div className="script-ai-composer-footer">
-          <span><IconCopy /> Ctrl/Cmd + Enter 发送</span>
+          <span>
+            当前上下文：{providerContextTokens !== null
+              ? `${providerContextTokens.toLocaleString()} tokens`
+              : `约 ${currentContextTokens.toLocaleString()} tokens`}
+          </span>
           <Space>
             <Button type="text" size="small" icon={<IconCopy />} onClick={copyPrompt} disabled={!prompt.trim()} aria-label="复制请求" />
             <Button
@@ -765,7 +935,8 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
       </div>
         </>
       )}
-    </aside>
+    </aside>,
+    document.body,
   );
 };
 
