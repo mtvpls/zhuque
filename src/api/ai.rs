@@ -52,13 +52,6 @@ pub struct AiHistoryMessage {
     pub content: String,
 }
 
-#[derive(Debug, Serialize)]
-struct ChatRequest<'a> {
-    model: &'a str,
-    stream: bool,
-    messages: Vec<Value>,
-}
-
 const MASKED_API_KEY: &str = "********";
 
 #[derive(Debug, Serialize)]
@@ -146,46 +139,6 @@ async fn send_json_with_retries(
                             );
                         }
                     }
-                }
-            }
-            Err(error) => {
-                last_error = format!("{operation}请求失败: {error}");
-            }
-        }
-        if attempt < AI_REQUEST_MAX_ATTEMPTS {
-            tracing::warn!("{last_error}，将在第 {} 次尝试后重试", attempt);
-            sleep(Duration::from_millis(300 * attempt as u64)).await;
-        }
-    }
-    Err(format!("{operation}失败，已重试 2 次: {last_error}"))
-}
-
-async fn send_stream_with_retries(
-    client: &Client,
-    endpoint: &str,
-    api_key: &str,
-    payload: &Value,
-    operation: &str,
-) -> Result<reqwest::Response, String> {
-    let mut last_error = String::new();
-    for attempt in 1..=AI_REQUEST_MAX_ATTEMPTS {
-        match client
-            .post(endpoint)
-            .bearer_auth(api_key)
-            .json(payload)
-            .send()
-            .await
-        {
-            Ok(response) if response.status().is_success() => return Ok(response),
-            Ok(response) => {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                last_error = format!(
-                    "{operation}返回 {status}: {}",
-                    body.chars().take(500).collect::<String>()
-                );
-                if !should_retry_status(status) {
-                    return Err(last_error);
                 }
             }
             Err(error) => {
@@ -531,130 +484,6 @@ async fn compress_json_messages(
         request_estimate,
         source_estimate,
     })
-}
-
-pub async fn chat(
-    State(state): State<Arc<AppState>>,
-    Json(request): Json<AiChatRequest>,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)> {
-    let config = state
-        .config_service
-        .get_ai_config()
-        .await
-        .map_err(internal_error)?;
-
-    if !config.enabled || config.api_key.trim().is_empty() || config.model.trim().is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "AI 尚未配置，请先在系统配置中填写 Provider、API Key 和模型".into(),
-        ));
-    }
-
-    if request.prompt.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "请求内容不能为空".into()));
-    }
-
-    let base_url = config.base_url.trim_end_matches('/');
-    let endpoint = if base_url.ends_with("/chat/completions") {
-        base_url.to_string()
-    } else {
-        format!("{base_url}/chat/completions")
-    };
-
-    let system = if request.mode == "implement" {
-        "你是 Zhuque 的脚本修改 Agent。只能修改用户提供的当前文件，不能猜测其他文件内容。\n\
-必须只返回一个合法 JSON 对象，不要 Markdown、代码围栏或额外文字：\n\
-{\"summary\":\"简短说明\",\"files\":[{\"path\":\"当前文件路径\",\"operation\":\"update\",\"content\":\"完整的新文件内容\"}]}\n\
-如果不需要修改，files 返回空数组。不要输出 API Key、环境变量值或其他凭据。"
-    } else {
-        "你是 Zhuque 的脚本开发 Agent。你只能基于用户提供的工作区上下文回答。\n\
-模式：ask 只分析；plan 只给出计划。\n\
-不要猜测未提供的文件内容，不要输出 API Key、环境变量值或其他凭据。"
-    };
-    let context = format!(
-        "模式: {}\n文件名: {}\n路径: {}\n脚本内容:\n{}\n\n最近执行输出:\n{}\n\n用户请求:\n{}",
-        request.mode,
-        request.file_name.as_deref().unwrap_or("未选择文件"),
-        request.file_path.as_deref().unwrap_or(""),
-        request.file_content.as_deref().unwrap_or("未提供"),
-        request.execution_output.as_deref().unwrap_or("未提供"),
-        request.prompt,
-    );
-    let mut messages = vec![json!({"role": "system", "content": system})];
-    for item in request.history.iter() {
-        if (item.role == "user" || item.role == "assistant") && !item.content.trim().is_empty() {
-            messages.push(json!({"role": item.role, "content": item.content}));
-        }
-    }
-    messages.push(json!({"role": "user", "content": context}));
-
-    let client = Client::builder().build().map_err(internal_error)?;
-    if let Err(error) = compress_json_messages(
-        &client,
-        &endpoint,
-        &config.api_key,
-        &config.model,
-        &mut messages,
-        &config,
-        request.force_compress,
-    )
-    .await
-    {
-        tracing::warn!("{error}; falling back to local context compaction");
-        fallback_compact_json_messages(&mut messages, &config);
-    }
-    let payload = ChatRequest {
-        model: &config.model,
-        stream: true,
-        messages,
-    };
-
-    let response = send_stream_with_retries(
-        &client,
-        &endpoint,
-        &config.api_key,
-        &serde_json::to_value(&payload).map_err(internal_error)?,
-        "AI 请求",
-    )
-    .await
-    .map_err(|error| (StatusCode::BAD_GATEWAY, error))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            format!("AI 服务返回 {status}: {body}"),
-        ));
-    }
-
-    let stream = async_stream::stream! {
-        let mut bytes = response.bytes_stream();
-        let mut buffer = String::new();
-        while let Some(chunk) = bytes.next().await {
-            match chunk {
-                Ok(chunk) => {
-                    buffer.push_str(&String::from_utf8_lossy(&chunk));
-                    while let Some(index) = buffer.find('\n') {
-                        let line = buffer[..index].trim_end_matches('\r').to_string();
-                        buffer.drain(..=index);
-                        if let Some(data) = line.strip_prefix("data:") {
-                            let data = data.trim();
-                            if !data.is_empty() && data != "[DONE]" {
-                                yield Ok(Event::default().data(data));
-                            }
-                        }
-                    }
-                }
-                Err(error) => {
-                    yield Ok(Event::default().event("error").data(error.to_string()));
-                    break;
-                }
-            }
-        }
-    };
-
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1429,7 +1258,7 @@ async fn run_agent_job(state: Arc<AppState>, request: AiChatRequest, job: Arc<Ai
         }
     };
     let system = format!(
-        "你是 Zhuque 的工作区 Agent。你可以浏览脚本目录、读取文件、搜索代码，管理定时任务和环境变量，查看执行日志，并联网搜索公开网页{}。先使用工具获取必要上下文，不要猜测文件内容。当用户要求修改时，最后必须只返回合法 JSON，不要 Markdown 或额外文字。JSON 格式：{{\"summary\":\"简短说明\",\"files\":[{{\"path\":\"工作区相对路径\",\"operation\":\"update|create|delete\",\"content\":\"文件完整内容\"}}]}}。修改多个文件时全部放入 files。所有路径必须是工作区相对路径。附加目录存在时，所有工具路径都必须限制在该目录内；工具 path 为空表示附加目录根目录，禁止回到工作区根目录。{}",
+        "你是 Zhuque 的工作区 Agent。你可以浏览脚本目录、读取文件、搜索代码，管理定时任务、环境变量和依赖，查看执行日志，并联网搜索公开网页{}。如果需要 Python、Node.js 或 Linux 依赖，必须使用依赖管理工具安装，不要直接通过 shell、pip、npm、apt 等命令安装；先确认依赖类型和名称。先使用工具获取必要上下文，不要猜测文件内容。当用户要求修改时，最后必须只返回合法 JSON，不要 Markdown 或额外文字。JSON 格式：{{\"summary\":\"简短说明\",\"files\":[{{\"path\":\"工作区相对路径\",\"operation\":\"update|create|delete\",\"content\":\"文件完整内容\"}}]}}。修改多个文件时全部放入 files。所有路径必须是工作区相对路径。附加目录存在时，所有工具路径都必须限制在该目录内；工具 path 为空表示附加目录根目录，禁止回到工作区根目录。{}",
         if request.allow_commands { "，并可执行脚本和命令" } else { "" },
         if request.allow_commands { "执行命令前确认命令不会破坏用户文件；创建、编辑或删除任务/环境变量前确认用户已经明确授权。" } else { "当前未授权执行命令、脚本或写入型管理操作。" },
     );
@@ -1746,7 +1575,7 @@ pub async fn agent(
 
     let stream = async_stream::stream! {
         let system = format!(
-            "你是 Zhuque 的工作区 Agent。你可以浏览脚本目录、读取文件、搜索代码，管理定时任务和环境变量，查看执行日志，并联网搜索公开网页{}。先使用工具获取必要上下文，不要猜测文件内容。当用户要求修改时，最后必须只返回合法 JSON，不要 Markdown 或额外文字。JSON 格式：{{\"summary\":\"简短说明\",\"files\":[{{\"path\":\"工作区相对路径\",\"operation\":\"update|create|delete\",\"content\":\"文件完整内容\"}}]}}。修改多个文件时全部放入 files。所有路径必须是工作区相对路径。附加目录存在时，所有工具路径都必须限制在该目录内；工具 path 为空表示附加目录根目录，禁止回到工作区根目录。{}",
+            "你是 Zhuque 的工作区 Agent。你可以浏览脚本目录、读取文件、搜索代码，管理定时任务、环境变量和依赖，查看执行日志，并联网搜索公开网页{}。如果需要 Python、Node.js 或 Linux 依赖，必须使用依赖管理工具安装，不要直接通过 shell、pip、npm、apt 等命令安装；先确认依赖类型和名称。先使用工具获取必要上下文，不要猜测文件内容。当用户要求修改时，最后必须只返回合法 JSON，不要 Markdown 或额外文字。JSON 格式：{{\"summary\":\"简短说明\",\"files\":[{{\"path\":\"工作区相对路径\",\"operation\":\"update|create|delete\",\"content\":\"文件完整内容\"}}]}}。修改多个文件时全部放入 files。所有路径必须是工作区相对路径。附加目录存在时，所有工具路径都必须限制在该目录内；工具 path 为空表示附加目录根目录，禁止回到工作区根目录。{}",
             if request.allow_commands { "，并可执行脚本和命令" } else { "" },
             if request.allow_commands { "执行命令前确认命令不会破坏用户文件；创建、编辑或删除任务/环境变量前确认用户已经明确授权。" } else { "当前未授权执行命令、脚本或写入型管理操作。" },
         );

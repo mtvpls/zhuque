@@ -269,7 +269,6 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/ai/sessions/:id/messages",
             get(ai::get_session_messages).post(ai::compress_session),
         )
-        .route("/api/ai/chat", post(ai::chat))
         .route("/api/ai/agent", post(ai::agent))
         .route("/api/ai/ws", get(ai::agent_ws))
         // 系统配置管理
