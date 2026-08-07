@@ -4,6 +4,8 @@ import {
   Alert,
   Button,
   Card,
+  Dropdown,
+  Menu,
   Input,
   Message,
   Space,
@@ -15,12 +17,14 @@ import {
   IconCode,
   IconDelete,
   IconClose,
-  IconCopy,
   IconFile,
   IconFolder,
   IconHistory,
   IconInfoCircle,
   IconLoading,
+  IconLock,
+  IconEdit,
+  IconUnlock,
   IconPlayArrow,
   IconPlus,
   IconRefresh,
@@ -32,7 +36,7 @@ import './ScriptAIWorkspace.css';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
-type PermissionMode = 'ask' | 'session';
+type PermissionMode = 'default' | 'changes' | 'all';
 type PermissionApproval = 'command' | 'change';
 type EventTone = 'neutral' | 'success' | 'warning' | 'error';
 
@@ -127,7 +131,7 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
   const [providerContextTokens, setProviderContextTokens] = useState<number | null>(null);
   const [cacheUsage, setCacheUsage] = useState<{ hit: number; miss: number } | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
-  const [permissionMode, setPermissionMode] = useState<PermissionMode>('ask');
+  const [permissionMode, setPermissionMode] = useState<PermissionMode>('default');
   const [pendingPermission, setPendingPermission] = useState<'command' | 'change' | null>(null);
   const [pendingRequest, setPendingRequest] = useState('');
   const [showSessions, setShowSessions] = useState(false);
@@ -313,6 +317,17 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
       .trim();
   };
 
+  const commandPermissionTools = new Set([
+    'run_script',
+    'run_command',
+    'create_task',
+    'update_task',
+    'delete_task',
+    'create_env_var',
+    'update_env_var',
+    'delete_env_var',
+  ]);
+
   const connectJob = (jobId?: string, startRequest?: Record<string, unknown>, socketSessionId = sessionIdRef.current) => {
     const token = localStorage.getItem('token') || '';
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -388,6 +403,10 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
           assistantSegmentRef.current = null;
           toolInteractionRef.current = true;
           const result = typeof payload.result === 'string' ? payload.result : '';
+          if (type === 'tool_call' && commandPermissionTools.has(tool) && permissionMode !== 'all' && !pendingPermission) {
+            setPendingRequest(activeRequestRef.current);
+            setPendingPermission('command');
+          }
           if (type === 'tool_result' && payload.success === false && (tool === 'write_file' || tool === 'edit_file' || tool === 'delete_file' || result.includes('系统拦截'))) {
             const approval: PermissionApproval = tool === 'write_file' || tool === 'edit_file' || tool === 'delete_file' ? 'change' : 'command';
             setPendingRequest(activeRequestRef.current);
@@ -528,8 +547,8 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
       execution_output: contextEnabled ? executionOutput : undefined,
       directory_path: aiDirectoryPath,
       history: conversation,
-      allow_commands: approval === 'command' || permissionMode === 'session',
-      allow_changes: approval === 'change' || permissionMode === 'session',
+      allow_commands: approval === 'command' || permissionMode === 'all',
+      allow_changes: approval === 'change' || permissionMode === 'changes' || permissionMode === 'all',
       retry: approved,
       session_id: sessionId,
     });
@@ -627,7 +646,7 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
     const changes = draftChanges;
     try {
       await onApplyChanges(changes);
-      if (remember) setPermissionMode('session');
+      if (remember) setPermissionMode('changes');
       setPendingPermission(null);
       setDraftChanges(null);
       addEvent('多文件修改已落盘', changes.length + ' 个文件立即生效', 'success');
@@ -639,15 +658,11 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
   };
 
   useEffect(() => {
-    if (permissionMode === 'session' && draftChanges && draftChanges.length > 0 && !running) {
+    if ((permissionMode === 'changes' || permissionMode === 'all') && draftChanges && draftChanges.length > 0 && !running) {
       void applyDraft();
     }
   }, [permissionMode, draftChanges, running]);
 
-  const copyPrompt = async () => {
-    await navigator.clipboard?.writeText(prompt);
-    Message.success('请求已复制');
-  };
 
   useEffect(() => {
     const handlePointerMove = (event: PointerEvent) => {
@@ -949,7 +964,7 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
             </div>
             <Space>
               <Button size="small" type="primary" onClick={() => handleSubmit(pendingPermission)}>允许</Button>
-              <Button size="small" onClick={() => { setPermissionMode('session'); void handleSubmit(pendingPermission); }}>本会话允许</Button>
+              <Button size="small" onClick={() => { setPermissionMode(pendingPermission === 'command' ? 'all' : 'changes'); void handleSubmit(pendingPermission); }}>本会话允许</Button>
               <Button size="small" onClick={() => { setPendingPermission(null); setPendingRequest(''); }}>拒绝</Button>
             </Space>
           </div>
@@ -1037,7 +1052,27 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
               : `约 ${formatTokenCount(currentContextTokens)} tokens`}
           </span>
           <Space>
-            <Button type="text" size="small" icon={<IconCopy />} onClick={copyPrompt} disabled={!prompt.trim()} aria-label="复制请求" />
+            <Dropdown
+              trigger="click"
+              position="br"
+              droplist={(
+                <Menu selectedKeys={[permissionMode]}>
+                  <Menu.Item key="default" onClick={() => setPermissionMode('default')}><Space><IconLock />默认</Space></Menu.Item>
+                  <Menu.Item key="changes" onClick={() => setPermissionMode('changes')}><Space><IconEdit />允许编辑文件</Space></Menu.Item>
+                  <Menu.Item key="all" onClick={() => setPermissionMode('all')}><Space><IconUnlock />全部权限</Space></Menu.Item>
+                </Menu>
+              )}
+            >
+              <Button
+                type="text"
+                size="small"
+                shape="circle"
+                icon={permissionMode === 'default' ? <IconLock /> : permissionMode === 'changes' ? <IconEdit /> : <IconUnlock />}
+                className="script-ai-permission-trigger"
+                aria-label={`审批模式：${permissionMode === 'default' ? '默认' : permissionMode === 'changes' ? '允许编辑文件' : '全部权限'}`}
+                title={`审批模式：${permissionMode === 'default' ? '默认' : permissionMode === 'changes' ? '允许编辑文件' : '全部权限'}`}
+              />
+            </Dropdown>
             <Button
               type="text"
               size="small"
