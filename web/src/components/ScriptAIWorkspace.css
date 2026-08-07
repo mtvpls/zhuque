@@ -59,7 +59,26 @@
 .script-ai-message.role-user { background: #e8f3ff; border-color: #c9e2ff; }
 .script-ai-message.role-assistant { background: #fff; }
 .script-ai-message-role { display: block; margin-bottom: 3px; color: var(--color-text-3); font-size: 10px; font-weight: 600; }
-.script-ai-message-content { overflow-wrap: anywhere; }
+.script-ai-message-content { min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
+.markdown-content { white-space: normal; overflow-wrap: anywhere; word-break: break-word; }
+.markdown-content p { margin: 0 0 8px; overflow-wrap: anywhere; }
+.markdown-content p:last-child { margin-bottom: 0; }
+.markdown-content h1, .markdown-content h2, .markdown-content h3, .markdown-content h4, .markdown-content h5, .markdown-content h6 { margin: 8px 0 5px; color: var(--color-text-1); font-weight: 600; line-height: 1.35; overflow-wrap: anywhere; }
+.markdown-content h1 { font-size: 18px; }
+.markdown-content h2 { font-size: 16px; }
+.markdown-content h3 { font-size: 14px; }
+.markdown-content ul, .markdown-content ol { box-sizing: border-box; width: 100%; max-width: 100%; margin: 4px 0 8px; padding-left: 24px; overflow-wrap: anywhere; word-break: break-word; }
+.markdown-content li { max-width: 100%; margin: 3px 0; padding-left: 2px; overflow-wrap: anywhere; word-break: break-word; }
+.markdown-content code { overflow-wrap: anywhere; word-break: break-word; padding: 1px 4px; background: #f2f3f5; border-radius: 3px; font-family: 'JetBrains Mono', Consolas, monospace; font-size: .92em; }
+.markdown-content pre { max-width: 100%; box-sizing: border-box; margin: 7px 0; overflow: auto; padding: 9px; background: #1e1e1e; border-radius: 3px; color: #d4d4d4; font-family: 'JetBrains Mono', Consolas, monospace; font-size: 11px; line-height: 1.6; white-space: pre; }
+.markdown-content pre code { padding: 0; background: transparent; color: inherit; white-space: pre; word-break: normal; overflow-wrap: normal; }
+.markdown-content a { max-width: 100%; color: #165dff; text-decoration: underline; overflow-wrap: anywhere; word-break: break-word; }
+.markdown-content table { width: 100%; max-width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 11px; }
+.markdown-content th, .markdown-content td { max-width: 260px; padding: 5px 7px; border: 1px solid var(--color-border); text-align: left; vertical-align: top; overflow-wrap: anywhere; word-break: break-word; }
+.markdown-content th { background: #f2f3f5; color: var(--color-text-1); font-weight: 600; }
+.markdown-content td { background: #fff; }
+.markdown-break { height: 4px; }
+
 
 .script-ai-diff-card { margin-bottom: 12px; background: #fff; }
 .script-ai-diff-heading { display: flex; align-items: center; justify-content: space-between; font-size: 12px; font-weight: 600; }

@@ -29,6 +29,8 @@ import {
   IconStop,
 } from '@arco-design/web-react/icon';
 import './ScriptAIWorkspace.css';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 
 type PermissionMode = 'ask' | 'session';
 type EventTone = 'neutral' | 'success' | 'warning' | 'error';
@@ -822,7 +824,11 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
             ) : (
               <div key={'message-' + index} className={'script-ai-message role-' + group.message.role}>
                 <span className="script-ai-message-role">{group.message.role === 'user' ? '你' : 'AI'}</span>
-                <div className="script-ai-message-content">{group.message.content}</div>
+                <div className="script-ai-message-content markdown-content">
+                  {group.message.role === 'assistant' ? (
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{group.message.content}</ReactMarkdown>
+                  ) : group.message.content}
+                </div>
               </div>
             ))}
           </div>
