@@ -313,6 +313,7 @@ sendNotify('标题', '内容');
 | 变量名 | 说明 | 默认值 | 必填 |
 | --- | --- | --- | --- |
 | `JWT_SECRET` | JWT 密钥（建议自定义） | 自动生成 UUID | 否 |
+| `JWT_EXPIRATION_DAYS` | JWT 有效期（天） | `7` | 否 |
 | `WEBHOOK_TOKEN` | Webhook 认证令牌 | 无 | 否\* |
 | `DATA_DIR` | 数据目录路径 | `./data` | 否 |
 | `PORT` | 服务端口 | `3000` | 否 |

@@ -4,14 +4,15 @@ use anyhow::{anyhow, Result};
 use chrono::Utc;
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
-const TOKEN_EXPIRATION_DAYS: i64 = 7;
+const DEFAULT_TOKEN_EXPIRATION_DAYS: i64 = 7;
 const SESSION_TOKEN_EXPIRATION: i64 = 300; // 5分钟
 
 pub struct AuthService {
     jwt_secret: String,
+    jwt_expiration_days: i64,
     config_service: Option<Arc<ConfigService>>,
     user_service: Arc<UserService>,
 }
@@ -30,8 +31,23 @@ impl AuthService {
             }
         };
 
+        let jwt_expiration_days = match std::env::var("JWT_EXPIRATION_DAYS") {
+            Ok(value) => match value.parse::<i64>() {
+                Ok(days) if days > 0 => days,
+                _ => {
+                    warn!(
+                        "Invalid JWT_EXPIRATION_DAYS '{}', using default of {} days",
+                        value, DEFAULT_TOKEN_EXPIRATION_DAYS
+                    );
+                    DEFAULT_TOKEN_EXPIRATION_DAYS
+                }
+            },
+            Err(_) => DEFAULT_TOKEN_EXPIRATION_DAYS,
+        };
+
         Ok(Self {
             jwt_secret,
+            jwt_expiration_days,
             config_service: None,
             user_service,
         })
@@ -123,7 +139,7 @@ impl AuthService {
     /// 生成JWT token
     fn generate_jwt_token(&self, username: &str) -> Result<LoginResponse> {
         let now = Utc::now().timestamp();
-        let expires_in = TOKEN_EXPIRATION_DAYS * 24 * 60 * 60;
+        let expires_in = self.jwt_expiration_days * 24 * 60 * 60;
         let exp = now + expires_in;
 
         let claims = Claims {
