@@ -50,6 +50,8 @@ pub struct AiChatRequest {
 pub struct AiHistoryMessage {
     pub role: String,
     pub content: String,
+    #[serde(default)]
+    pub metadata: Option<String>,
 }
 
 const MASKED_API_KEY: &str = "********";
@@ -185,12 +187,15 @@ struct ProviderUsage {
     prompt_tokens: Option<usize>,
     completion_tokens: Option<usize>,
     total_tokens: Option<usize>,
+    cache_hit_tokens: Option<usize>,
+    cache_miss_tokens: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
 struct ProviderCallResult {
     message: Value,
     usage: Option<ProviderUsage>,
+    text_chunks: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -211,10 +216,22 @@ fn provider_usage(value: &Value) -> Option<ProviderUsage> {
             .zip(completion_tokens)
             .map(|(prompt, completion)| prompt + completion)
     });
+    let cache_hit_tokens = read("prompt_cache_hit_tokens").or_else(|| {
+        usage
+            .get("prompt_tokens_details")
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+    });
+    let cache_miss_tokens = read("prompt_cache_miss_tokens").or_else(|| {
+        prompt_tokens.zip(cache_hit_tokens).map(|(prompt, hit)| prompt.saturating_sub(hit))
+    });
     let result = ProviderUsage {
         prompt_tokens,
         completion_tokens,
         total_tokens,
+        cache_hit_tokens,
+        cache_miss_tokens,
     };
     (result.prompt_tokens.is_some()
         || result.completion_tokens.is_some()
@@ -224,6 +241,15 @@ fn provider_usage(value: &Value) -> Option<ProviderUsage> {
 
 fn provider_context_tokens(usage: Option<ProviderUsage>) -> Option<usize> {
     usage.and_then(|value| value.prompt_tokens)
+}
+
+fn provider_cache_tokens(usage: Option<ProviderUsage>) -> Option<(usize, usize)> {
+    usage.and_then(|value| {
+        value
+            .cache_hit_tokens
+            .zip(value.cache_miss_tokens)
+            .or_else(|| value.cache_hit_tokens.map(|hit| (hit, 0)))
+    })
 }
 
 fn estimate_tokens(text: &str) -> usize {
@@ -502,7 +528,11 @@ struct AgentResult {
     files: Vec<AgentFileChange>,
 }
 
-fn agent_tools(allow_commands: bool) -> Value {
+fn agent_system_prompt() -> &'static str {
+    r#"你是 Zhuque 的工作区 Agent。你可以浏览脚本目录、读取文件、搜索代码，管理定时任务、环境变量和依赖，查看执行日志，联网搜索公开网页，并在获得权限后执行脚本和命令。需要 Python、Node.js 或 Linux 依赖时，必须使用依赖管理工具安装，不得直接通过 shell、pip、npm、apt 等命令安装。先使用工具获取必要上下文，不要猜测文件内容。用户要求修改文件时，最后只返回合法 JSON，不要 Markdown 或额外文字。JSON 格式：{"summary":"简短说明","files":[{"path":"工作区相对路径","operation":"update|create|delete","content":"文件完整内容"}]}。修改多个文件时全部放入 files。所有路径必须是工作区相对路径。附加目录存在时，所有工具路径必须限制在该目录内；工具 path 为空表示附加目录根目录，禁止回到工作区根目录。运行权限、模式、当前文件和本轮用户请求会放在最后一条 user 消息中。保持本系统提示词不变，优先利用稳定前缀缓存。"#
+}
+
+fn agent_tools() -> Value {
     let mut tools = vec![
         json!({
             "type": "function",
@@ -670,7 +700,6 @@ fn agent_tools(allow_commands: bool) -> Value {
         }),
     ];
 
-    if allow_commands {
         tools.push(json!({
             "type": "function",
             "function": {
@@ -698,8 +727,6 @@ fn agent_tools(allow_commands: bool) -> Value {
                 }
             }
         }));
-    }
-
     Value::Array(tools)
 }
 
@@ -1257,29 +1284,40 @@ async fn run_agent_job(state: Arc<AppState>, request: AiChatRequest, job: Arc<Ai
             return;
         }
     };
-    let system = format!(
-        "你是 Zhuque 的工作区 Agent。你可以浏览脚本目录、读取文件、搜索代码，管理定时任务、环境变量和依赖，查看执行日志，并联网搜索公开网页{}。如果需要 Python、Node.js 或 Linux 依赖，必须使用依赖管理工具安装，不要直接通过 shell、pip、npm、apt 等命令安装；先确认依赖类型和名称。先使用工具获取必要上下文，不要猜测文件内容。当用户要求修改时，最后必须只返回合法 JSON，不要 Markdown 或额外文字。JSON 格式：{{\"summary\":\"简短说明\",\"files\":[{{\"path\":\"工作区相对路径\",\"operation\":\"update|create|delete\",\"content\":\"文件完整内容\"}}]}}。修改多个文件时全部放入 files。所有路径必须是工作区相对路径。附加目录存在时，所有工具路径都必须限制在该目录内；工具 path 为空表示附加目录根目录，禁止回到工作区根目录。{}",
-        if request.allow_commands { "，并可执行脚本和命令" } else { "" },
-        if request.allow_commands { "执行命令前确认命令不会破坏用户文件；创建、编辑或删除任务/环境变量前确认用户已经明确授权。" } else { "当前未授权执行命令、脚本或写入型管理操作。" },
-    );
-    let context = format!(
-        "模式: {}\n当前文件名: {}\n当前路径: {}\n当前附加目录: {}\n当前文件内容:\n{}\n\n最近执行输出:\n{}\n\n用户请求:\n{}",
+    let system = agent_system_prompt();
+    let stable_context = format!(
+        "运行权限: {}\n模式: {}\n当前文件名: {}\n当前路径: {}\n当前附加目录: {}\n当前文件内容:\n{}\n\n最近执行输出:\n{}",
+        if request.allow_commands { "已授权执行脚本和命令；写入型管理操作仍须得到用户明确授权" } else { "未授权执行脚本、命令或写入型管理操作" },
         request.mode,
         request.file_name.as_deref().unwrap_or("未选择文件"),
         request.file_path.as_deref().unwrap_or(""),
         request.directory_path.as_deref().unwrap_or("未附加目录"),
         request.file_content.as_deref().unwrap_or("未提供"),
         request.execution_output.as_deref().unwrap_or("未提供"),
-        request.prompt,
     );
     let mut messages = vec![json!({"role":"system","content":system})];
-    for item in request.history.iter() {
-        if (item.role == "user" || item.role == "assistant") && !item.content.trim().is_empty() {
-            messages.push(json!({"role":item.role,"content":item.content}));
+    let history_start = request.history.len().saturating_sub(40);
+    for item in request.history.iter().skip(history_start) {
+        if item.content.trim().is_empty() && item.metadata.is_none() { continue; }
+        if !matches!(item.role.as_str(), "user" | "assistant" | "tool") { continue; }
+        let metadata = item.metadata.as_deref().and_then(|raw| serde_json::from_str::<Value>(raw).ok());
+        let is_runtime_context = metadata.as_ref().and_then(|value| value.get("runtime_context")).and_then(Value::as_bool) == Some(true)
+            || (item.role == "user" && item.content.starts_with("运行权限:") && item.content.contains("当前请求:"));
+        if is_runtime_context { continue; }
+        let mut message = json!({"role": item.role, "content": item.content.chars().take(12000).collect::<String>()});
+        if let Some(metadata) = metadata {
+            if let Some(value) = metadata.get("tool_calls") { message["tool_calls"] = value.clone(); }
+            if let Some(value) = metadata.get("tool_call_id") { message["tool_call_id"] = value.clone(); }
+            if let Some(value) = metadata.get("name") { message["name"] = value.clone(); }
         }
+        messages.push(message);
     }
-    messages.push(json!({"role":"user","content":context}));
-    let tools = agent_tools(request.allow_commands);
+    messages.push(json!({
+        "role": "user",
+        "content": format!("{}\n\n当前请求:\n{}", stable_context, request.prompt),
+        "metadata": {"runtime_context": true},
+    }));
+    let tools = agent_tools();
     let mut final_content = String::new();
     loop {
         if let Err(error) = compress_json_messages(
@@ -1309,6 +1347,8 @@ async fn run_agent_job(state: Arc<AppState>, request: AiChatRequest, job: Arc<Ai
             &config.model,
             &messages,
             &tools,
+            request.session_id.as_deref().map(|id| id),
+            Some(&job),
         )
         .await
         {
@@ -1322,9 +1362,25 @@ async fn run_agent_job(state: Arc<AppState>, request: AiChatRequest, job: Arc<Ai
         };
         let provider_usage = response.usage;
         if let Some(tokens) = provider_context_tokens(provider_usage) {
+            set_session_context_tokens(
+                &state,
+                request.session_id.as_deref(),
+                &job.user_key,
+                tokens,
+            )
+            .await;
             publish_job(&job, json!({
                 "type": "context_usage",
                 "tokens": tokens,
+                "source": "provider",
+            }))
+            .await;
+        }
+        if let Some((hit, miss)) = provider_cache_tokens(provider_usage) {
+            publish_job(&job, json!({
+                "type": "cache_usage",
+                "hit_tokens": hit,
+                "miss_tokens": miss,
                 "source": "provider",
             }))
             .await;
@@ -1386,17 +1442,18 @@ async fn run_agent_job(state: Arc<AppState>, request: AiChatRequest, job: Arc<Ai
             json!({"type":"changes","summary":result.summary,"files":result.files}),
         )
         .await;
-    } else {
-        publish_job(&job, json!({"type":"text","content":final_content})).await;
     }
-    let _ = store_session_message(
+    let _ = store_agent_protocol_messages(
         &state,
         request.session_id.as_deref(),
         &job.user_key,
-        "assistant",
-        &final_content,
+        &messages,
     )
     .await;
+    publish_job(&job, json!({
+        "type": "conversation_sync",
+        "messages": agent_history_for_client(&messages),
+    })).await;
     set_session_job(&state, request.session_id.as_deref(), &job.user_key, None).await;
     publish_job(&job, json!({"type":"done"})).await;
 }
@@ -1574,32 +1631,35 @@ pub async fn agent(
     let state = state.clone();
 
     let stream = async_stream::stream! {
-        let system = format!(
-            "你是 Zhuque 的工作区 Agent。你可以浏览脚本目录、读取文件、搜索代码，管理定时任务、环境变量和依赖，查看执行日志，并联网搜索公开网页{}。如果需要 Python、Node.js 或 Linux 依赖，必须使用依赖管理工具安装，不要直接通过 shell、pip、npm、apt 等命令安装；先确认依赖类型和名称。先使用工具获取必要上下文，不要猜测文件内容。当用户要求修改时，最后必须只返回合法 JSON，不要 Markdown 或额外文字。JSON 格式：{{\"summary\":\"简短说明\",\"files\":[{{\"path\":\"工作区相对路径\",\"operation\":\"update|create|delete\",\"content\":\"文件完整内容\"}}]}}。修改多个文件时全部放入 files。所有路径必须是工作区相对路径。附加目录存在时，所有工具路径都必须限制在该目录内；工具 path 为空表示附加目录根目录，禁止回到工作区根目录。{}",
-            if request.allow_commands { "，并可执行脚本和命令" } else { "" },
-            if request.allow_commands { "执行命令前确认命令不会破坏用户文件；创建、编辑或删除任务/环境变量前确认用户已经明确授权。" } else { "当前未授权执行命令、脚本或写入型管理操作。" },
-        );
-        let context = format!(
-            "模式: {}\n当前文件名: {}\n当前路径: {}\n当前附加目录: {}\n当前文件内容:\n{}\n\n最近执行输出:\n{}\n\n用户请求:\n{}",
+        let system = agent_system_prompt();
+        let stable_context = format!(
+            "运行权限: {}\n模式: {}\n当前文件名: {}\n当前路径: {}\n当前附加目录: {}\n当前文件内容:\n{}\n\n最近执行输出:\n{}",
+            if request.allow_commands { "已授权执行脚本和命令；写入型管理操作仍须得到用户明确授权" } else { "未授权执行脚本、命令或写入型管理操作" },
             request.mode,
             request.file_name.as_deref().unwrap_or("未选择文件"),
             request.file_path.as_deref().unwrap_or(""),
             request.directory_path.as_deref().unwrap_or("未附加目录"),
             request.file_content.as_deref().unwrap_or("未提供"),
             request.execution_output.as_deref().unwrap_or("未提供"),
-            request.prompt,
         );
-        let mut messages = vec![json!({"role": "system", "content": system})];
-        for item in request.history.iter() {
-            if (item.role == "user" || item.role == "assistant") && !item.content.trim().is_empty() {
-                messages.push(json!({
-                    "role": item.role,
-                    "content": item.content.chars().take(12000).collect::<String>(),
-                }));
+        let mut messages = vec![
+            json!({"role": "system", "content": system}),
+            json!({"role": "user", "content": stable_context, "metadata": {"runtime_context": true}}),
+        ];
+        let history_start = request.history.len().saturating_sub(40);
+        for item in request.history.iter().skip(history_start) {
+            if !item.content.trim().is_empty() && matches!(item.role.as_str(), "user" | "assistant" | "tool") {
+                let mut message = json!({"role": item.role, "content": item.content.chars().take(12000).collect::<String>()});
+                if let Some(metadata) = item.metadata.as_deref().and_then(|raw| serde_json::from_str::<Value>(raw).ok()) {
+                    if let Some(value) = metadata.get("tool_calls") { message["tool_calls"] = value.clone(); }
+                    if let Some(value) = metadata.get("tool_call_id") { message["tool_call_id"] = value.clone(); }
+                    if let Some(value) = metadata.get("name") { message["name"] = value.clone(); }
+                }
+                messages.push(message);
             }
         }
-        messages.push(json!({"role": "user", "content": context}));
-        let tools = agent_tools(request.allow_commands);
+        messages.push(json!({"role": "user", "content": request.prompt}));
+        let tools = agent_tools();
         let mut final_content = String::new();
 
         loop {
@@ -1610,6 +1670,8 @@ pub async fn agent(
                 &config.model,
                 &messages,
                 &tools,
+                request.session_id.as_deref().map(|id| id),
+                None,
             ).await {
                 Ok(value) => value,
                 Err(error) => {
@@ -1617,12 +1679,22 @@ pub async fn agent(
                     return;
                 }
             };
-
+            for chunk in &response.text_chunks {
+                yield Ok(Event::default().event("agent").data(json!({"type":"text","content":chunk}).to_string()));
+            }
             let provider_usage = response.usage;
             if let Some(tokens) = provider_context_tokens(provider_usage) {
                 yield Ok(Event::default().event("agent").data(json!({
                     "type": "context_usage",
                     "tokens": tokens,
+                    "source": "provider",
+                }).to_string()));
+            }
+            if let Some((hit, miss)) = provider_cache_tokens(provider_usage) {
+                yield Ok(Event::default().event("agent").data(json!({
+                    "type": "cache_usage",
+                    "hit_tokens": hit,
+                    "miss_tokens": miss,
                     "source": "provider",
                 }).to_string()));
             }
@@ -1688,6 +1760,71 @@ pub async fn agent(
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
+fn apply_agent_stream_chunk(
+    data: &str,
+    content: &mut String,
+    text_chunks: &mut Vec<String>,
+    tool_calls: &mut Vec<Value>,
+    usage: &mut Option<ProviderUsage>,
+) {
+    let data = data.trim();
+    if data.is_empty() || data == "[DONE]" {
+        return;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(data) else {
+        return;
+    };
+    if let Some(parsed_usage) = provider_usage(&value) {
+        *usage = Some(parsed_usage);
+    }
+    let Some(choice) = value.get("choices").and_then(Value::as_array).and_then(|items| items.first()) else {
+        return;
+    };
+    let Some(delta) = choice.get("delta") else {
+        return;
+    };
+    if let Some(text) = delta.get("content").and_then(Value::as_str) {
+        content.push_str(text);
+        text_chunks.push(text.to_string());
+    }
+    let Some(deltas) = delta.get("tool_calls").and_then(Value::as_array) else {
+        return;
+    };
+    for delta_call in deltas {
+        let index = delta_call.get("index").and_then(Value::as_u64).unwrap_or(tool_calls.len() as u64) as usize;
+        while tool_calls.len() <= index {
+            tool_calls.push(json!({"id":"","type":"function","function":{"name":"","arguments":""}}));
+        }
+        let current = &mut tool_calls[index];
+        if let Some(id) = delta_call.get("id").and_then(Value::as_str) {
+            current["id"] = Value::String(id.to_string());
+        }
+        if let Some(name) = delta_call.get("function").and_then(|value| value.get("name")).and_then(Value::as_str) {
+            let existing = current["function"]["name"].as_str().unwrap_or("").to_string();
+            current["function"]["name"] = Value::String(existing + name);
+        }
+        if let Some(arguments) = delta_call.get("function").and_then(|value| value.get("arguments")).and_then(Value::as_str) {
+            let existing = current["function"]["arguments"].as_str().unwrap_or("").to_string();
+            current["function"]["arguments"] = Value::String(existing + arguments);
+        }
+    }
+}
+
+async fn publish_stream_text(
+    job: Option<&Arc<AiJob>>,
+    chunks: &[String],
+    published: &mut usize,
+) {
+    let Some(job) = job else {
+        *published = chunks.len();
+        return;
+    };
+    while *published < chunks.len() {
+        publish_job(job, json!({"type":"text","content":chunks[*published]})).await;
+        *published += 1;
+    }
+}
+
 async fn call_agent_provider(
     client: &Client,
     endpoint: &str,
@@ -1695,34 +1832,98 @@ async fn call_agent_provider(
     model: &str,
     messages: &[Value],
     tools: &Value,
+    prompt_cache_key: Option<&str>,
+    stream_job: Option<&Arc<AiJob>>,
 ) -> Result<ProviderCallResult, String> {
-    let payload = json!({
+    let mut payload = json!({
         "model": model,
-        "stream": false,
-        "messages": messages,
+        "stream": true,
+        "messages": messages.iter().map(|message| {
+            let mut message = message.clone();
+            if let Value::Object(object) = &mut message {
+                object.remove("metadata");
+            }
+            message
+        }).collect::<Vec<_>>(),
         "tools": tools,
         "tool_choice": "auto",
     });
-    let value = send_json_with_retries(
-        client,
-        endpoint,
-        api_key,
-        &payload,
-        "AI 请求",
-        validate_agent_response,
-    )
-    .await?;
-    let message = value
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|choices| choices.first())
-        .and_then(|choice| choice.get("message"))
-        .cloned()
-        .ok_or_else(|| "AI 响应缺少 choices[0].message".to_string())?;
-    Ok(ProviderCallResult {
-        message,
-        usage: provider_usage(&value),
-    })
+    if let Some(key) = prompt_cache_key {
+        payload["prompt_cache_key"] = Value::String(key.to_string());
+    }
+    let mut last_error = String::new();
+    for attempt in 1..=AI_REQUEST_MAX_ATTEMPTS {
+        let response = match client.post(endpoint).bearer_auth(api_key).json(&payload).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                last_error = format!("AI 请求失败: {error}");
+                if attempt < AI_REQUEST_MAX_ATTEMPTS {
+                    sleep(Duration::from_millis(400 * attempt as u64)).await;
+                    continue;
+                }
+                return Err(last_error);
+            }
+        };
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            last_error = format!("AI 请求返回 {status}: {}", body.chars().take(500).collect::<String>());
+            if attempt < AI_REQUEST_MAX_ATTEMPTS && should_retry_status(status) {
+                sleep(Duration::from_millis(400 * attempt as u64)).await;
+                continue;
+            }
+            return Err(last_error);
+        }
+        let mut body_stream = response.bytes_stream();
+        let mut buffer = String::new();
+        let mut raw_body = String::new();
+        let mut content = String::new();
+        let mut text_chunks = Vec::new();
+        let mut tool_calls = Vec::new();
+        let mut usage = None;
+        let mut published_text_chunks = 0usize;
+        while let Some(chunk) = body_stream.next().await {
+            let bytes = chunk.map_err(|error| format!("读取 AI 流失败: {error}"))?;
+            let text = String::from_utf8_lossy(&bytes);
+            raw_body.push_str(&text);
+            buffer.push_str(&text);
+            while let Some(index) = buffer.find('\n') {
+                let line = buffer[..index].trim_end_matches('\r').to_string();
+                buffer.drain(..=index);
+                if let Some(data) = line.strip_prefix("data:") {
+                    apply_agent_stream_chunk(data, &mut content, &mut text_chunks, &mut tool_calls, &mut usage);
+                    publish_stream_text(stream_job, &text_chunks, &mut published_text_chunks).await;
+                }
+            }
+        }
+        if !buffer.trim().is_empty() {
+            if let Some(data) = buffer.trim().strip_prefix("data:") {
+                apply_agent_stream_chunk(data, &mut content, &mut text_chunks, &mut tool_calls, &mut usage);
+                publish_stream_text(stream_job, &text_chunks, &mut published_text_chunks).await;
+            }
+        }
+        if text_chunks.is_empty() && tool_calls.is_empty() {
+            if let Ok(value) = serde_json::from_str::<Value>(&raw_body) {
+                usage = provider_usage(&value);
+                if let Some(message) = value.get("choices").and_then(Value::as_array).and_then(|items| items.first()).and_then(|item| item.get("message")).cloned() {
+                    content = message.get("content").and_then(Value::as_str).unwrap_or("").to_string();
+                    if !content.is_empty() {
+                        text_chunks.push(content.clone());
+                    }
+                    tool_calls = message.get("tool_calls").and_then(Value::as_array).cloned().unwrap_or_default();
+                }
+            }
+        }
+        let mut message = json!({"role":"assistant","content":content});
+        if !tool_calls.is_empty() {
+            message["tool_calls"] = Value::Array(tool_calls);
+        }
+        if content.is_empty() && message.get("tool_calls").is_none() {
+            return Err("AI 流响应缺少内容".to_string());
+        }
+        return Ok(ProviderCallResult { message, usage, text_chunks });
+    }
+    Err(last_error)
 }
 
 fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
@@ -1736,6 +1937,7 @@ pub struct AiSessionSummary {
     directory_path: Option<String>,
     file_path: Option<String>,
     active_job_id: Option<String>,
+    current_context_tokens: Option<i64>,
     updated_at: String,
 }
 
@@ -1743,6 +1945,8 @@ pub struct AiSessionSummary {
 pub struct AiStoredMessage {
     role: String,
     content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<String>,
 }
 
 pub async fn list_sessions(
@@ -1751,7 +1955,7 @@ pub async fn list_sessions(
 ) -> Result<Json<Vec<AiSessionSummary>>, (StatusCode, String)> {
     let pool = state.db_pool.read().await;
     let rows = sqlx::query_as::<_, AiSessionSummaryRow>(
-        "SELECT id, title, directory_path, file_path, active_job_id, CAST(updated_at AS TEXT) AS updated_at FROM ai_sessions WHERE user_key = ? ORDER BY updated_at DESC"
+        "SELECT id, title, directory_path, file_path, active_job_id, context_tokens AS current_context_tokens, CAST(updated_at AS TEXT) AS updated_at FROM ai_sessions WHERE user_key = ? ORDER BY updated_at DESC"
     ).bind(sub).fetch_all(&*pool).await.map_err(internal_error)?;
     Ok(Json(rows.into_iter().map(Into::into).collect()))
 }
@@ -1763,6 +1967,7 @@ struct AiSessionSummaryRow {
     directory_path: Option<String>,
     file_path: Option<String>,
     active_job_id: Option<String>,
+    current_context_tokens: Option<i64>,
     updated_at: String,
 }
 impl From<AiSessionSummaryRow> for AiSessionSummary {
@@ -1773,6 +1978,7 @@ impl From<AiSessionSummaryRow> for AiSessionSummary {
             directory_path: row.directory_path,
             file_path: row.file_path,
             active_job_id: row.active_job_id,
+            current_context_tokens: row.current_context_tokens,
             updated_at: row.updated_at,
         }
     }
@@ -1790,7 +1996,7 @@ pub async fn create_session(
         .execute(&*pool)
         .await
         .map_err(internal_error)?;
-    let row = sqlx::query_as::<_, AiSessionSummaryRow>("SELECT id, title, directory_path, file_path, active_job_id, CAST(updated_at AS TEXT) AS updated_at FROM ai_sessions WHERE id = ?").bind(&id).fetch_one(&*pool).await.map_err(internal_error)?;
+    let row = sqlx::query_as::<_, AiSessionSummaryRow>("SELECT id, title, directory_path, file_path, active_job_id, context_tokens AS current_context_tokens, CAST(updated_at AS TEXT) AS updated_at FROM ai_sessions WHERE id = ?").bind(&id).fetch_one(&*pool).await.map_err(internal_error)?;
     Ok(Json(row.into()))
 }
 
@@ -1800,18 +2006,19 @@ pub async fn get_session_messages(
     Path(session_id): Path<String>,
 ) -> Result<Json<Vec<AiStoredMessage>>, (StatusCode, String)> {
     let pool = state.db_pool.read().await;
-    let owns: Option<(String,)> =
-        sqlx::query_as("SELECT id FROM ai_sessions WHERE id = ? AND user_key = ?")
-            .bind(&session_id)
-            .bind(sub)
-            .fetch_optional(&*pool)
-            .await
-            .map_err(internal_error)?;
+    let owns: Option<(String,)> = sqlx::query_as(
+        "SELECT id FROM ai_sessions WHERE id = ? AND user_key = ?",
+    )
+    .bind(&session_id)
+    .bind(sub)
+    .fetch_optional(&*pool)
+    .await
+    .map_err(internal_error)?;
     if owns.is_none() {
         return Err((StatusCode::NOT_FOUND, "AI 会话不存在".into()));
     }
     let rows = sqlx::query_as::<_, AiStoredMessage>(
-        "SELECT role, content FROM ai_messages WHERE session_id = ? ORDER BY id",
+        "SELECT role, content, metadata FROM ai_messages WHERE session_id = ? ORDER BY id",
     )
     .bind(session_id)
     .fetch_all(&*pool)
@@ -1849,7 +2056,7 @@ pub async fn compress_session(
             return Err((StatusCode::NOT_FOUND, "AI 会话不存在".into()));
         }
         sqlx::query_as::<_, AiStoredMessage>(
-            "SELECT role, content FROM ai_messages WHERE session_id = ? ORDER BY id",
+            "SELECT role, content, metadata FROM ai_messages WHERE session_id = ? ORDER BY id",
         )
         .bind(&session_id)
         .fetch_all(&*pool)
@@ -1940,7 +2147,7 @@ pub async fn compress_session(
             } else {
                 role.to_string()
             };
-            Some(AiStoredMessage { role, content })
+            Some(AiStoredMessage { role, content, metadata: None })
         })
         .collect();
 
@@ -1951,10 +2158,11 @@ pub async fn compress_session(
         .await
         .map_err(internal_error)?;
     for message in &compressed {
-        sqlx::query("INSERT INTO ai_messages (session_id, role, content) VALUES (?, ?, ?)")
+        sqlx::query("INSERT INTO ai_messages (session_id, role, content, metadata) VALUES (?, ?, ?, ?)")
             .bind(&session_id)
             .bind(&message.role)
             .bind(&message.content)
+            .bind(&message.metadata)
             .execute(&*pool)
             .await
             .map_err(internal_error)?;
@@ -2055,6 +2263,24 @@ pub async fn delete_session(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn set_session_context_tokens(
+    state: &AppState,
+    session_id: Option<&str>,
+    user_key: &str,
+    tokens: usize,
+) {
+    let Some(session_id) = session_id.filter(|value| !value.is_empty()) else {
+        return;
+    };
+    let pool = state.db_pool.read().await;
+    let _ = sqlx::query("UPDATE ai_sessions SET context_tokens = ? WHERE id = ? AND user_key = ?")
+        .bind(tokens as i64)
+        .bind(session_id)
+        .bind(user_key)
+        .execute(&*pool)
+        .await;
+}
+
 async fn set_session_job(
     state: &AppState,
     session_id: Option<&str>,
@@ -2067,6 +2293,74 @@ async fn set_session_job(
     let pool = state.db_pool.read().await;
     let _ = sqlx::query("UPDATE ai_sessions SET active_job_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_key = ?")
         .bind(job_id).bind(session_id).bind(user_key).execute(&*pool).await;
+}
+
+fn agent_history_for_client(messages: &[Value]) -> Vec<Value> {
+    messages.iter().filter_map(|message| {
+        let role = message.get("role").and_then(Value::as_str)?;
+        if !matches!(role, "user" | "assistant" | "tool") { return None; }
+        let metadata = message.get("metadata");
+        let runtime = metadata.and_then(|value| value.get("runtime_context")).and_then(Value::as_bool) == Some(true);
+        let raw_content = message.get("content").and_then(Value::as_str).unwrap_or("");
+        let content = if runtime {
+            raw_content.split("\n\n当前请求:\n").nth(1).unwrap_or("")
+        } else {
+            raw_content
+        };
+        let mut output = json!({"role": role, "content": content});
+        let protocol = json!({
+            "tool_calls": message.get("tool_calls"),
+            "tool_call_id": message.get("tool_call_id"),
+            "name": message.get("name"),
+        });
+        if protocol.get("tool_calls").is_some() || protocol.get("tool_call_id").is_some() || protocol.get("name").is_some() {
+            output["metadata"] = Value::String(protocol.to_string());
+        }
+        if output["content"].as_str().unwrap_or("").trim().is_empty() && output.get("metadata").is_none() { return None; }
+        Some(output)
+    }).collect()
+}
+
+async fn store_agent_protocol_messages(
+    state: &AppState,
+    session_id: Option<&str>,
+    user_key: &str,
+    messages: &[Value],
+) -> bool {
+    let Some(session_id) = session_id.filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    let pool = state.db_pool.read().await;
+    let _ = sqlx::query("DELETE FROM ai_messages WHERE session_id = ?")
+        .bind(session_id)
+        .execute(&*pool)
+        .await;
+    for message in messages {
+        let Some(role) = message.get("role").and_then(Value::as_str) else { continue; };
+        if !matches!(role, "user" | "assistant" | "tool") { continue; }
+        let content = message.get("content").and_then(Value::as_str).unwrap_or("");
+        let is_runtime_context = message.get("metadata").and_then(|value| value.get("runtime_context")).and_then(Value::as_bool) == Some(true);
+        let persisted_content = if is_runtime_context {
+            message.get("content").and_then(Value::as_str).and_then(|value| value.split("\n\n当前请求:\n").nth(1)).unwrap_or("")
+        } else {
+            content
+        };
+        let has_protocol_metadata = message.get("tool_calls").is_some()
+            || message.get("tool_call_id").is_some()
+            || message.get("name").is_some();
+        if persisted_content.trim().is_empty() && !has_protocol_metadata { continue; }
+        let metadata = serde_json::to_string(&json!({
+            "tool_calls": message.get("tool_calls"),
+            "tool_call_id": message.get("tool_call_id"),
+            "name": message.get("name"),
+        })).ok();
+        let _ = sqlx::query("INSERT INTO ai_messages (session_id, role, content, metadata) SELECT ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM ai_sessions WHERE id = ? AND user_key = ?)")
+            .bind(session_id).bind(role).bind(persisted_content).bind(metadata).bind(session_id).bind(user_key)
+            .execute(&*pool).await;
+    }
+    let _ = sqlx::query("UPDATE ai_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_key = ?")
+        .bind(session_id).bind(user_key).execute(&*pool).await;
+    true
 }
 
 async fn store_session_message(

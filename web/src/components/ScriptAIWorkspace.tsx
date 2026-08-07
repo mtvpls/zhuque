@@ -61,14 +61,16 @@ interface ScriptAIWorkspaceProps {
 }
 
 interface ConversationMessage {
-  role: 'user' | 'assistant';
+  role: 'user' | 'assistant' | 'tool';
   content: string;
+  metadata?: string | null;
 }
 
 interface AiSession {
   id: string;
   title: string;
   active_job_id?: string | null;
+  current_context_tokens?: number | null;
   updated_at: string;
 }
 
@@ -77,6 +79,10 @@ const estimateContextTokens = (parts: Array<string | undefined>) => {
   const messageOverhead = parts.filter((part) => Boolean(part?.trim())).length * 4;
   return Math.ceil(characters / 4) + messageOverhead;
 };
+
+const formatTokenCount = (value: number) => value > 1000
+  ? `${(value / 1000).toFixed(1)}k`
+  : value.toLocaleString();
 
 const formatSessionTime = (value: string) => {
   const timestamp = new Date(value.replace(' ', 'T') + 'Z');
@@ -92,7 +98,7 @@ const formatSessionTime = (value: string) => {
 
 type FeedItem =
   | { kind: 'event'; event: AgentEvent }
-  | { kind: 'message'; message: ConversationMessage };
+  | { kind: 'message'; message: ConversationMessage; segmentId?: string };
 
 type FeedGroup =
   | { kind: 'events'; events: AgentEvent[] }
@@ -118,6 +124,7 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
   const [sessions, setSessions] = useState<AiSession[]>([]);
   const [loadingSession, setLoadingSession] = useState(false);
   const [providerContextTokens, setProviderContextTokens] = useState<number | null>(null);
+  const [cacheUsage, setCacheUsage] = useState<{ hit: number; miss: number } | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [permissionMode, setPermissionMode] = useState<PermissionMode>('ask');
   const [pendingPermission, setPendingPermission] = useState<'command' | 'change' | null>(null);
@@ -133,6 +140,10 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
   const jobIdRef = useRef<string | null>(null);
   const activeRequestRef = useRef('');
   const assistantTextRef = useRef('');
+  const assistantSegmentRef = useRef<string | null>(null);
+  const streamedTextRef = useRef(false);
+  const toolInteractionRef = useRef(false);
+  const conversationSyncRef = useRef(false);
   const reconnectTimerRef = useRef<number | null>(null);
   const keepSubscribedRef = useRef(false);
   const lastSequenceRef = useRef(0);
@@ -182,15 +193,52 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
   }, [visible]);
 
   useEffect(() => {
+    if (!sessionId) {
+      setProviderContextTokens(null);
+      return;
+    }
+    const session = sessions.find((item) => item.id === sessionId);
+    setProviderContextTokens(session?.current_context_tokens ?? null);
+  }, [sessionId, sessions]);
+
+  useEffect(() => {
     if (!sessionId || !visible) return;
     setLoadingSession(true);
     void fetch(`/api/ai/sessions/${encodeURIComponent(sessionId)}/messages`, {
       headers: { Authorization: `Bearer ${localStorage.getItem('token') || ''}` },
     }).then(async (response) => {
       if (!response.ok) return;
-      const messages = await response.json() as ConversationMessage[];
-      setConversation(messages);
-      setFeedItems(messages.map((message) => ({ kind: 'message' as const, message })));
+      const storedMessages = await response.json() as ConversationMessage[];
+      const restoredFeed: FeedItem[] = [];
+      for (const message of storedMessages) {
+        if (message.role === 'user') {
+          const isRuntimeContext = message.metadata?.includes('"runtime_context":true') || (message.content.startsWith('运行权限:') && message.content.includes('当前请求:'));
+          if (!isRuntimeContext) restoredFeed.push({ kind: 'message', message });
+          continue;
+        }
+        if (message.role === 'assistant') {
+          let toolCalls: Array<{ function?: { name?: string; arguments?: string } }> = [];
+          try {
+            const metadata = message.metadata ? JSON.parse(message.metadata) as { tool_calls?: Array<{ function?: { name?: string; arguments?: string } }> } : {};
+            toolCalls = metadata.tool_calls || [];
+          } catch { }
+          for (const call of toolCalls) {
+            restoredFeed.push({ kind: 'event', event: { id: restoredFeed.length + 1, label: `调用工具 · ${call.function?.name || '未知工具'}`, detail: call.function?.arguments || undefined } });
+          }
+          if (message.content.trim()) restoredFeed.push({ kind: 'message', message });
+          continue;
+        }
+        if (message.role === 'tool') {
+          let toolName = '工具';
+          try {
+            const metadata = message.metadata ? JSON.parse(message.metadata) as { name?: string } : {};
+            toolName = metadata.name || toolName;
+          } catch { }
+          restoredFeed.push({ kind: 'event', event: { id: restoredFeed.length + 1, label: `工具完成 · ${toolName}`, detail: message.content.slice(0, 1600), tone: 'success' } });
+        }
+      }
+      setConversation(storedMessages);
+      setFeedItems(restoredFeed);
     }).catch(() => undefined).finally(() => setLoadingSession(false));
   }, [sessionId, visible]);
 
@@ -274,6 +322,10 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
     const socket = new WebSocket(`${protocol}//${window.location.host}/api/ai/ws?${query}`);
     socketRef.current = socket;
     assistantTextRef.current = '';
+    assistantSegmentRef.current = null;
+    streamedTextRef.current = false;
+    toolInteractionRef.current = false;
+    conversationSyncRef.current = false;
     keepSubscribedRef.current = true;
 
     socket.onopen = () => {
@@ -295,7 +347,28 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
         if (type === 'context_usage') {
           const tokens = Number(payload.tokens);
           if (payload.source === 'provider' && Number.isFinite(tokens) && tokens > 0) {
-            setProviderContextTokens(Math.round(tokens));
+            const roundedTokens = Math.round(tokens);
+            setProviderContextTokens(roundedTokens);
+            setSessions((previous) => previous.map((session) => (
+              session.id === socketSessionId
+                ? { ...session, current_context_tokens: roundedTokens }
+                : session
+            )));
+          }
+        } else if (type === 'cache_usage') {
+          const hit = Number(payload.hit_tokens);
+          const miss = Number(payload.miss_tokens);
+          if (Number.isFinite(hit) && Number.isFinite(miss)) {
+            const total = Math.max(0, hit + miss);
+            setCacheUsage({ hit: Math.max(0, hit), miss: Math.max(0, miss) });
+            if (total > 0) {
+              setProviderContextTokens(total);
+              setSessions((previous) => previous.map((session) => (
+                session.id === socketSessionId
+                  ? { ...session, current_context_tokens: total }
+                  : session
+              )));
+            }
           }
         } else if (type === 'session_title') {
           const title = typeof payload.title === 'string' ? payload.title : '';
@@ -313,14 +386,47 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
               localStorage.setItem('script-ai-active-jobs', JSON.stringify(sessionJobsRef.current));
             }
           }
-        } else if (type === 'tool_call') {
-          addEvent('调用工具 · ' + tool, payload.arguments ? JSON.stringify(payload.arguments) : undefined);
-        } else if (type === 'tool_result') {
+        } else if (type === 'tool_call' || type === 'tool_result') {
+          assistantSegmentRef.current = null;
+          toolInteractionRef.current = true;
           const result = typeof payload.result === 'string' ? payload.result : '';
-          addEvent('工具完成 · ' + tool, result.slice(0, 1600) || (payload.success ? '无输出' : '执行失败'), payload.success ? 'success' : 'error');
+          setFeedItems((previous) => [
+            ...previous,
+            {
+              kind: 'event',
+              event: {
+                id: Date.now() + previous.length,
+                label: type === 'tool_call' ? '调用工具 · ' + tool : '工具完成 · ' + tool,
+                detail: type === 'tool_call'
+                  ? (payload.arguments ? JSON.stringify(payload.arguments) : undefined)
+                  : (result.slice(0, 1600) || (payload.success ? '无输出' : '执行失败')),
+                tone: type === 'tool_call' ? 'neutral' : (payload.success ? 'success' : 'error'),
+              },
+            },
+          ]);
         } else if (type === 'text') {
-          assistantTextRef.current += typeof payload.content === 'string' ? payload.content : '';
+          const chunk = typeof payload.content === 'string' ? payload.content : '';
+          if (chunk) {
+            assistantTextRef.current += chunk;
+            streamedTextRef.current = true;
+            if (!assistantSegmentRef.current) {
+              assistantSegmentRef.current = `assistant-${Date.now()}-${envelope.seq ?? Math.random()}`;
+            }
+            const segmentId = assistantSegmentRef.current;
+            setFeedItems((previous) => {
+              const index = previous.findIndex((item) => item.kind === 'message' && item.segmentId === segmentId);
+              if (index >= 0) {
+                const item = previous[index];
+                if (item.kind !== 'message') return previous;
+                const next = [...previous];
+                next[index] = { ...item, message: { ...item.message, content: item.message.content + chunk } };
+                return next;
+              }
+              return [...previous, { kind: 'message', segmentId, message: { role: 'assistant', content: chunk } }];
+            });
+          }
         } else if (type === 'changes') {
+          assistantSegmentRef.current = null;
           const changes = (Array.isArray(payload.files) ? payload.files : []).filter((change): change is AgentFileChange => {
             const item = change as AgentFileChange;
             return Boolean(item && typeof item.path === 'string' &&
@@ -332,6 +438,14 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
           addEvent('生成多文件修改提案', changes.length + ' 个文件等待应用', 'warning');
         } else if (type === 'cancelled') {
           addEvent('任务已取消', String(payload.message || '当前任务已停止'), 'warning');
+        } else if (type === 'conversation_sync') {
+          const messages = Array.isArray(payload.messages)
+            ? payload.messages.filter((item): item is ConversationMessage => Boolean(item && (item.role === 'user' || item.role === 'assistant' || item.role === 'tool') && typeof item.content === 'string'))
+            : [];
+          if (messages.length > 0) {
+            conversationSyncRef.current = true;
+            setConversation(messages);
+          }
         } else if (type === 'error') {
           const errorMessage = String(payload.message || '无法连接 AI Agent');
           addEvent('Agent 请求失败', errorMessage, 'error');
@@ -347,8 +461,12 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
           const finalAssistantMessage = assistantTextRef.current || 'Agent 已完成。';
           const request = activeRequestRef.current;
           if (request) {
-            setConversation((previous) => [...previous, { role: 'user', content: request }, { role: 'assistant', content: finalAssistantMessage }]);
-            setFeedItems((previous) => [...previous, { kind: 'message', message: { role: 'assistant', content: finalAssistantMessage } }]);
+            if (!streamedTextRef.current) {
+              setFeedItems((previous) => [...previous, { kind: 'message', message: { role: 'assistant', content: finalAssistantMessage } }]);
+            }
+            if (!conversationSyncRef.current && !toolInteractionRef.current) {
+              setConversation((previous) => [...previous, { role: 'user', content: request }, { role: 'assistant', content: finalAssistantMessage }]);
+            }
           }
           activeRequestRef.current = '';
           if (socketSessionId) {
@@ -403,6 +521,7 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
     setPendingRequest('');
     setRunning(true);
     setProviderContextTokens(null);
+    setCacheUsage(null);
     setPrompt('');
     setDraftChanges(null);
     keepSubscribedRef.current = true;
@@ -413,7 +532,6 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
     if (!approvedCommand) {
       setFeedItems((previous) => [...previous, { kind: 'message', message: { role: 'user', content: request } }]);
     }
-    addEvent('准备工作区上下文', aiDirectoryPath || filePath || fileName || '未选择文件');
     connectJob(undefined, {
       mode: 'agent',
       prompt: request,
@@ -923,8 +1041,8 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
         <div className="script-ai-composer-footer">
           <span>
             当前上下文：{providerContextTokens !== null
-              ? `${providerContextTokens.toLocaleString()} tokens`
-              : `约 ${currentContextTokens.toLocaleString()} tokens`}
+              ? `${formatTokenCount(providerContextTokens)} tokens${cacheUsage ? `（${formatTokenCount(cacheUsage.hit)}）` : ''}`
+              : `约 ${formatTokenCount(currentContextTokens)} tokens`}
           </span>
           <Space>
             <Button type="text" size="small" icon={<IconCopy />} onClick={copyPrompt} disabled={!prompt.trim()} aria-label="复制请求" />

@@ -246,10 +246,15 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool> {
             directory_path TEXT,
             file_path TEXT,
             active_job_id TEXT,
+            context_tokens INTEGER,
             created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
     "#).execute(&pool).await?;
+    sqlx::query("ALTER TABLE ai_sessions ADD COLUMN context_tokens INTEGER")
+        .execute(&pool)
+        .await
+        .ok();
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_ai_sessions_user_updated ON ai_sessions(user_key, updated_at DESC)").execute(&pool).await?;
     sqlx::query(r#"
         CREATE TABLE IF NOT EXISTS ai_messages (
@@ -257,10 +262,15 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool> {
             session_id TEXT NOT NULL,
             role TEXT NOT NULL,
             content TEXT NOT NULL,
+            metadata TEXT,
             created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (session_id) REFERENCES ai_sessions(id) ON DELETE CASCADE
         )
     "#).execute(&pool).await?;
+    sqlx::query("ALTER TABLE ai_messages ADD COLUMN metadata TEXT")
+        .execute(&pool)
+        .await
+        .ok();
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_ai_messages_session ON ai_messages(session_id, id)").execute(&pool).await?;
 
     // 执行增量压缩回收空间
