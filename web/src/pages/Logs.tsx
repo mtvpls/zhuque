@@ -48,10 +48,8 @@ const Logs: React.FC = () => {
 
   useEffect(() => {
     console.log('selectedTaskId changed:', selectedTaskId);
-    if (selectedTaskId) {
-      console.log('Calling loadLogs with taskId:', selectedTaskId);
-      loadLogs(selectedTaskId, 1);
-    }
+    console.log('Calling loadLogs with taskId:', selectedTaskId);
+    loadLogs(selectedTaskId, 1);
   }, [selectedTaskId]);
 
   const loadTasks = async () => {
@@ -59,21 +57,16 @@ const Logs: React.FC = () => {
       const res: any = await taskApi.listSimple();
       console.log('Tasks loaded:', res);
       setTasks(res);
-      if (res.length > 0) {
-        console.log('Setting selectedTaskId to:', res[0].id);
-        setSelectedTaskId(res[0].id);
-      } else {
-        console.log('No tasks found');
-      }
+      console.log('默认查看全部任务');
     } catch (error) {
       console.error('Failed to load tasks:', error);
     }
   };
 
-  const loadLogs = async (taskId: number, page = 1) => {
+  const loadLogs = async (taskId: number | null, page = 1) => {
     setLoading(true);
     try {
-      const res: any = await logApi.list(taskId, page, pagination.pageSize);
+      const res: any = await logApi.list(taskId ?? undefined, page, pagination.pageSize);
       console.log('Logs API response:', res);
       console.log('Logs data:', res.data);
       console.log('Logs data length:', res.data?.length);
@@ -92,9 +85,7 @@ const Logs: React.FC = () => {
   };
 
   const handlePageChange = (page: number) => {
-    if (selectedTaskId) {
-      loadLogs(selectedTaskId, page);
-    }
+    loadLogs(selectedTaskId, page);
   };
 
   const handleViewLog = async (log: Log) => {
@@ -182,8 +173,8 @@ const Logs: React.FC = () => {
           <Select
             placeholder="选择任务（可搜索）"
             style={{ width: 200 }}
-            value={selectedTaskId ?? undefined}
-            onChange={(value) => setSelectedTaskId(value as number)}
+            value={selectedTaskId ?? 'all'}
+            onChange={(value) => setSelectedTaskId(value === 'all' || value == null ? null : value as number)}
             showSearch
             filterOption={(inputValue, option) =>
               (option?.props?.children as string)
@@ -192,6 +183,7 @@ const Logs: React.FC = () => {
             }
             allowClear
           >
+            <Option key="all" value="all">全部任务</Option>
             {tasks.map((task) => (
               <Option key={task.id} value={task.id}>
                 {task.name}
@@ -200,7 +192,7 @@ const Logs: React.FC = () => {
           </Select>
           <Button
             icon={<IconRefresh />}
-            onClick={() => selectedTaskId && loadLogs(selectedTaskId, pagination.current)}
+            onClick={() => loadLogs(selectedTaskId, pagination.current)}
           >
             刷新
           </Button>
