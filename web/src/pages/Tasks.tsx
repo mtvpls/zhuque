@@ -23,7 +23,7 @@ import {
   Radio,
   Checkbox,
 } from '@arco-design/web-react';
-import { IconPlus, IconPlayArrow, IconEdit, IconDelete, IconInfoCircle, IconStop, IconFile, IconMore, IconLink, IconPoweroff, IconNotification } from '@arco-design/web-react/icon';
+import { IconPlus, IconPlayArrow, IconEdit, IconDelete, IconInfoCircle, IconStop, IconFile, IconMore, IconLink, IconPoweroff, IconNotification, IconCopy } from '@arco-design/web-react/icon';
 import { taskApi } from '@/api/task';
 import { logApi } from '@/api/log';
 import { notificationApi } from '@/api/notification';
@@ -364,6 +364,28 @@ const Tasks: React.FC = () => {
     setVisible(true);
   };
 
+  const handleClone = (task: Task) => {
+    setEditingTask(null);
+    form.resetFields();
+    form.setFieldsValue({
+      name: `${task.name} 克隆任务`,
+      type: task.type,
+      group_id: task.group_id,
+      cron: Array.isArray(task.cron) ? task.cron : [task.cron],
+      command: task.command,
+      enabled: task.enabled,
+      working_dir: task.working_dir,
+      timeout: task.timeout,
+      pre_command: task.pre_command,
+      post_command: task.post_command,
+      env: task.env,
+    });
+    setTaskEnvFormat('json');
+    resetNotifState(task.notification);
+    loadGlobalChannels();
+    setVisible(true);
+  };
+
   const handleSubmit = async () => {
     try {
       const values = await form.validate();
@@ -695,6 +717,12 @@ const Tasks: React.FC = () => {
               <Space>
                 <IconEdit />
                 编辑
+              </Space>
+            </Menu.Item>
+            <Menu.Item key="clone" onClick={() => handleClone(record)}>
+              <Space>
+                <IconCopy />
+                克隆
               </Space>
             </Menu.Item>
             <Menu.Item
