@@ -252,8 +252,10 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
     ]);
   };
 
-  const looksLikeCommandRequest = (request: string) =>
-    /(执行|运行|命令|测试|编译|构建|安装依赖|启动|调试|shell|终端|lint|test|build|install|run|compile|ping|curl|wget|npm|pnpm|yarn|cargo|python|node|bash|powershell|cmd)/i.test(request);
+  const looksLikeCommandRequest = (request: string) => {
+    if (/(list_tasks|list_logs|get_log|list_env_vars|web_search|list_dir|read_file|search_code)/i.test(request)) return false;
+    return /(执行|运行|命令|测试|编译|构建|安装依赖|启动|调试|创建.*任务|新增.*任务|编辑.*任务|修改.*任务|删除.*任务|创建.*环境变量|新增.*环境变量|编辑.*环境变量|修改.*环境变量|删除.*环境变量|shell|终端|lint|test|build|install|run|compile|ping|curl|wget|npm|pnpm|yarn|cargo|python|node|bash|powershell|cmd)/i.test(request);
+  };
 
   const getPendingCommand = (request: string) => {
     const quoted = request.match(/`([^`]+)`/);
@@ -828,7 +830,7 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
 
         {pendingPermission === 'command' && (
           <div className="script-ai-permission">
-            <div><strong>将执行命令</strong><code>{getPendingCommand(pendingRequest)}</code></div>
+            <div><strong>该请求需要写入或执行权限</strong><code>{getPendingCommand(pendingRequest)}</code></div>
             <Space>
               <Button size="small" type="primary" onClick={() => handleSubmit(true)}>允许</Button>
               <Button size="small" onClick={() => { setPermissionMode('session'); void handleSubmit(true); }}>本会话允许</Button>

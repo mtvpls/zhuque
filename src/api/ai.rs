@@ -1,5 +1,7 @@
 use crate::api::AppState;
-use crate::models::{AiConfig, Claims};
+use crate::models::{
+    AiConfig, Claims, CreateEnvVar, CreateTask, CronInput, UpdateEnvVar, UpdateTask,
+};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -18,7 +20,7 @@ use futures::{
 };
 use once_cell::sync::Lazy;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::HashMap, convert::Infallible, process::Stdio, sync::Arc, time::Duration};
 use tokio::process::Command;
@@ -711,6 +713,132 @@ fn agent_tools(allow_commands: bool) -> Value {
                 }
             }
         }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "list_tasks",
+                "description": "列出定时任务，可按名称或命令搜索。不要返回任务环境变量内容。",
+                "parameters": { "type": "object", "properties": { "search": { "type": "string" } } }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "create_task",
+                "description": "创建定时任务。只有用户明确要求创建时调用；必须提供名称、命令和 cron。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" }, "command": { "type": "string" },
+                        "cron": { "type": "string", "description": "cron 表达式，也可传字符串数组" },
+                        "type": { "type": "string", "enum": ["cron", "manual", "startup"] },
+                        "enabled": { "type": "boolean" }, "env": { "type": "string" },
+                        "working_dir": { "type": "string" }, "timeout": { "type": "integer", "minimum": 0 }
+                    },
+                    "required": ["name", "command", "cron"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "update_task",
+                "description": "编辑已有定时任务。先确认任务 id，只修改用户明确要求的字段。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer" }, "name": { "type": "string" }, "command": { "type": "string" },
+                        "cron": { "type": "string" }, "type": { "type": "string", "enum": ["cron", "manual", "startup"] },
+                        "enabled": { "type": "boolean" }, "env": { "type": "string" }, "working_dir": { "type": "string" },
+                        "timeout": { "type": "integer", "minimum": 0 }
+                    },
+                    "required": ["id"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "delete_task",
+                "description": "删除已有定时任务。仅在用户明确要求删除并确认 id 后调用。",
+                "parameters": { "type": "object", "properties": { "id": { "type": "integer" } }, "required": ["id"] }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "list_logs",
+                "description": "查看任务执行日志列表，可按 task_id、页码和每页数量过滤；列表不含正文。",
+                "parameters": {
+                    "type": "object", "properties": {
+                        "task_id": { "type": "integer" }, "page": { "type": "integer", "minimum": 1 },
+                        "page_size": { "type": "integer", "minimum": 1, "maximum": 100 }
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "get_log",
+                "description": "读取一条任务执行日志的完整输出。",
+                "parameters": { "type": "object", "properties": { "id": { "type": "integer" } }, "required": ["id"] }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "list_env_vars",
+                "description": "列出环境变量名称、备注和启用状态；出于安全原因不返回变量值。",
+                "parameters": { "type": "object", "properties": { "search": { "type": "string" } } }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "create_env_var",
+                "description": "创建环境变量。value 只用于写入，结果中不回显。",
+                "parameters": {
+                    "type": "object", "properties": {
+                        "key": { "type": "string" }, "value": { "type": "string" },
+                        "remark": { "type": "string" }, "enabled": { "type": "boolean" }
+                    }, "required": ["key", "value"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "update_env_var",
+                "description": "编辑环境变量。value 只用于写入，结果中不回显。",
+                "parameters": {
+                    "type": "object", "properties": {
+                        "id": { "type": "integer" }, "key": { "type": "string" }, "value": { "type": "string" },
+                        "remark": { "type": "string" }, "enabled": { "type": "boolean" }
+                    }, "required": ["id"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "delete_env_var",
+                "description": "删除环境变量。仅在用户明确要求删除并确认 id 后调用。",
+                "parameters": { "type": "object", "properties": { "id": { "type": "integer" } }, "required": ["id"] }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "联网搜索公开网页，返回标题、摘要和链接；需要实时信息时使用。",
+                "parameters": {
+                    "type": "object", "properties": {
+                        "query": { "type": "string" }, "limit": { "type": "integer", "minimum": 1, "maximum": 10 }
+                    }, "required": ["query"]
+                }
+            }
+        }),
     ];
 
     if allow_commands {
@@ -895,6 +1023,138 @@ async fn run_workspace_command(
     }))
 }
 
+#[derive(Debug, Deserialize)]
+struct CreateTaskToolArgs {
+    name: String,
+    command: String,
+    cron: CronInput,
+    #[serde(rename = "type")]
+    task_type: Option<String>,
+    enabled: Option<bool>,
+    env: Option<String>,
+    pre_command: Option<String>,
+    post_command: Option<String>,
+    group_id: Option<i64>,
+    working_dir: Option<String>,
+    timeout: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateTaskToolArgs {
+    id: i64,
+    name: Option<String>,
+    command: Option<String>,
+    cron: Option<CronInput>,
+    #[serde(rename = "type")]
+    task_type: Option<String>,
+    enabled: Option<bool>,
+    env: Option<String>,
+    pre_command: Option<String>,
+    post_command: Option<String>,
+    group_id: Option<i64>,
+    working_dir: Option<String>,
+    timeout: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EnvToolArgs {
+    id: Option<i64>,
+    key: Option<String>,
+    value: Option<String>,
+    remark: Option<String>,
+    enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IdToolArgs {
+    id: i64,
+}
+
+fn parse_tool_args<T: DeserializeOwned>(arguments: &Value) -> Result<T, String> {
+    serde_json::from_value(arguments.clone()).map_err(|error| format!("工具参数无效: {error}"))
+}
+
+fn task_summary(task: &crate::models::Task) -> Value {
+    json!({
+        "id": task.id,
+        "name": task.name,
+        "command": task.command,
+        "cron": task.cron,
+        "type": task.task_type,
+        "enabled": task.enabled,
+        "working_dir": task.working_dir,
+        "timeout": task.timeout,
+        "last_run_at": task.last_run_at,
+        "next_run_at": task.next_run_at,
+    })
+}
+
+fn env_summary(env: &crate::models::EnvVar) -> Value {
+    json!({
+        "id": env.id,
+        "key": env.key,
+        "remark": env.remark,
+        "enabled": env.enabled,
+        "value": "[已隐藏]",
+    })
+}
+
+fn redact_tool_arguments(name: &str, arguments: &Value) -> Value {
+    if !matches!(name, "create_env_var" | "update_env_var") {
+        return arguments.clone();
+    }
+    let mut value = arguments.clone();
+    if let Some(object) = value.as_object_mut() {
+        if object.contains_key("value") {
+            object.insert("value".to_string(), Value::String("[已隐藏]".to_string()));
+        }
+    }
+    value
+}
+
+fn decode_xml(value: &str) -> String {
+    value.replace("<![CDATA[", "").replace("]]>", "")
+        .replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+        .replace("&quot;", "\"").replace("&apos;", "'")
+}
+
+fn xml_tag(item: &str, tag: &str) -> String {
+    let start_tag = format!("<{tag}>");
+    let end_tag = format!("</{tag}>");
+    item.find(&start_tag).and_then(|start| {
+        let content_start = start + start_tag.len();
+        item[content_start..].find(&end_tag)
+            .map(|end| decode_xml(&item[content_start..content_start + end]))
+    }).unwrap_or_default()
+}
+
+async fn web_search(query: &str, limit: usize) -> Result<Value, String> {
+    if query.trim().is_empty() {
+        return Err("搜索关键词不能为空".to_string());
+    }
+    let limit = limit.clamp(1, 10);
+    let url = format!(
+        "https://www.bing.com/search?format=rss&count={limit}&q={}",
+        urlencoding::encode(query.trim())
+    );
+    let client = Client::builder()
+        .user_agent("Zhuque/AI-Workbench")
+        .build()
+        .map_err(|error| format!("创建搜索客户端失败: {error}"))?;
+    let response = client.get(url).send().await.map_err(|error| format!("联网搜索请求失败: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("搜索服务返回 {}", response.status()));
+    }
+    let body = response.text().await.map_err(|error| format!("读取搜索结果失败: {error}"))?;
+    let results = body.split("<item>").skip(1).take(limit).map(|item| json!({
+        "title": xml_tag(item, "title"),
+        "url": xml_tag(item, "link"),
+        "snippet": xml_tag(item, "description"),
+        "published_at": xml_tag(item, "pubDate"),
+    })).collect::<Vec<_>>();
+    Ok(json!({ "query": query.trim(), "source": "Bing RSS", "results": results }))
+}
+
 async fn execute_agent_tool(
     state: &AppState,
     name: &str,
@@ -903,6 +1163,14 @@ async fn execute_agent_tool(
     attached_directory: Option<&str>,
     cancel: Option<&CancellationToken>,
 ) -> Result<Value, String> {
+    if !allow_commands && matches!(
+        name,
+        "create_task" | "update_task" | "delete_task"
+            | "create_env_var" | "update_env_var" | "delete_env_var"
+    ) {
+        return Err("该操作需要用户先授权写入权限".to_string());
+    }
+
     match name {
         "list_dir" => {
             let path = arguments.get("path").and_then(Value::as_str).unwrap_or("");
@@ -933,6 +1201,97 @@ async fn execute_agent_tool(
             let path = arguments.get("path").and_then(Value::as_str).unwrap_or("");
             let path = scope_agent_path(attached_directory, path);
             search_workspace(&state.script_service, &path, &query).await
+        }
+        "list_tasks" => {
+            let search = arguments.get("search").and_then(Value::as_str);
+            let tasks = state.task_service.list_with_search(search).await.map_err(|e| e.to_string())?;
+            Ok(json!({ "tasks": tasks.iter().map(task_summary).collect::<Vec<_>>() }))
+        }
+        "create_task" => {
+            let args: CreateTaskToolArgs = parse_tool_args(arguments)?;
+            let task = state.task_service.create(CreateTask {
+                name: args.name,
+                command: args.command,
+                cron: args.cron,
+                task_type: args.task_type.unwrap_or_else(|| "cron".to_string()),
+                enabled: args.enabled.unwrap_or(true),
+                env: args.env,
+                pre_command: args.pre_command,
+                post_command: args.post_command,
+                group_id: args.group_id,
+                working_dir: args.working_dir,
+                notification: None,
+                timeout: args.timeout.unwrap_or(0).max(0),
+            }).await.map_err(|e| e.to_string())?;
+            state.scheduler.add_task_to_scheduler(task.id).await.map_err(|e| e.to_string())?;
+            Ok(json!({ "task": task_summary(&task) }))
+        }
+        "update_task" => {
+            let args: UpdateTaskToolArgs = parse_tool_args(arguments)?;
+            let task = state.task_service.update(args.id, UpdateTask {
+                name: args.name,
+                command: args.command,
+                cron: args.cron,
+                task_type: args.task_type,
+                enabled: args.enabled,
+                env: args.env,
+                pre_command: args.pre_command,
+                post_command: args.post_command,
+                group_id: args.group_id,
+                working_dir: args.working_dir,
+                notification: None,
+                timeout: args.timeout.map(|value| value.max(0)),
+            }).await.map_err(|e| e.to_string())?.ok_or_else(|| "任务不存在".to_string())?;
+            state.scheduler.update_task_in_scheduler(args.id).await.map_err(|e| e.to_string())?;
+            Ok(json!({ "task": task_summary(&task) }))
+        }
+        "delete_task" => {
+            let args: IdToolArgs = parse_tool_args(arguments)?;
+            let deleted = state.task_service.delete(args.id).await.map_err(|e| e.to_string())?;
+            if !deleted { return Err("任务不存在".to_string()); }
+            state.scheduler.remove_task_from_scheduler(args.id).await.map_err(|e| e.to_string())?;
+            Ok(json!({ "deleted": true, "id": args.id }))
+        }
+        "list_logs" => {
+            let task_id = arguments.get("task_id").and_then(Value::as_i64);
+            let page = arguments.get("page").and_then(Value::as_i64).unwrap_or(1).max(1);
+            let page_size = arguments.get("page_size").and_then(Value::as_i64).unwrap_or(10).clamp(1, 100);
+            let logs = state.log_service.list(task_id, page, page_size).await.map_err(|e| e.to_string())?;
+            serde_json::to_value(logs).map_err(|e| e.to_string())
+        }
+        "get_log" => {
+            let args: IdToolArgs = parse_tool_args(arguments)?;
+            let log = state.log_service.get(args.id).await.map_err(|e| e.to_string())?.ok_or_else(|| "日志不存在".to_string())?;
+            serde_json::to_value(log).map_err(|e| e.to_string())
+        }
+        "list_env_vars" => {
+            let search = arguments.get("search").and_then(Value::as_str);
+            let vars = state.env_service.list_with_search(search).await.map_err(|e| e.to_string())?;
+            Ok(json!({ "variables": vars.iter().map(env_summary).collect::<Vec<_>>() }))
+        }
+        "create_env_var" => {
+            let args: EnvToolArgs = parse_tool_args(arguments)?;
+            let key = args.key.ok_or_else(|| "缺少环境变量 key".to_string())?;
+            let value = args.value.ok_or_else(|| "缺少环境变量 value".to_string())?;
+            let env = state.env_service.create(CreateEnvVar { key, value, remark: args.remark, enabled: args.enabled }).await.map_err(|e| e.to_string())?;
+            Ok(json!({ "created": true, "variable": env_summary(&env) }))
+        }
+        "update_env_var" => {
+            let args: EnvToolArgs = parse_tool_args(arguments)?;
+            let id = args.id.ok_or_else(|| "缺少环境变量 id".to_string())?;
+            let env = state.env_service.update(id, UpdateEnvVar { key: args.key, value: args.value, remark: args.remark, enabled: args.enabled }).await.map_err(|e| e.to_string())?.ok_or_else(|| "环境变量不存在".to_string())?;
+            Ok(json!({ "updated": true, "variable": env_summary(&env) }))
+        }
+        "delete_env_var" => {
+            let args: IdToolArgs = parse_tool_args(arguments)?;
+            let deleted = state.env_service.delete(args.id).await.map_err(|e| e.to_string())?;
+            if !deleted { return Err("环境变量不存在".to_string()); }
+            Ok(json!({ "deleted": true, "id": args.id }))
+        }
+        "web_search" => {
+            let query = argument_string(arguments, "query")?;
+            let limit = arguments.get("limit").and_then(Value::as_u64).unwrap_or(5) as usize;
+            web_search(&query, limit).await
         }
         "run_script" if allow_commands => {
             let path = argument_string(arguments, "path")?;
@@ -1070,9 +1429,9 @@ async fn run_agent_job(state: Arc<AppState>, request: AiChatRequest, job: Arc<Ai
         }
     };
     let system = format!(
-        "你是 Zhuque 的脚本工作区 Agent。你可以浏览目录、读取文件、搜索代码{}。先使用工具获取必要上下文，不要猜测文件内容。当用户要求修改时，最后必须只返回合法 JSON，不要 Markdown 或额外文字。JSON 格式：{{\"summary\":\"简短说明\",\"files\":[{{\"path\":\"工作区相对路径\",\"operation\":\"update|create|delete\",\"content\":\"文件完整内容\"}}]}}。修改多个文件时全部放入 files。所有路径必须是工作区相对路径。附加目录存在时，所有工具路径都必须限制在该目录内；工具 path 为空表示附加目录根目录，禁止回到工作区根目录。{}",
+        "你是 Zhuque 的工作区 Agent。你可以浏览脚本目录、读取文件、搜索代码，管理定时任务和环境变量，查看执行日志，并联网搜索公开网页{}。先使用工具获取必要上下文，不要猜测文件内容。当用户要求修改时，最后必须只返回合法 JSON，不要 Markdown 或额外文字。JSON 格式：{{\"summary\":\"简短说明\",\"files\":[{{\"path\":\"工作区相对路径\",\"operation\":\"update|create|delete\",\"content\":\"文件完整内容\"}}]}}。修改多个文件时全部放入 files。所有路径必须是工作区相对路径。附加目录存在时，所有工具路径都必须限制在该目录内；工具 path 为空表示附加目录根目录，禁止回到工作区根目录。{}",
         if request.allow_commands { "，并可执行脚本和命令" } else { "" },
-        if request.allow_commands { "执行命令前确认命令不会破坏用户文件。" } else { "当前未授权执行命令或脚本。" },
+        if request.allow_commands { "执行命令前确认命令不会破坏用户文件；创建、编辑或删除任务/环境变量前确认用户已经明确授权。" } else { "当前未授权执行命令、脚本或写入型管理操作。" },
     );
     let context = format!(
         "模式: {}\n当前文件名: {}\n当前路径: {}\n当前附加目录: {}\n当前文件内容:\n{}\n\n最近执行输出:\n{}\n\n用户请求:\n{}",
@@ -1172,7 +1531,7 @@ async fn run_agent_job(state: Arc<AppState>, request: AiChatRequest, job: Arc<Ai
             };
             publish_job(
                 &job,
-                json!({"type":"tool_call","tool":name,"arguments":arguments}),
+                json!({"type":"tool_call","tool":name,"arguments":redact_tool_arguments(name, &arguments)}),
             )
             .await;
             let result = execute_agent_tool(
@@ -1387,9 +1746,9 @@ pub async fn agent(
 
     let stream = async_stream::stream! {
         let system = format!(
-            "你是 Zhuque 的脚本工作区 Agent。你可以浏览目录、读取文件、搜索代码{}。先使用工具获取必要上下文，不要猜测文件内容。当用户要求修改时，最后必须只返回合法 JSON，不要 Markdown 或额外文字。JSON 格式：{{\"summary\":\"简短说明\",\"files\":[{{\"path\":\"工作区相对路径\",\"operation\":\"update|create|delete\",\"content\":\"文件完整内容\"}}]}}。修改多个文件时全部放入 files。所有路径必须是工作区相对路径。附加目录存在时，所有工具路径都必须限制在该目录内；工具 path 为空表示附加目录根目录，禁止回到工作区根目录。{}",
+            "你是 Zhuque 的工作区 Agent。你可以浏览脚本目录、读取文件、搜索代码，管理定时任务和环境变量，查看执行日志，并联网搜索公开网页{}。先使用工具获取必要上下文，不要猜测文件内容。当用户要求修改时，最后必须只返回合法 JSON，不要 Markdown 或额外文字。JSON 格式：{{\"summary\":\"简短说明\",\"files\":[{{\"path\":\"工作区相对路径\",\"operation\":\"update|create|delete\",\"content\":\"文件完整内容\"}}]}}。修改多个文件时全部放入 files。所有路径必须是工作区相对路径。附加目录存在时，所有工具路径都必须限制在该目录内；工具 path 为空表示附加目录根目录，禁止回到工作区根目录。{}",
             if request.allow_commands { "，并可执行脚本和命令" } else { "" },
-            if request.allow_commands { "执行命令前确认命令不会破坏用户文件。" } else { "当前未授权执行命令或脚本。" },
+            if request.allow_commands { "执行命令前确认命令不会破坏用户文件；创建、编辑或删除任务/环境变量前确认用户已经明确授权。" } else { "当前未授权执行命令、脚本或写入型管理操作。" },
         );
         let context = format!(
             "模式: {}\n当前文件名: {}\n当前路径: {}\n当前附加目录: {}\n当前文件内容:\n{}\n\n最近执行输出:\n{}\n\n用户请求:\n{}",
@@ -1460,7 +1819,7 @@ pub async fn agent(
                 yield Ok(Event::default().event("agent").data(json!({
                     "type": "tool_call",
                     "tool": name,
-                    "arguments": arguments,
+                    "arguments": redact_tool_arguments(name, &arguments),
                 }).to_string()));
 
                 let result = execute_agent_tool(&state, name, &arguments, request.allow_commands, request.directory_path.as_deref(), None).await;
