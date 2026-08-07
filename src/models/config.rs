@@ -77,7 +77,6 @@ fn default_ai_compression_ratio() -> u8 {
 impl AiConfig {
     pub fn normalized(&self) -> Self {
         let mut value = self.clone();
-        value.context_window_tokens = value.context_window_tokens.clamp(8_192, 131_072);
         value.compression_ratio = value.compression_ratio.clamp(10, 95);
         value
     }

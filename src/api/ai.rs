@@ -89,8 +89,6 @@ impl From<AiConfig> for AiConfigResponse {
     }
 }
 
-const DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 131_072;
-const MIN_CONTEXT_WINDOW_TOKENS: usize = 8_192;
 const COMPRESSED_CONTEXT_TARGET_PERCENT: usize = 60;
 const AI_REQUEST_MAX_ATTEMPTS: usize = 3;
 
@@ -290,8 +288,7 @@ fn trim_to_tokens(text: &str, max_tokens: usize) -> String {
 }
 
 fn context_limit(config: &AiConfig) -> usize {
-    (config.context_window_tokens as usize)
-        .clamp(MIN_CONTEXT_WINDOW_TOKENS, DEFAULT_CONTEXT_WINDOW_TOKENS)
+    config.context_window_tokens as usize
 }
 
 fn compression_trigger(config: &AiConfig) -> usize {

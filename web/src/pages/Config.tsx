@@ -724,9 +724,8 @@ const Config: React.FC = () => {
                   label="最大上下文长度（Token）"
                   field="context_window_tokens"
                   rules={[{ required: true, message: '请输入最大上下文长度' }]}
-                  extra="取值 8192–131072，默认 131072（128K）。"
                 >
-                  <InputNumber min={8192} max={131072} step={1024} style={{ width: '100%' }} />
+                  <InputNumber step={1024} style={{ width: '100%' }} />
                 </FormItem>
                 <FormItem
                   label="自动压缩触发比例（%）"
@@ -998,7 +997,7 @@ const Config: React.FC = () => {
                     <Row gutter={[16, 16]}>
                       <Col xs={24} sm={12} md={12} lg={8} xl={6}>
                         <div>
-                          <Text bold>版本:</Text> <Text>朱雀 v1.3.4</Text>
+                          <Text bold>版本:</Text> <Text>朱雀 v1.4.0</Text>
                         </div>
                       </Col>
                       <Col xs={24} sm={12} md={12} lg={8} xl={6}>
