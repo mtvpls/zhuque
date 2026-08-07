@@ -41,6 +41,10 @@ pub struct AiChatRequest {
     pub history: Vec<AiHistoryMessage>,
     #[serde(default)]
     pub allow_commands: bool,
+    #[serde(default)]
+    pub allow_changes: bool,
+    #[serde(default)]
+    pub retry: bool,
     pub session_id: Option<String>,
     #[serde(default)]
     pub force_compress: bool,
@@ -241,6 +245,13 @@ fn provider_usage(value: &Value) -> Option<ProviderUsage> {
 
 fn provider_context_tokens(usage: Option<ProviderUsage>) -> Option<usize> {
     usage.and_then(|value| value.prompt_tokens)
+}
+
+fn provider_context_tokens_without_prompt(
+    usage: Option<ProviderUsage>,
+    prompt: &str,
+) -> Option<usize> {
+    provider_context_tokens(usage).map(|tokens| tokens.saturating_sub(estimate_tokens(prompt)))
 }
 
 fn provider_cache_tokens(usage: Option<ProviderUsage>) -> Option<(usize, usize)> {
@@ -512,24 +523,8 @@ async fn compress_json_messages(
     })
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct AgentFileChange {
-    path: String,
-    operation: String,
-    #[serde(default)]
-    content: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct AgentResult {
-    #[serde(default)]
-    summary: String,
-    #[serde(default)]
-    files: Vec<AgentFileChange>,
-}
-
 fn agent_system_prompt() -> &'static str {
-    r#"你是 Zhuque 的工作区 Agent。你可以浏览脚本目录、读取文件、搜索代码，管理定时任务、环境变量和依赖，查看执行日志，联网搜索公开网页，并在获得权限后执行脚本和命令。需要 Python、Node.js 或 Linux 依赖时，必须使用依赖管理工具安装，不得直接通过 shell、pip、npm、apt 等命令安装。先使用工具获取必要上下文，不要猜测文件内容。用户要求修改文件时，最后只返回合法 JSON，不要 Markdown 或额外文字。JSON 格式：{"summary":"简短说明","files":[{"path":"工作区相对路径","operation":"update|create|delete","content":"文件完整内容"}]}。修改多个文件时全部放入 files。所有路径必须是工作区相对路径。附加目录存在时，所有工具路径必须限制在该目录内；工具 path 为空表示附加目录根目录，禁止回到工作区根目录。运行权限、模式、当前文件和本轮用户请求会放在最后一条 user 消息中。保持本系统提示词不变，优先利用稳定前缀缓存。"#
+    r#"你是 Zhuque 的工作区 Agent。你可以浏览脚本目录、读取文件、搜索代码，管理定时任务、环境变量和依赖，查看执行日志，联网搜索公开网页，可以直接调用对应工具执行脚本和命令，直接调用对应工具。需要 Python、Node.js 或 Linux 依赖时，必须使用依赖管理工具安装，不得直接通过 shell、pip、npm、apt 等命令安装。脚本执行期间可通过内置 helper 主动发送通知到已配置的通知渠道：Shell 使用 `notify "标题" "内容"`；Python 使用 `from notify import send` 后调用 `send("标题", "内容")`；Node.js 使用 `const { sendNotify } = require('sendNotify')` 后调用 `sendNotify('标题', '内容')`；TypeScript（Bun）使用 `import { sendNotify } from 'sendNotify'` 后调用 `sendNotify('标题', '内容')`。需要主动通知时优先使用对应脚本语言的 helper，不要安装额外通知依赖；标题和内容均必填。先使用工具获取必要上下文，不要猜测文件内容。用户要求修改文件时，优先使用 `edit_file` 做精确字符串替换以节省输出 token；只有新建文件或无法精确替换时才使用 `write_file`，删除文件使用 `delete_file`。必须调用这些工具，不能通过 Markdown、JSON 或最终回复伪造文件修改，也不要输出文件完整内容作为修改提案。修改完成后用简短文字说明结果。所有路径必须是工作区相对路径。附加目录存在时，所有工具路径必须限制在该目录内；工具 path 为空表示附加目录根目录，禁止回到工作区根目录。运行权限、模式、当前文件和本轮用户请求会放在最后一条 user 消息中。保持本系统提示词不变，优先利用稳定前缀缓存。"#
 }
 
 fn agent_tools() -> Value {
@@ -549,10 +544,14 @@ fn agent_tools() -> Value {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "读取脚本工作区内一个文本文件。",
+                "description": "读取脚本工作区内一个文本文件。可选 start_line/end_line 按 1 开始的行号读取区间；省略时读取完整文件。",
                 "parameters": {
                     "type": "object",
-                    "properties": { "path": { "type": "string" } },
+                    "properties": {
+                        "path": { "type": "string" },
+                        "start_line": { "type": "integer", "minimum": 1 },
+                        "end_line": { "type": "integer", "minimum": 1 }
+                    },
                     "required": ["path"]
                 }
             }
@@ -700,18 +699,59 @@ fn agent_tools() -> Value {
         }),
     ];
 
-        tools.push(json!({
-            "type": "function",
-            "function": {
-                "name": "run_script",
-                "description": "执行工作区内的一个脚本并返回输出。",
-                "parameters": {
-                    "type": "object",
-                    "properties": { "path": { "type": "string" } },
-                    "required": ["path"]
-                }
+    tools.push(json!({
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "写入工作区内一个文本文件。用户明确要求修改或创建文件时使用；content 必须是完整文件内容。",
+            "parameters": {
+                "type": "object",
+                "properties": { "path": { "type": "string" }, "content": { "type": "string" } },
+                "required": ["path", "content"]
             }
-        }));
+        }
+    }));
+    tools.push(json!({
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "编辑工作区内文本文件：将 old_string 替换为 new_string。默认替换全部匹配；仅在用户明确要求修改时调用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "old_string": { "type": "string" },
+                    "new_string": { "type": "string" },
+                    "replace_all": { "type": "boolean" }
+                },
+                "required": ["path", "old_string", "new_string"]
+            }
+        }
+    }));
+    tools.push(json!({
+        "type": "function",
+        "function": {
+            "name": "delete_file",
+            "description": "删除工作区内一个文件。仅在用户明确要求删除时使用。",
+            "parameters": {
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"]
+            }
+        }
+    }));
+    tools.push(json!({
+        "type": "function",
+        "function": {
+            "name": "run_script",
+            "description": "执行工作区内的一个脚本并返回输出。",
+            "parameters": {
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"]
+            }
+        }
+    }));
         tools.push(json!({
             "type": "function",
             "function": {
@@ -1016,18 +1056,34 @@ async fn execute_agent_tool(
     name: &str,
     arguments: &Value,
     allow_commands: bool,
+    allow_changes: bool,
     attached_directory: Option<&str>,
     cancel: Option<&CancellationToken>,
 ) -> Result<Value, String> {
+    if !allow_changes && matches!(name, "write_file" | "edit_file" | "delete_file") {
+        return Err("操作未执行：系统拦截".to_string());
+    }
+
     if !allow_commands && matches!(
         name,
         "create_task" | "update_task" | "delete_task"
             | "create_env_var" | "update_env_var" | "delete_env_var"
     ) {
-        return Err("该操作需要用户先授权写入权限".to_string());
+        return Err("操作未执行：系统拦截".to_string());
     }
 
     match name {
+        "write_file" => {
+            let path = scope_agent_path(attached_directory, &argument_string(arguments, "path")?);
+            let content = argument_string(arguments, "content")?;
+            state.script_service.write(&path, &content).await.map_err(|e| e.to_string())?;
+            Ok(json!({ "written": true, "path": path, "bytes": content.len() }))
+        }
+        "delete_file" => {
+            let path = scope_agent_path(attached_directory, &argument_string(arguments, "path")?);
+            state.script_service.delete(&path).await.map_err(|e| e.to_string())?;
+            Ok(json!({ "deleted": true, "path": path }))
+        }
         "list_dir" => {
             let path = arguments.get("path").and_then(Value::as_str).unwrap_or("");
             let path = scope_agent_path(attached_directory, path);
@@ -1046,11 +1102,52 @@ async fn execute_agent_tool(
                 .read(&path)
                 .await
                 .map_err(|e| e.to_string())?;
+            let all_lines: Vec<&str> = content.lines().collect();
+            let start_line = arguments.get("start_line").and_then(Value::as_u64).unwrap_or(1) as usize;
+            let end_line = arguments
+                .get("end_line")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize)
+                .unwrap_or(all_lines.len().max(1));
+            if start_line == 0 || end_line < start_line {
+                return Err("读取行区间无效：start_line 必须不大于 end_line，且从 1 开始".to_string());
+            }
+            let selected = if arguments.get("start_line").is_some() || arguments.get("end_line").is_some() {
+                all_lines
+                    .get(start_line.saturating_sub(1)..end_line.min(all_lines.len()))
+                    .unwrap_or(&[])
+                    .join("\n")
+            } else {
+                content.chars().take(160000).collect::<String>()
+            };
             Ok(json!({
                 "path": path,
-                "content": content.chars().take(160000).collect::<String>(),
-                "truncated": content.chars().count() > 160000,
+                "start_line": if arguments.get("start_line").is_some() || arguments.get("end_line").is_some() { start_line } else { 1 },
+                "end_line": if arguments.get("start_line").is_some() || arguments.get("end_line").is_some() { end_line.min(all_lines.len()) } else { all_lines.len() },
+                "content": selected,
+                "truncated": if arguments.get("start_line").is_some() || arguments.get("end_line").is_some() { end_line > all_lines.len() } else { content.chars().count() > 160000 },
             }))
+        }
+        "edit_file" => {
+            let path = scope_agent_path(attached_directory, &argument_string(arguments, "path")?);
+            let old_string = argument_string(arguments, "old_string")?;
+            let new_string = argument_string(arguments, "new_string")?;
+            if old_string.is_empty() {
+                return Err("old_string 不能为空".to_string());
+            }
+            let content = state.script_service.read(&path).await.map_err(|e| e.to_string())?;
+            let replace_all = arguments.get("replace_all").and_then(Value::as_bool).unwrap_or(true);
+            let occurrences = content.matches(&old_string).count();
+            if occurrences == 0 {
+                return Err("未找到要替换的文本，请先使用 read_file 获取准确内容".to_string());
+            }
+            let updated = if replace_all {
+                content.replace(&old_string, &new_string)
+            } else {
+                content.replacen(&old_string, &new_string, 1)
+            };
+            state.script_service.write(&path, &updated).await.map_err(|e| e.to_string())?;
+            Ok(json!({ "edited": true, "path": path, "replacements": if replace_all { occurrences } else { 1 } }))
         }
         "search_files" => {
             let query = argument_string(arguments, "query")?;
@@ -1193,7 +1290,7 @@ async fn execute_agent_tool(
             )
             .await
         }
-        "run_script" | "run_command" => Err("用户未允许执行命令或脚本".to_string()),
+        "run_script" | "run_command" => Err("操作未执行：系统拦截".to_string()),
         _ => Err(format!("未知工具: {name}")),
     }
 }
@@ -1237,16 +1334,18 @@ async fn publish_job(job: &Arc<AiJob>, payload: Value) {
 }
 
 async fn run_agent_job(state: Arc<AppState>, request: AiChatRequest, job: Arc<AiJob>) {
-    if let Some(title) = store_session_message(
-        &state,
-        request.session_id.as_deref(),
-        &job.user_key,
-        "user",
-        &request.prompt,
-    )
-    .await
-    {
-        publish_job(&job, json!({"type":"session_title","title":title})).await;
+    if !request.retry {
+        if let Some(title) = store_session_message(
+            &state,
+            request.session_id.as_deref(),
+            &job.user_key,
+            "user",
+            &request.prompt,
+        )
+        .await
+        {
+            publish_job(&job, json!({"type":"session_title","title":title})).await;
+        }
     }
     let config = match state.config_service.get_ai_config().await {
         Ok(config)
@@ -1286,8 +1385,7 @@ async fn run_agent_job(state: Arc<AppState>, request: AiChatRequest, job: Arc<Ai
     };
     let system = agent_system_prompt();
     let stable_context = format!(
-        "运行权限: {}\n模式: {}\n当前文件名: {}\n当前路径: {}\n当前附加目录: {}\n当前文件内容:\n{}\n\n最近执行输出:\n{}",
-        if request.allow_commands { "已授权执行脚本和命令；写入型管理操作仍须得到用户明确授权" } else { "未授权执行脚本、命令或写入型管理操作" },
+        "执行工具状态: 由系统处理\n模式: {}\n当前文件名: {}\n当前路径: {}\n当前附加目录: {}\n当前文件内容:\n{}\n\n最近执行输出:\n{}",
         request.mode,
         request.file_name.as_deref().unwrap_or("未选择文件"),
         request.file_path.as_deref().unwrap_or(""),
@@ -1297,7 +1395,11 @@ async fn run_agent_job(state: Arc<AppState>, request: AiChatRequest, job: Arc<Ai
     );
     let mut messages = vec![json!({"role":"system","content":system})];
     let history_start = request.history.len().saturating_sub(40);
-    for item in request.history.iter().skip(history_start) {
+    let retry_user_index = request.retry.then(|| {
+        request.history.iter().rposition(|item| item.role == "user" && item.content.trim() == request.prompt.trim())
+    }).flatten();
+    for (history_index, item) in request.history.iter().enumerate().skip(history_start) {
+        if Some(history_index) == retry_user_index { continue; }
         if item.content.trim().is_empty() && item.metadata.is_none() { continue; }
         if !matches!(item.role.as_str(), "user" | "assistant" | "tool") { continue; }
         let metadata = item.metadata.as_deref().and_then(|raw| serde_json::from_str::<Value>(raw).ok());
@@ -1318,8 +1420,7 @@ async fn run_agent_job(state: Arc<AppState>, request: AiChatRequest, job: Arc<Ai
         "metadata": {"runtime_context": true},
     }));
     let tools = agent_tools();
-    let mut final_content = String::new();
-    loop {
+    'agent_loop: loop {
         if let Err(error) = compress_json_messages(
             &client,
             &endpoint,
@@ -1361,7 +1462,7 @@ async fn run_agent_job(state: Arc<AppState>, request: AiChatRequest, job: Arc<Ai
             }
         };
         let provider_usage = response.usage;
-        if let Some(tokens) = provider_context_tokens(provider_usage) {
+        if let Some(tokens) = provider_context_tokens_without_prompt(provider_usage, &request.prompt) {
             set_session_context_tokens(
                 &state,
                 request.session_id.as_deref(),
@@ -1393,11 +1494,6 @@ async fn run_agent_job(state: Arc<AppState>, request: AiChatRequest, job: Arc<Ai
             .unwrap_or_default();
         messages.push(response.clone());
         if tool_calls.is_empty() {
-            final_content = response
-                .get("content")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
             break;
         }
         for call in tool_calls {
@@ -1424,6 +1520,7 @@ async fn run_agent_job(state: Arc<AppState>, request: AiChatRequest, job: Arc<Ai
                 name,
                 &arguments,
                 request.allow_commands,
+                request.allow_changes,
                 request.directory_path.as_deref(),
                 Some(&job.cancel),
             )
@@ -1434,14 +1531,10 @@ async fn run_agent_job(state: Arc<AppState>, request: AiChatRequest, job: Arc<Ai
             };
             publish_job(&job, json!({"type":"tool_result","tool":name,"success":success,"result":content.chars().take(6000).collect::<String>()})).await;
             messages.push(json!({"role":"tool","tool_call_id":call_id,"content":content}));
+            if !success && content.contains("系统拦截") {
+                break 'agent_loop;
+            }
         }
-    }
-    if let Some(result) = parse_agent_result(&final_content) {
-        publish_job(
-            &job,
-            json!({"type":"changes","summary":result.summary,"files":result.files}),
-        )
-        .await;
     }
     let _ = store_agent_protocol_messages(
         &state,
@@ -1581,27 +1674,6 @@ async fn handle_agent_ws(
     }
 }
 
-fn parse_agent_result(content: &str) -> Option<AgentResult> {
-    let trimmed = content.trim();
-    let candidate = if let Some(start) = trimmed.find("```") {
-        let after_start = &trimmed[start + 3..];
-        let body = after_start
-            .strip_prefix("json")
-            .or_else(|| after_start.strip_prefix("JSON"))
-            .unwrap_or(after_start);
-        body.split("```").next().unwrap_or(body).trim().to_string()
-    } else if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
-        if start <= end {
-            trimmed[start..=end].to_string()
-        } else {
-            trimmed.to_string()
-        }
-    } else {
-        trimmed.to_string()
-    };
-    serde_json::from_str(&candidate).ok()
-}
-
 pub async fn agent(
     State(state): State<Arc<AppState>>,
     Json(request): Json<AiChatRequest>,
@@ -1633,9 +1705,8 @@ pub async fn agent(
     let stream = async_stream::stream! {
         let system = agent_system_prompt();
         let stable_context = format!(
-            "运行权限: {}\n模式: {}\n当前文件名: {}\n当前路径: {}\n当前附加目录: {}\n当前文件内容:\n{}\n\n最近执行输出:\n{}",
-            if request.allow_commands { "已授权执行脚本和命令；写入型管理操作仍须得到用户明确授权" } else { "未授权执行脚本、命令或写入型管理操作" },
-            request.mode,
+            "执行工具状态: 由系统处理\n模式: {}\n当前文件名: {}\n当前路径: {}\n当前附加目录: {}\n当前文件内容:\n{}\n\n最近执行输出:\n{}",
+                    request.mode,
             request.file_name.as_deref().unwrap_or("未选择文件"),
             request.file_path.as_deref().unwrap_or(""),
             request.directory_path.as_deref().unwrap_or("未附加目录"),
@@ -1660,9 +1731,8 @@ pub async fn agent(
         }
         messages.push(json!({"role": "user", "content": request.prompt}));
         let tools = agent_tools();
-        let mut final_content = String::new();
 
-        loop {
+        'agent_stream_loop: loop {
             let response = match call_agent_provider(
                 &client,
                 &endpoint,
@@ -1683,7 +1753,7 @@ pub async fn agent(
                 yield Ok(Event::default().event("agent").data(json!({"type":"text","content":chunk}).to_string()));
             }
             let provider_usage = response.usage;
-            if let Some(tokens) = provider_context_tokens(provider_usage) {
+            if let Some(tokens) = provider_context_tokens_without_prompt(provider_usage, &request.prompt) {
                 yield Ok(Event::default().event("agent").data(json!({
                     "type": "context_usage",
                     "tokens": tokens,
@@ -1702,7 +1772,6 @@ pub async fn agent(
             let tool_calls = response.get("tool_calls").and_then(Value::as_array).cloned().unwrap_or_default();
             messages.push(response.clone());
             if tool_calls.is_empty() {
-                final_content = response.get("content").and_then(Value::as_str).unwrap_or("").to_string();
                 break;
             }
 
@@ -1723,7 +1792,7 @@ pub async fn agent(
                     "arguments": redact_tool_arguments(name, &arguments),
                 }).to_string()));
 
-                let result = execute_agent_tool(&state, name, &arguments, request.allow_commands, request.directory_path.as_deref(), None).await;
+                let result = execute_agent_tool(&state, name, &arguments, request.allow_commands, request.allow_changes, request.directory_path.as_deref(), None).await;
                 let (content, success) = match result {
                     Ok(value) => (value.to_string(), true),
                     Err(error) => (json!({"error": error}).to_string(), false),
@@ -1739,21 +1808,12 @@ pub async fn agent(
                     "tool_call_id": call_id,
                     "content": content,
                 }));
+                if !success && content.contains("系统拦截") {
+                    break 'agent_stream_loop;
+                }
             }
         }
 
-        if let Some(result) = parse_agent_result(&final_content) {
-            yield Ok(Event::default().event("agent").data(json!({
-                "type": "changes",
-                "summary": result.summary,
-                "files": result.files,
-            }).to_string()));
-        } else {
-            yield Ok(Event::default().event("agent").data(json!({
-                "type": "text",
-                "content": final_content,
-            }).to_string()));
-        }
         yield Ok(Event::default().event("agent").data(json!({"type":"done"}).to_string()));
     };
 

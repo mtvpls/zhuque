@@ -33,6 +33,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
 type PermissionMode = 'ask' | 'session';
+type PermissionApproval = 'command' | 'change';
 type EventTone = 'neutral' | 'success' | 'warning' | 'error';
 
 interface AgentEvent {
@@ -234,7 +235,9 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
             const metadata = message.metadata ? JSON.parse(message.metadata) as { name?: string } : {};
             toolName = metadata.name || toolName;
           } catch { }
+          if (!message.content.includes('系统拦截')) {
           restoredFeed.push({ kind: 'event', event: { id: restoredFeed.length + 1, label: `工具完成 · ${toolName}`, detail: message.content.slice(0, 1600), tone: 'success' } });
+          }
         }
       }
       setConversation(storedMessages);
@@ -269,10 +272,9 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
 
   const currentContextTokens = useMemo(() => estimateContextTokens([
     ...conversation.map((message) => message.content),
-    prompt,
     contextEnabled ? fileContent : undefined,
     contextEnabled ? executionOutput : undefined,
-  ]), [conversation, prompt, contextEnabled, fileContent, executionOutput]);
+  ]), [conversation, contextEnabled, fileContent, executionOutput]);
 
   const hasDiff = Boolean(draftChanges && draftChanges.length > 0);
   const currentChange = draftChanges?.find((change) => change.path === filePath);
@@ -302,10 +304,6 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
     ]);
   };
 
-  const looksLikeCommandRequest = (request: string) => {
-    if (/(list_tasks|list_logs|get_log|list_env_vars|web_search|list_dir|read_file|search_code)/i.test(request)) return false;
-    return /(执行|运行|命令|测试|编译|构建|安装依赖|启动|调试|创建.*任务|新增.*任务|编辑.*任务|修改.*任务|删除.*任务|创建.*环境变量|新增.*环境变量|编辑.*环境变量|修改.*环境变量|删除.*环境变量|shell|终端|lint|test|build|install|run|compile|ping|curl|wget|npm|pnpm|yarn|cargo|python|node|bash|powershell|cmd)/i.test(request);
-  };
 
   const getPendingCommand = (request: string) => {
     const quoted = request.match(/`([^`]+)`/);
@@ -390,6 +388,12 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
           assistantSegmentRef.current = null;
           toolInteractionRef.current = true;
           const result = typeof payload.result === 'string' ? payload.result : '';
+          if (type === 'tool_result' && payload.success === false && (tool === 'write_file' || tool === 'edit_file' || tool === 'delete_file' || result.includes('系统拦截'))) {
+            const approval: PermissionApproval = tool === 'write_file' || tool === 'edit_file' || tool === 'delete_file' ? 'change' : 'command';
+            setPendingRequest(activeRequestRef.current);
+            setPendingPermission(approval);
+            return;
+          }
           setFeedItems((previous) => [
             ...previous,
             {
@@ -425,17 +429,6 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
               return [...previous, { kind: 'message', segmentId, message: { role: 'assistant', content: chunk } }];
             });
           }
-        } else if (type === 'changes') {
-          assistantSegmentRef.current = null;
-          const changes = (Array.isArray(payload.files) ? payload.files : []).filter((change): change is AgentFileChange => {
-            const item = change as AgentFileChange;
-            return Boolean(item && typeof item.path === 'string' &&
-              (item.operation === 'update' || item.operation === 'create' || item.operation === 'delete') &&
-              (item.operation === 'delete' || typeof item.content === 'string'));
-          });
-          setDraftChanges(changes);
-          assistantTextRef.current = String(payload.summary || '已生成多文件修改提案，请检查 Diff。');
-          addEvent('生成多文件修改提案', changes.length + ' 个文件等待应用', 'warning');
         } else if (type === 'cancelled') {
           addEvent('任务已取消', String(payload.message || '当前任务已停止'), 'warning');
         } else if (type === 'conversation_sync') {
@@ -501,22 +494,16 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
     return socket;
   };
 
-  const handleSubmit = (approvedCommand = false) => {
-    const request = (approvedCommand ? pendingRequest : prompt).trim();
+  const handleSubmit = (approval?: PermissionApproval) => {
+    const approved = Boolean(approval);
+    const request = (approved ? pendingRequest : prompt).trim();
     if (!request || running) return;
-    if (!approvedCommand && /^\/(compress|compact)$/i.test(request)) {
+    if (!approved && /^\/(compress|compact)$/i.test(request)) {
       setPrompt('');
       setCommandSuggestionsVisible(false);
       void compressSession();
       return;
     }
-    if (!approvedCommand && permissionMode !== 'session' && looksLikeCommandRequest(request)) {
-      setPendingRequest(request);
-      setPendingPermission('command');
-      setFeedItems((previous) => [...previous, { kind: 'message', message: { role: 'user', content: request } }]);
-      return;
-    }
-
     setPendingPermission(null);
     setPendingRequest('');
     setRunning(true);
@@ -529,7 +516,7 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
     lastSequenceRef.current = 0;
     activeRequestRef.current = request;
     assistantTextRef.current = '';
-    if (!approvedCommand) {
+    if (!approved) {
       setFeedItems((previous) => [...previous, { kind: 'message', message: { role: 'user', content: request } }]);
     }
     connectJob(undefined, {
@@ -541,7 +528,9 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
       execution_output: contextEnabled ? executionOutput : undefined,
       directory_path: aiDirectoryPath,
       history: conversation,
-      allow_commands: approvedCommand || permissionMode === 'session',
+      allow_commands: approval === 'command' || permissionMode === 'session',
+      allow_changes: approval === 'change' || permissionMode === 'session',
+      retry: approved,
       session_id: sessionId,
     });
   };
@@ -742,7 +731,7 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
 
   if (!visible) return null;
 
-  return createPortal(
+  const workspace = (
     <aside
       className="script-ai-workspace"
       aria-label="AI 脚本工作台"
@@ -952,12 +941,15 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
           </div>
         )}
 
-        {pendingPermission === 'command' && (
+        {pendingPermission && (
           <div className="script-ai-permission">
-            <div><strong>该请求需要写入或执行权限</strong><code>{getPendingCommand(pendingRequest)}</code></div>
+            <div>
+              <strong>{pendingPermission === 'change' ? '该操作需要文件写入权限' : '该操作需要命令执行权限'}</strong>
+              <code>{pendingPermission === 'command' ? getPendingCommand(pendingRequest) : pendingRequest}</code>
+            </div>
             <Space>
-              <Button size="small" type="primary" onClick={() => handleSubmit(true)}>允许</Button>
-              <Button size="small" onClick={() => { setPermissionMode('session'); void handleSubmit(true); }}>本会话允许</Button>
+              <Button size="small" type="primary" onClick={() => handleSubmit(pendingPermission)}>允许</Button>
+              <Button size="small" onClick={() => { setPermissionMode('session'); void handleSubmit(pendingPermission); }}>本会话允许</Button>
               <Button size="small" onClick={() => { setPendingPermission(null); setPendingRequest(''); }}>拒绝</Button>
             </Space>
           </div>
@@ -1061,9 +1053,9 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
       </div>
         </>
       )}
-    </aside>,
-    document.body,
-  );
+    </aside>);
+
+  return isMobileViewport ? createPortal(workspace, document.body) : workspace;
 };
 
 export default ScriptAIWorkspace;
