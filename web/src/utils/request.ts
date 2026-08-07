@@ -1,6 +1,46 @@
 import axios from 'axios';
 import type { AxiosInstance, AxiosRequestConfig } from 'axios';
 
+let redirectingToLogin = false;
+
+export const redirectToLoginOnUnauthorized = () => {
+  const currentPath = window.location.pathname;
+
+  if (currentPath === '/login' || currentPath === '/setup' || redirectingToLogin) {
+    return;
+  }
+
+  redirectingToLogin = true;
+  localStorage.removeItem('token');
+  window.location.replace('/login');
+};
+
+export const installAuthErrorHandler = () => {
+  if (typeof window === 'undefined') {
+    return;
+  }
+
+  // Direct axios calls and fetch calls must use the same auth-expiration behavior.
+  axios.interceptors.response.use(
+    (response) => response,
+    (error) => {
+      if (error.response?.status === 401) {
+        redirectToLoginOnUnauthorized();
+      }
+      return Promise.reject(error);
+    },
+  );
+
+  const originalFetch = window.fetch.bind(window);
+  window.fetch = async (...args: Parameters<typeof window.fetch>) => {
+    const response = await originalFetch(...args);
+    if (response.status === 401) {
+      redirectToLoginOnUnauthorized();
+    }
+    return response;
+  };
+};
+
 // 创建自定义的 axios 实例类型，返回数据而不是完整响应
 interface CustomAxiosInstance extends Omit<AxiosInstance, 'get' | 'post' | 'put' | 'delete' | 'patch'> {
   get<T = any>(url: string, config?: AxiosRequestConfig): Promise<T>;
@@ -36,12 +76,7 @@ request.interceptors.response.use(
   },
   (error) => {
     if (error.response?.status === 401) {
-      // 只有不在登录页面和初始设置页面时才清除token并重定向
-      const currentPath = window.location.pathname;
-      if (currentPath !== '/login' && currentPath !== '/setup') {
-        localStorage.removeItem('token');
-        window.location.href = '/login';
-      }
+      redirectToLoginOnUnauthorized();
     }
     return Promise.reject(error);
   }
