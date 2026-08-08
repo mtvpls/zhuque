@@ -1122,7 +1122,7 @@ const Config: React.FC = () => {
                     <Row gutter={[16, 16]}>
                       <Col xs={24} sm={12} md={12} lg={8} xl={6}>
                         <div>
-                          <Text bold>版本:</Text> <Text>朱雀 v1.4.0</Text>
+                          <Text bold>版本:</Text> <Text>朱雀 v1.4.1</Text>
                         </div>
                       </Col>
                       <Col xs={24} sm={12} md={12} lg={8} xl={6}>
