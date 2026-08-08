@@ -250,3 +250,15 @@
 .script-ai-session-actions .arco-btn:hover {
   color: #f53f3f;
 }
+
+
+.script-ai-model-select {
+  max-width: 190px;
+  height: 28px;
+  padding: 0 24px 0 8px;
+  border: 1px solid var(--color-border-2, #e5e6eb);
+  border-radius: 4px;
+  background: var(--color-bg-2, #fff);
+  color: var(--color-text-1, #1d2129);
+  font-size: 12px;
+}

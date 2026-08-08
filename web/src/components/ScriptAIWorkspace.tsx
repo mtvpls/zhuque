@@ -71,11 +71,17 @@ interface ConversationMessage {
   metadata?: string | null;
 }
 
+interface AiModelOption {
+  provider: string;
+  model: string;
+}
+
 interface AiSession {
   id: string;
   title: string;
   active_job_id?: string | null;
   current_context_tokens?: number | null;
+  model?: string | null;
   updated_at: string;
 }
 
@@ -303,6 +309,18 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
   const [providerContextTokens, setProviderContextTokens] = useState<number | null>(null);
   const [cacheUsage, setCacheUsage] = useState<{ hit: number; miss: number } | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [modelOptions, setModelOptions] = useState<AiModelOption[]>([]);
+  const [selectedModel, setSelectedModel] = useState('');
+  const modelGroups = useMemo(() => {
+    const groups = new Map<string, string[]>();
+    for (const option of modelOptions) {
+      const provider = option.provider || '未命名服务商';
+      const models = groups.get(provider) || [];
+      if (!models.includes(option.model)) models.push(option.model);
+      groups.set(provider, models);
+    }
+    return Array.from(groups, ([provider, models]) => ({ provider, models }));
+  }, [modelOptions]);
   const [permissionMode, setPermissionMode] = useState<PermissionMode>('default');
   const [pendingPermission, setPendingPermission] = useState<'command' | 'change' | null>(null);
   const [pendingToolCallId, setPendingToolCallId] = useState<string | null>(null);
@@ -355,6 +373,14 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
   useEffect(() => {
     if (!visible) return;
     const headers = { Authorization: `Bearer ${localStorage.getItem('token') || ''}` };
+    void fetch('/api/ai/config', { headers }).then(async (response) => {
+      if (!response.ok) return;
+      const config = await response.json() as { providers?: Array<{ name: string; models?: string[] }> };
+      const options = (config.providers || []).flatMap((provider) => (provider.models || []).map((model) => ({ provider: provider.name, model })));
+      setModelOptions(options);
+      const remembered = localStorage.getItem('script-ai-last-model') || '';
+      setSelectedModel((current) => current || remembered || options[0]?.model || '');
+    }).catch(() => undefined);
     setLoadingSession(true);
     void (async () => {
       const response = await fetch('/api/ai/sessions', { headers });
@@ -380,6 +406,8 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
     }
     const session = sessions.find((item) => item.id === sessionId);
     setProviderContextTokens(session?.current_context_tokens ?? null);
+    if (session?.model) setSelectedModel(session.model);
+    else if (selectedModel) localStorage.setItem('script-ai-last-model', selectedModel);
   }, [sessionId, sessions]);
 
   useEffect(() => {
@@ -818,6 +846,7 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
       allow_commands: permissionMode === 'all',
       allow_changes: permissionMode === 'changes' || permissionMode === 'all',
       session_id: sessionId,
+      model: selectedModel,
     });
   };
 
@@ -1088,18 +1117,6 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
           </div>
         </div>
         <Space>
-          <Button
-            type="text"
-            size="small"
-            icon={<IconRefresh />}
-            onClick={() => {
-              setConversation([]);
-              setFeedItems([]);
-                        setDraftChanges(null);
-            }}
-            aria-label="清空对话"
-            title="清空对话"
-          />
           <Button
             type="text"
             size="small"
@@ -1395,13 +1412,32 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
         />
         <div className="script-ai-composer-footer">
           <span>
-            当前上下文：{providerContextTokens !== null
+            {providerContextTokens !== null
               ? `${formatTokenCount(providerContextTokens)} tokens${cacheUsage && !running ? `（${formatTokenCount(cacheUsage.hit)}）` : ''}`
               : running
                 ? '计算中...'
                 : `估算约 ${formatTokenCount(currentContextTokens)} tokens`}
           </span>
           <Space>
+            <select
+              className="script-ai-model-select"
+              value={selectedModel}
+              onChange={(event) => {
+                const value = event.target.value;
+                setSelectedModel(value);
+                localStorage.setItem('script-ai-last-model', value);
+                if (sessionId) setSessions((previous) => previous.map((session) => session.id === sessionId ? { ...session, model: value } : session));
+              }}
+              aria-label="选择 AI 模型"
+              title="选择 AI 模型"
+              disabled={running || modelOptions.length === 0}
+            >
+              {modelGroups.length === 0 ? <option value="">未配置模型</option> : modelGroups.map((group) => (
+                <optgroup key={group.provider} label={group.provider}>
+                  {group.models.map((model) => <option key={`${group.provider}:${model}`} value={model}>{model}</option>)}
+                </optgroup>
+              ))}
+            </select>
             <Dropdown
               trigger="click"
               position="br"
@@ -1425,15 +1461,14 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
               />
             </Dropdown>
             <Button
-              type="text"
+              type="primary"
               size="small"
-              icon={<IconStop />}
-              onClick={stopAgent}
-              disabled={!running}
-              aria-label="中断 AI 请求"
-              title="中断 AI 请求"
-            />
-            <Button type="primary" size="small" icon={<IconSend />} onClick={() => handleSubmit()} disabled={!prompt.trim() || running}>发送</Button>
+              icon={running ? <IconStop /> : <IconSend />}
+              onClick={running ? stopAgent : () => handleSubmit()}
+              disabled={!running && (!prompt.trim() || !selectedModel)}
+              aria-label={running ? '中断 AI 请求' : '发送 AI 请求'}
+              title={running ? '中断 AI 请求' : (selectedModel ? `使用 ${selectedModel} 发送` : '请先配置 AI 模型')}
+            >{running ? '中断' : '发送'}</Button>
           </Space>
         </div>
       </div>

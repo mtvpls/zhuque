@@ -56,6 +56,8 @@ pub struct PythonMirror {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiConfig {
     pub enabled: bool,
+    #[serde(default)]
+    pub providers: Vec<AiProviderConfig>,
     pub provider: String,
     #[serde(default = "default_ai_protocol")]
     pub protocol: String,
@@ -66,6 +68,17 @@ pub struct AiConfig {
     pub context_window_tokens: u32,
     #[serde(default = "default_ai_compression_ratio")]
     pub compression_ratio: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiProviderConfig {
+    pub name: String,
+    #[serde(default = "default_ai_protocol")]
+    pub protocol: String,
+    pub base_url: String,
+    pub api_key: String,
+    #[serde(default)]
+    pub models: Vec<String>,
 }
 
 fn default_ai_protocol() -> String {
@@ -83,6 +96,15 @@ fn default_ai_compression_ratio() -> u8 {
 impl AiConfig {
     pub fn normalized(&self) -> Self {
         let mut value = self.clone();
+        if value.providers.is_empty() {
+            value.providers.push(AiProviderConfig {
+                name: value.provider.clone(),
+                protocol: value.protocol.clone(),
+                base_url: value.base_url.clone(),
+                api_key: value.api_key.clone(),
+                models: if value.model.trim().is_empty() { Vec::new() } else { vec![value.model.clone()] },
+            });
+        }
         value.compression_ratio = value.compression_ratio.clamp(10, 95);
         value
     }
@@ -92,6 +114,7 @@ impl Default for AiConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            providers: Vec::new(),
             provider: "OpenAI Compatible".to_string(),
             protocol: default_ai_protocol(),
             base_url: "https://api.openai.com/v1".to_string(),

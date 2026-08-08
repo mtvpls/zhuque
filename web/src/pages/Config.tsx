@@ -24,6 +24,7 @@ import { getSystemLogs, type SystemLogEntry } from '@/api/systemLog';
 import { authApi } from '@/api/auth';
 import { loginLogApi, type LoginLog } from '@/api/loginLog';
 import dayjs from 'dayjs';
+import './Config.css';
 
 const FormItem = Form.Item;
 const { Title, Text } = Typography;
@@ -37,6 +38,14 @@ interface DiskInfo {
   available_space: number;
   used_space: number;
   usage_percent: number;
+}
+
+interface AiProviderForm {
+  name: string;
+  protocol: string;
+  base_url: string;
+  api_key: string;
+  models: string;
 }
 
 interface SystemInfo {
@@ -81,7 +90,14 @@ const Config: React.FC = () => {
   });
   const [isMobile, setIsMobile] = useState(window.innerWidth <= 768);
   const [aiForm] = Form.useForm();
+  const [providerForm] = Form.useForm();
   const [aiLoading, setAiLoading] = useState(false);
+  const [aiProviders, setAiProviders] = useState<AiProviderForm[]>([]);
+  const [providerModalVisible, setProviderModalVisible] = useState(false);
+  const [editingProviderIndex, setEditingProviderIndex] = useState<number | null>(null);
+  const [providerModelsLoading, setProviderModelsLoading] = useState(false);
+  const [availableProviderModels, setAvailableProviderModels] = useState<string[]>([]);
+  const [selectedProviderModels, setSelectedProviderModels] = useState<string[]>([]);
 
   useEffect(() => {
     const handleResize = () => {
@@ -161,8 +177,51 @@ const Config: React.FC = () => {
         headers: { Authorization: `Bearer ${token}` },
       });
       aiForm.setFieldsValue(res.data);
+      setAiProviders((res.data.providers || []).map((provider: any) => ({
+        ...provider,
+        models: (provider.models || []).join('\n'),
+      })));
     } catch (error) {
       Message.error('加载 AI 配置失败');
+    }
+  };
+
+  const openProviderModal = (index: number | null = null) => {
+    setEditingProviderIndex(index);
+    setAvailableProviderModels([]);
+    const provider = index === null
+      ? { name: '', protocol: 'chat_completions', base_url: '', api_key: '', models: '' }
+      : aiProviders[index];
+    providerForm.setFieldsValue(provider);
+    setSelectedProviderModels(String(provider.models || '').split(/[\n,]+/).map((model: string) => model.trim()).filter(Boolean));
+    setProviderModalVisible(true);
+  };
+
+  const fetchProviderModels = async () => {
+    try {
+      const values = await providerForm.validate(['name', 'base_url', 'api_key']);
+      setProviderModelsLoading(true);
+      const response = await axios.post('/api/ai/models', values, { headers: { Authorization: `Bearer ${localStorage.getItem('token') || ''}` } });
+      setAvailableProviderModels(response.data || []);
+      Message.success(`已获取 ${response.data?.length || 0} 个模型`);
+    } catch (error: any) {
+      Message.error(error.response?.data || '获取模型列表失败');
+    } finally {
+      setProviderModelsLoading(false);
+    }
+  };
+
+  const saveProvider = async () => {
+    try {
+      const values = await providerForm.validate() as AiProviderForm;
+      if (!values.models?.trim()) throw new Error('请至少填写一个模型');
+      const next = [...aiProviders];
+      if (editingProviderIndex === null) next.push(values);
+      else next[editingProviderIndex] = values;
+      setAiProviders(next);
+      setProviderModalVisible(false);
+    } catch (error: any) {
+      if (error?.message) Message.error(error.message);
     }
   };
 
@@ -171,7 +230,22 @@ const Config: React.FC = () => {
       const values = await aiForm.validate();
       setAiLoading(true);
       const token = localStorage.getItem('token');
-      await axios.post('/api/ai/config', values, {
+      const primaryProvider = aiProviders[0];
+      const primaryModels = String(primaryProvider?.models || '').split(/[\n,]+/).map((model: string) => model.trim()).filter(Boolean);
+      const payload = {
+        ...values,
+        // 后端仍保留旧版单服务商字段，使用第一个服务商作为兼容值。
+        provider: primaryProvider?.name || values.provider || 'OpenAI Compatible',
+        protocol: primaryProvider?.protocol || values.protocol || 'chat_completions',
+        base_url: primaryProvider?.base_url || values.base_url || '',
+        api_key: primaryProvider?.api_key || values.api_key || '',
+        model: values.model || primaryModels[0] || '',
+        providers: aiProviders.map((provider) => ({
+          ...provider,
+          models: String(provider.models || '').split(/[\n,]+/).map((model: string) => model.trim()).filter(Boolean),
+        })),
+      };
+      await axios.post('/api/ai/config', payload, {
         headers: { Authorization: `Bearer ${token}` },
       });
       Message.success('AI 配置已保存');
@@ -709,25 +783,33 @@ const Config: React.FC = () => {
                 <FormItem label="启用 AI" field="enabled" triggerPropName="checked">
                   <Switch />
                 </FormItem>
-                <FormItem label="Provider 名称" field="provider" rules={[{ required: true, message: '请输入 Provider 名称' }]}>
-                  <Input placeholder="OpenAI Compatible / DeepSeek / Ollama" />
-                </FormItem>
-                <FormItem label="协议" field="protocol" rules={[{ required: true, message: '请选择 AI 协议' }]}>
-                  <Select placeholder="选择 AI 协议">
-                    <Select.Option value="chat_completions">OpenAI Chat Completions（兼容 OpenAI）</Select.Option>
-                    <Select.Option value="responses">OpenAI Responses</Select.Option>
-                    <Select.Option value="claude_messages">Claude Messages</Select.Option>
-                  </Select>
-                </FormItem>
-                <FormItem label="Base URL" field="base_url" rules={[{ required: true, message: '请输入 Base URL' }]}>
-                  <Input placeholder="https://api.openai.com/v1" />
-                </FormItem>
-                <FormItem label="API Key" field="api_key">
-                  <Input.Password placeholder="sk-..." />
-                </FormItem>
-                <FormItem label="模型名称" field="model" rules={[{ required: true, message: '请输入模型名称' }]}>
-                  <Input placeholder="gpt-4o-mini / deepseek-chat / qwen-plus" />
-                </FormItem>
+                <div className="ai-provider-list">
+                  <div className="ai-provider-list-toolbar">
+                    <Typography.Text bold>服务商列表</Typography.Text>
+                    <Button type="outline" onClick={() => openProviderModal()}>新增服务商</Button>
+                  </div>
+                  {aiProviders.length === 0 ? (
+                    <div className="ai-provider-list-empty">暂无服务商配置</div>
+                  ) : aiProviders.map((provider, index) => (
+                    <div className="ai-provider-list-row" key={`${provider.name}-${index}`}>
+                      <div className="ai-provider-list-main">
+                        <strong>{provider.name || '未命名服务商'}</strong>
+                        <span title={provider.base_url}>{provider.base_url || '未配置 Base URL'}</span>
+                      </div>
+                      <div className="ai-provider-list-models">
+                        {(() => {
+                          const models = provider.models.split(/[\n,]+/).map((model) => model.trim()).filter(Boolean);
+                          return models.length > 0 ? `${models.length} 个模型` : '未配置模型';
+                        })()}
+                      </div>
+                      <Space>
+                        <Button type="text" size="small" onClick={() => openProviderModal(index)}>编辑</Button>
+                        <Button type="text" size="small" status="danger" onClick={() => setAiProviders((items) => items.filter((_, itemIndex) => itemIndex !== index))}>删除</Button>
+                      </Space>
+                    </div>
+                  ))}
+                </div>
+                <FormItem label="兼容旧配置的默认模型" field="model"><Input placeholder="旧版单 Provider 配置可保留" /></FormItem>
                 <FormItem
                   label="最大上下文长度（Token）"
                   field="context_window_tokens"
@@ -744,6 +826,41 @@ const Config: React.FC = () => {
                   <InputNumber min={10} max={95} step={1} suffix="%" style={{ width: '100%' }} />
                 </FormItem>
               </Form>
+              <Modal
+                title={editingProviderIndex === null ? '新增服务商' : '编辑服务商'}
+                visible={providerModalVisible}
+                onCancel={() => setProviderModalVisible(false)}
+                onOk={saveProvider}
+                okText="确定"
+                cancelText="取消"
+              >
+                <Form form={providerForm} layout="vertical">
+                  <FormItem label="服务商名称" field="name" rules={[{ required: true, message: '请输入服务商名称' }]}><Input placeholder="OpenAI / DeepSeek / Ollama" /></FormItem>
+                  <FormItem label="协议" field="protocol" rules={[{ required: true, message: '请选择 AI 协议' }]}><Select><Select.Option value="chat_completions">OpenAI Chat Completions</Select.Option><Select.Option value="responses">OpenAI Responses</Select.Option><Select.Option value="claude_messages">Claude Messages</Select.Option></Select></FormItem>
+                  <FormItem label="Base URL" field="base_url" rules={[{ required: true, message: '请输入 Base URL' }]}><Input placeholder="https://api.openai.com/v1" /></FormItem>
+                  <FormItem label="API Key" field="api_key"><Input.Password placeholder="sk-..." /></FormItem>
+                  <div className="ai-model-fetch-row"><Button loading={providerModelsLoading} onClick={fetchProviderModels}>获取模型列表</Button></div>
+                  {availableProviderModels.length > 0 && (
+                    <FormItem label="已获取模型">
+                      <Select
+                        mode="multiple"
+                        showSearch
+                        allowClear
+                        placeholder="搜索并选择模型"
+                        style={{ width: '100%' }}
+                        value={selectedProviderModels}
+                        onChange={(models) => {
+                          setSelectedProviderModels(models);
+                          providerForm.setFieldValue('models', models.join('\n'));
+                        }}
+                      >
+                        {availableProviderModels.map((model) => <Select.Option key={model} value={model}>{model}</Select.Option>)}
+                      </Select>
+                    </FormItem>
+                  )}
+                  <FormItem label="模型列表" field="models" rules={[{ required: true, message: '请至少填写一个模型' }]} extra="可手动输入，每行一个或使用逗号分隔"><Input.TextArea autoSize={{ minRows: 3, maxRows: 7 }} placeholder="gpt-4o-mini\ndeepseek-chat" /></FormItem>
+                </Form>
+              </Modal>
             </div>
           </TabPane>
 

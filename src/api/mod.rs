@@ -260,6 +260,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/backup/restore", post(backup::restore_backup))
         // AI 配置与服务端代理
         .route("/api/ai/config", get(ai::config).post(ai::update_config))
+        .route("/api/ai/models", post(ai::list_provider_models))
         .route(
             "/api/ai/sessions",
             get(ai::list_sessions).post(ai::create_session),

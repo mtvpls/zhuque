@@ -246,12 +246,17 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool> {
             directory_path TEXT,
             file_path TEXT,
             active_job_id TEXT,
+            model TEXT,
             context_tokens INTEGER,
             created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
     "#).execute(&pool).await?;
     sqlx::query("ALTER TABLE ai_sessions ADD COLUMN context_tokens INTEGER")
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("ALTER TABLE ai_sessions ADD COLUMN model TEXT")
         .execute(&pool)
         .await
         .ok();

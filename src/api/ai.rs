@@ -48,6 +48,8 @@ pub struct AiChatRequest {
     pub retry: bool,
     pub session_id: Option<String>,
     #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
     pub force_compress: bool,
 }
 
@@ -61,9 +63,17 @@ pub struct AiHistoryMessage {
 
 const MASKED_API_KEY: &str = "********";
 
+#[derive(Debug, Deserialize)]
+pub struct AiModelsRequest {
+    pub name: String,
+    pub base_url: String,
+    pub api_key: String,
+}
+
 #[derive(Debug, Serialize)]
 struct AiConfigResponse {
     enabled: bool,
+    providers: Vec<AiProviderResponse>,
     provider: String,
     base_url: String,
     protocol: String,
@@ -73,10 +83,26 @@ struct AiConfigResponse {
     compression_ratio: u8,
 }
 
+#[derive(Debug, Serialize)]
+struct AiProviderResponse {
+    name: String,
+    protocol: String,
+    base_url: String,
+    api_key: String,
+    models: Vec<String>,
+}
+
 impl From<AiConfig> for AiConfigResponse {
     fn from(config: AiConfig) -> Self {
         Self {
             enabled: config.enabled,
+            providers: config.providers.into_iter().map(|provider| AiProviderResponse {
+                name: provider.name,
+                protocol: provider.protocol,
+                base_url: provider.base_url,
+                api_key: if provider.api_key.is_empty() { String::new() } else { MASKED_API_KEY.to_string() },
+                models: provider.models,
+            }).collect(),
             provider: config.provider,
             base_url: config.base_url,
             protocol: config.protocol,
@@ -124,6 +150,25 @@ impl AiProtocol {
             format!("{base_url}{suffix}")
         }
     }
+}
+
+fn config_for_model(config: &AiConfig, requested_model: Option<&str>) -> AiConfig {
+    let mut selected = config.clone();
+    let requested = requested_model.map(str::trim).filter(|value| !value.is_empty());
+    let provider = requested.and_then(|model| config.providers.iter().find(|provider| provider.models.iter().any(|candidate| candidate == model)))
+        .or_else(|| config.providers.iter().find(|provider| provider.models.iter().any(|candidate| candidate == &config.model)))
+        .or_else(|| config.providers.first());
+    if let Some(provider) = provider {
+        selected.provider = provider.name.clone();
+        selected.protocol = provider.protocol.clone();
+        selected.base_url = provider.base_url.clone();
+        if !provider.api_key.trim().is_empty() { selected.api_key = provider.api_key.clone(); }
+        selected.model = requested.map(str::to_string)
+            .or_else(|| (!config.model.trim().is_empty()).then(|| config.model.clone()))
+            .or_else(|| provider.models.first().cloned())
+            .unwrap_or_default();
+    }
+    selected
 }
 
 fn protocol_for_config(config: &AiConfig) -> AiProtocol {
@@ -1786,8 +1831,8 @@ async fn run_agent_job(state: Arc<AppState>, request: AiChatRequest, job: Arc<Ai
     let config = match state.config_service.get_ai_config().await {
         Ok(config)
             if config.enabled
-                && !config.api_key.trim().is_empty()
-                && !config.model.trim().is_empty() =>
+                && (!config.api_key.trim().is_empty() || config.providers.iter().any(|provider| !provider.api_key.trim().is_empty()))
+                && (!config.model.trim().is_empty() || config.providers.iter().any(|provider| !provider.models.is_empty())) =>
         {
             config
         }
@@ -1804,6 +1849,14 @@ async fn run_agent_job(state: Arc<AppState>, request: AiChatRequest, job: Arc<Ai
             return;
         }
     };
+    let config = config_for_model(&config, request.model.as_deref());
+    if config.model.trim().is_empty() || config.api_key.trim().is_empty() {
+        publish_job(&job, json!({"type":"error","message":"请选择已配置的 AI 模型"})).await;
+        set_session_job(&state, request.session_id.as_deref(), &job.user_key, None).await;
+        publish_job(&job, json!({"type":"done"})).await;
+        return;
+    }
+    set_session_model(&state, request.session_id.as_deref(), &job.user_key, &config.model).await;
     let protocol = protocol_for_config(&config);
     let endpoint = protocol.endpoint(&config.base_url);
     let client = match Client::builder().build() {
@@ -2269,6 +2322,7 @@ pub async fn agent(
         .get_ai_config()
         .await
         .map_err(internal_error)?;
+    let config = config_for_model(&config, request.model.as_deref());
     if !config.enabled || config.api_key.trim().is_empty() || config.model.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -2621,6 +2675,7 @@ pub struct AiSessionSummary {
     directory_path: Option<String>,
     file_path: Option<String>,
     active_job_id: Option<String>,
+    model: Option<String>,
     current_context_tokens: Option<i64>,
     updated_at: String,
 }
@@ -2639,7 +2694,7 @@ pub async fn list_sessions(
 ) -> Result<Json<Vec<AiSessionSummary>>, (StatusCode, String)> {
     let pool = state.db_pool.read().await;
     let rows = sqlx::query_as::<_, AiSessionSummaryRow>(
-        "SELECT id, title, directory_path, file_path, active_job_id, context_tokens AS current_context_tokens, CAST(updated_at AS TEXT) AS updated_at FROM ai_sessions WHERE user_key = ? ORDER BY updated_at DESC"
+        "SELECT id, title, directory_path, file_path, active_job_id, model, context_tokens AS current_context_tokens, CAST(updated_at AS TEXT) AS updated_at FROM ai_sessions WHERE user_key = ? ORDER BY updated_at DESC"
     ).bind(sub).fetch_all(&*pool).await.map_err(internal_error)?;
     Ok(Json(rows.into_iter().map(Into::into).collect()))
 }
@@ -2651,6 +2706,7 @@ struct AiSessionSummaryRow {
     directory_path: Option<String>,
     file_path: Option<String>,
     active_job_id: Option<String>,
+    model: Option<String>,
     current_context_tokens: Option<i64>,
     updated_at: String,
 }
@@ -2662,6 +2718,7 @@ impl From<AiSessionSummaryRow> for AiSessionSummary {
             directory_path: row.directory_path,
             file_path: row.file_path,
             active_job_id: row.active_job_id,
+            model: row.model,
             current_context_tokens: row.current_context_tokens,
             updated_at: row.updated_at,
         }
@@ -2680,7 +2737,7 @@ pub async fn create_session(
         .execute(&*pool)
         .await
         .map_err(internal_error)?;
-    let row = sqlx::query_as::<_, AiSessionSummaryRow>("SELECT id, title, directory_path, file_path, active_job_id, context_tokens AS current_context_tokens, CAST(updated_at AS TEXT) AS updated_at FROM ai_sessions WHERE id = ?").bind(&id).fetch_one(&*pool).await.map_err(internal_error)?;
+    let row = sqlx::query_as::<_, AiSessionSummaryRow>("SELECT id, title, directory_path, file_path, active_job_id, model, context_tokens AS current_context_tokens, CAST(updated_at AS TEXT) AS updated_at FROM ai_sessions WHERE id = ?").bind(&id).fetch_one(&*pool).await.map_err(internal_error)?;
     Ok(Json(row.into()))
 }
 
@@ -2770,6 +2827,7 @@ pub async fn compress_session(
         .get_ai_config()
         .await
         .map_err(internal_error)?;
+    let config = config_for_model(&config, None);
     if !config.enabled || config.api_key.trim().is_empty() || config.model.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -2998,6 +3056,13 @@ async fn set_session_context_tokens(
         .await;
 }
 
+async fn set_session_model(state: &Arc<AppState>, session_id: Option<&str>, user_key: &str, model: &str) {
+    let Some(session_id) = session_id.filter(|id| !id.is_empty()) else { return; };
+    let pool = state.db_pool.read().await;
+    let _ = sqlx::query("UPDATE ai_sessions SET model = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_key = ?")
+        .bind(model).bind(session_id).bind(user_key).execute(&*pool).await;
+}
+
 async fn set_session_job(
     state: &AppState,
     session_id: Option<&str>,
@@ -3139,6 +3204,38 @@ async fn store_session_message(
         .await;
     }
     None
+}
+
+pub async fn list_provider_models(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<AiModelsRequest>,
+) -> Result<Json<Vec<String>>, (StatusCode, String)> {
+    let configured = state.config_service.get_ai_config().await.map_err(internal_error)?;
+    let provider = configured.providers.iter().find(|provider| provider.name == request.name);
+    let api_key = if request.api_key.trim().is_empty() || request.api_key == MASKED_API_KEY {
+        provider.map(|value| value.api_key.as_str()).unwrap_or("")
+    } else {
+        request.api_key.as_str()
+    };
+    if api_key.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "请先填写 API Key".into()));
+    }
+    let url = format!("{}/models", request.base_url.trim_end_matches('/'));
+    let response = reqwest::Client::new()
+        .get(url)
+        .bearer_auth(api_key)
+        .send()
+        .await
+        .map_err(internal_error)?;
+    let status = response.status();
+    let body: Value = response.json().await.map_err(internal_error)?;
+    if !status.is_success() {
+        let message = body.get("error").and_then(|value| value.get("message")).and_then(Value::as_str).unwrap_or("获取模型列表失败");
+        return Err((status, message.to_string()));
+    }
+    let models = body.get("data").and_then(Value::as_array).cloned().unwrap_or_default()
+        .into_iter().filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_string)).collect();
+    Ok(Json(models))
 }
 
 pub async fn config(
