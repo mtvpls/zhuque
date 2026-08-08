@@ -419,7 +419,7 @@ fn provider_usage(value: &Value) -> Option<ProviderUsage> {
     let cache_hit_tokens = read("prompt_cache_hit_tokens")
         .or_else(|| read("cache_read_input_tokens"))
         .or_else(|| usage.get("prompt_tokens_details").and_then(|details| details.get("cached_tokens")).and_then(Value::as_u64).map(|value| value as usize))
-        .or_else(|| usage.get("input_token_details").and_then(|details| details.get("cached_tokens")).and_then(Value::as_u64).map(|value| value as usize));
+        .or_else(|| usage.get("input_tokens_details").and_then(|details| details.get("cached_tokens")).and_then(Value::as_u64).map(|value| value as usize));
     let cache_miss_tokens = read("prompt_cache_miss_tokens")
         .or_else(|| read("cache_creation_input_tokens"))
         .or_else(|| prompt_tokens.zip(cache_hit_tokens).map(|(prompt, hit)| prompt.saturating_sub(hit)));
@@ -2137,11 +2137,14 @@ fn apply_protocol_stream_chunk(
     merge_provider_usage(usage, provider_usage(&value));
     match protocol {
         AiProtocol::Responses => {
-            if let Some(delta) = value.get("delta").and_then(Value::as_str).or_else(|| value.get("text").and_then(Value::as_str)) {
-                content.push_str(delta);
-                text_chunks.push(delta.to_string());
+            let event_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+            if event_type == "response.output_text.delta" {
+                if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+                    content.push_str(delta);
+                    text_chunks.push(delta.to_string());
+                }
             }
-            if value.get("type").and_then(Value::as_str) == Some("response.output_item.done") {
+            if event_type == "response.output_item.done" {
                 if let Some(item) = value.get("item").filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call")) {
                     tool_calls.push(json!({"id": item.get("call_id").or_else(|| item.get("id")).cloned().unwrap_or_else(|| json!("tool-call")), "type":"function", "function":{"name":item.get("name").cloned().unwrap_or_else(|| json!("")),"arguments":item.get("arguments").cloned().unwrap_or_else(|| json!("{}"))}}));
                 }
