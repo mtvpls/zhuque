@@ -8,6 +8,7 @@ import {
   Menu,
   Input,
   Message,
+  Modal,
   Space,
   Tag,
 } from '@arco-design/web-react';
@@ -108,6 +109,46 @@ type FeedGroup =
   | { kind: 'events'; events: AgentEvent[] }
   | { kind: 'message'; message: ConversationMessage };
 
+const feedItemsFromConversation = (messages: ConversationMessage[]): FeedItem[] => {
+  const feed: FeedItem[] = [];
+  for (const message of messages) {
+    if (message.role === 'user') {
+      const isRuntimeContext = message.metadata?.includes('"runtime_context":true')
+        || (message.content.startsWith('运行权限:') && message.content.includes('当前请求:'));
+      if (!isRuntimeContext) feed.push({ kind: 'message', message });
+      continue;
+    }
+    if (message.role === 'assistant') {
+      let toolCalls: Array<{ function?: { name?: string; arguments?: string } }> = [];
+      try {
+        const metadata = message.metadata ? JSON.parse(message.metadata) as { tool_calls?: Array<{ function?: { name?: string; arguments?: string } }> } : {};
+        toolCalls = metadata.tool_calls || [];
+      } catch { }
+      for (const call of toolCalls) {
+        feed.push({ kind: 'event', event: { id: feed.length + 1, label: `调用工具 · ${call.function?.name || '未知工具'}`, detail: call.function?.arguments || undefined } });
+      }
+      if (message.content.trim()) feed.push({ kind: 'message', message });
+      continue;
+    }
+    let toolName = '工具';
+    try {
+      const metadata = message.metadata ? JSON.parse(message.metadata) as { name?: string } : {};
+      toolName = metadata.name || toolName;
+    } catch { }
+    if (!message.content.includes('系统拦截')) {
+      feed.push({ kind: 'event', event: { id: feed.length + 1, label: `工具完成 · ${toolName}`, detail: message.content.slice(0, 1600), tone: 'success' } });
+    }
+  }
+  return feed;
+};
+
+interface DiffLine {
+  type: 'remove' | 'add' | 'gap';
+  text: string;
+  oldLine?: number;
+  newLine?: number;
+}
+
 const formatToolApproval = (tool: string, argumentsValue: Record<string, unknown> | null) => {
   if (!argumentsValue) return '';
   if (tool === 'run_command') return String(argumentsValue.command || '');
@@ -116,6 +157,128 @@ const formatToolApproval = (tool: string, argumentsValue: Record<string, unknown
     return String(argumentsValue.path || '');
   }
   return JSON.stringify(argumentsValue, null, 2);
+};
+
+const buildDiffLines = (oldContent: string, newContent: string): DiffLine[] => {
+  const oldLines = oldContent.split(/\r\n|\n|\r/);
+  const newLines = newContent.split(/\r\n|\n|\r/);
+  const oldCount = oldLines.length;
+  const newCount = newLines.length;
+  const maxCells = 4000000;
+  const operations: Array<{ type: 'equal' | 'remove' | 'add'; oldIndex?: number; newIndex?: number }> = [];
+
+  if (oldCount * newCount <= maxCells) {
+    const lcs = Array.from({ length: oldCount + 1 }, () => new Uint32Array(newCount + 1));
+    for (let oldIndex = oldCount - 1; oldIndex >= 0; oldIndex -= 1) {
+      for (let newIndex = newCount - 1; newIndex >= 0; newIndex -= 1) {
+        lcs[oldIndex][newIndex] = oldLines[oldIndex] === newLines[newIndex]
+          ? lcs[oldIndex + 1][newIndex + 1] + 1
+          : Math.max(lcs[oldIndex + 1][newIndex], lcs[oldIndex][newIndex + 1]);
+      }
+    }
+    let oldIndex = 0;
+    let newIndex = 0;
+    while (oldIndex < oldCount && newIndex < newCount) {
+      if (oldLines[oldIndex] === newLines[newIndex]) {
+        operations.push({ type: 'equal', oldIndex, newIndex });
+        oldIndex += 1;
+        newIndex += 1;
+      } else if (lcs[oldIndex + 1][newIndex] >= lcs[oldIndex][newIndex + 1]) {
+        operations.push({ type: 'remove', oldIndex });
+        oldIndex += 1;
+      } else {
+        operations.push({ type: 'add', newIndex });
+        newIndex += 1;
+      }
+    }
+    while (oldIndex < oldCount) {
+      operations.push({ type: 'remove', oldIndex });
+      oldIndex += 1;
+    }
+    while (newIndex < newCount) {
+      operations.push({ type: 'add', newIndex });
+      newIndex += 1;
+    }
+  } else {
+    const maxCount = Math.max(oldCount, newCount);
+    for (let index = 0; index < maxCount; index += 1) {
+      if (oldLines[index] === newLines[index]) operations.push({ type: 'equal', oldIndex: index, newIndex: index });
+      else {
+        if (oldLines[index] !== undefined) operations.push({ type: 'remove', oldIndex: index });
+        if (newLines[index] !== undefined) operations.push({ type: 'add', newIndex: index });
+      }
+    }
+  }
+
+  const changedIndexes = operations
+    .map((operation, index) => operation.type === 'equal' ? -1 : index)
+    .filter((index) => index >= 0);
+  if (changedIndexes.length === 0) return [];
+
+  const result: DiffLine[] = [];
+  let blockStart = 0;
+  for (let changedIndex = 0; changedIndex <= changedIndexes.length; changedIndex += 1) {
+    const current = changedIndexes[changedIndex];
+    const previous = changedIndexes[changedIndex - 1];
+    if (changedIndex === changedIndexes.length || (current - previous > 1)) {
+      const blockEnd = changedIndex === changedIndexes.length ? previous : previous;
+      const before = blockStart === 0 ? 0 : changedIndexes[blockStart] - changedIndexes[blockStart - 1] - 1;
+      if (blockStart > 0 && before > 0) result.push({ type: 'gap', text: '…' });
+      for (let operationIndex = changedIndexes[blockStart]; operationIndex <= blockEnd; operationIndex += 1) {
+        const operation = operations[operationIndex];
+        if (operation.type === 'remove') {
+          result.push({ type: 'remove', text: oldLines[operation.oldIndex!], oldLine: operation.oldIndex! + 1 });
+        } else if (operation.type === 'add') {
+          result.push({ type: 'add', text: newLines[operation.newIndex!], newLine: operation.newIndex! + 1 });
+        }
+      }
+      blockStart = changedIndex;
+    }
+  }
+  return result;
+};
+
+const renderDiffLine = (line: DiffLine, index: number, lines: DiffLine[]) => {
+  if (line.type === 'gap') {
+    return <><span className="diff-line-number">·</span><span className="diff-line-number">·</span><span>…</span></>;
+  }
+
+  const prefix = line.type === 'remove' ? '- ' : '+ ';
+  const oldNumber = line.oldLine ? String(line.oldLine) : '';
+  const newNumber = line.newLine ? String(line.newLine) : '';
+  if (line.type !== 'add' || index === 0 || lines[index - 1].type !== 'remove') {
+    return (
+      <>
+        <span className="diff-line-number">{oldNumber}</span>
+        <span className="diff-line-number">{newNumber}</span>
+        <span>{prefix}{line.text || ' '}</span>
+      </>
+    );
+  }
+
+  const previousText = lines[index - 1].text;
+  const currentText = line.text;
+  let start = 0;
+  while (start < previousText.length && start < currentText.length && previousText[start] === currentText[start]) start += 1;
+  let end = 0;
+  while (
+    end < previousText.length - start
+    && end < currentText.length - start
+    && previousText[previousText.length - 1 - end] === currentText[currentText.length - 1 - end]
+  ) end += 1;
+
+  const changedEnd = currentText.length - end;
+  return (
+    <>
+      <span className="diff-line-number">{oldNumber}</span>
+      <span className="diff-line-number">{newNumber}</span>
+      <span>
+        {prefix}{currentText.slice(0, start)}
+        <span className="diff-char-add">{currentText.slice(start, changedEnd) || ' '}</span>
+        {currentText.slice(changedEnd)}
+      </span>
+    </>
+  );
 };
 
 const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
@@ -145,7 +308,9 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
   const [pendingToolCallId, setPendingToolCallId] = useState<string | null>(null);
   const [pendingToolName, setPendingToolName] = useState('');
   const [pendingToolArguments, setPendingToolArguments] = useState<Record<string, unknown> | null>(null);
+  const [showFullDiff, setShowFullDiff] = useState(false);
   const [showSessions, setShowSessions] = useState(false);
+  const pendingApprovalRef = useRef<{ callId: string; decision: 'approve' | 'reject'; remember: boolean } | null>(null);
   const [contextEnabled, setContextEnabled] = useState(Boolean(filePath || fileName));
   const [workspaceWidth, setWorkspaceWidth] = useState(360);
   const [isMobileViewport, setIsMobileViewport] = useState(() => window.matchMedia('(max-width: 1024px), (hover: none) and (pointer: coarse)').matches);
@@ -162,7 +327,7 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
   const conversationSyncRef = useRef(false);
   const reconnectTimerRef = useRef<number | null>(null);
   const keepSubscribedRef = useRef(false);
-  const lastSequenceRef = useRef(0);
+  const lastSequencesRef = useRef<Record<string, number>>({});
   const sessionIdRef = useRef<string | null>(null);
   const feedRef = useRef<HTMLDivElement | null>(null);
 
@@ -293,24 +458,52 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
 
   const hasDiff = Boolean(draftChanges && draftChanges.length > 0);
   const currentChange = draftChanges?.find((change) => change.path === filePath);
-  const diffPreview = useMemo(() => {
-    if (!currentChange || currentChange.content === undefined || currentChange.operation === 'delete') {
-      return [];
+  const pendingFileChange = useMemo<AgentFileChange | null>(() => {
+    if (!pendingToolArguments || !['edit_file', 'write_file'].includes(pendingToolName)) return null;
+    const path = String(pendingToolArguments.path || '');
+    if (!path) return null;
+    const backendDiff = pendingToolArguments.diff && typeof pendingToolArguments.diff === 'object'
+      ? pendingToolArguments.diff as Record<string, unknown>
+      : null;
+
+    if (pendingToolName === 'write_file') {
+      const content = String(backendDiff?.after ?? pendingToolArguments.content ?? '');
+      const isCurrentFile = path === filePath || path === fileName;
+      return { path, operation: isCurrentFile && fileContent ? 'update' : 'create', content };
     }
-    const oldLines = fileContent.split('\n');
-    const newLines = currentChange.content.split('\n');
-    const preview: Array<{ type: 'remove' | 'add'; text: string }> = [];
-    const maxLines = Math.max(oldLines.length, newLines.length);
-    for (let index = 0; index < maxLines; index += 1) {
-      if (oldLines[index] !== newLines[index] && oldLines[index] !== undefined) {
-        preview.push({ type: 'remove', text: oldLines[index] });
-      }
-      if (oldLines[index] !== newLines[index] && newLines[index] !== undefined) {
-        preview.push({ type: 'add', text: newLines[index] });
-      }
+
+    if (typeof backendDiff?.after === 'string') {
+      return { path, operation: 'update', content: backendDiff.after };
     }
-    return preview.slice(0, 120);
-  }, [currentChange, fileContent]);
+
+    const oldString = String(pendingToolArguments.old_string || '');
+    const newString = String(pendingToolArguments.new_string || '');
+    const isCurrentFile = path === filePath || path === fileName;
+    const source = isCurrentFile ? fileContent : oldString;
+    const content = isCurrentFile
+      ? (pendingToolArguments.replace_all === false
+        ? source.replace(oldString, newString)
+        : source.split(oldString).join(newString))
+      : newString;
+    return { path, operation: 'update', content };
+  }, [fileContent, fileName, filePath, pendingToolArguments, pendingToolName]);
+
+  const activePreviewChange = pendingFileChange || currentChange;
+  const fullDiff = useMemo(() => {
+    if (!activePreviewChange || activePreviewChange.content === undefined || activePreviewChange.operation === 'delete') return [];
+    let oldContent = '';
+    const backendDiff = pendingToolArguments?.diff && typeof pendingToolArguments.diff === 'object'
+      ? pendingToolArguments.diff as Record<string, unknown>
+      : null;
+    if (typeof backendDiff?.before === 'string') oldContent = backendDiff.before;
+    if (!oldContent && (activePreviewChange.path === filePath || activePreviewChange.path === fileName)) oldContent = fileContent;
+    if (pendingToolName === 'edit_file' && !oldContent && pendingToolArguments) {
+      oldContent = String(pendingToolArguments.old_string || '');
+    }
+    return buildDiffLines(oldContent, activePreviewChange.content);
+  }, [activePreviewChange, fileContent, fileName, filePath, pendingToolArguments, pendingToolName]);
+  const diffPreview = fullDiff.slice(0, 80);
+  const diffTruncated = fullDiff.length > diffPreview.length;
 
   const addEvent = (label: string, detail?: string, tone: EventTone = 'neutral') => {
     setFeedItems((previous) => [
@@ -320,42 +513,81 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
   };
 
 
-  const connectJob = (jobId?: string, startRequest?: Record<string, unknown>, socketSessionId = sessionIdRef.current) => {
+  const connectJob = (jobId?: string, startRequest?: Record<string, unknown>) => {
+    const existingSocket = socketRef.current;
+    if (startRequest && existingSocket?.readyState === WebSocket.OPEN) {
+      existingSocket.send(JSON.stringify({ type: 'start', request: startRequest }));
+      return existingSocket;
+    }
     const token = localStorage.getItem('token') || '';
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const query = `token=${encodeURIComponent(token)}${jobId ? `&job_id=${encodeURIComponent(jobId)}` : ''}`;
     const socket = new WebSocket(`${protocol}//${window.location.host}/api/ai/ws?${query}`);
     socketRef.current = socket;
-    assistantTextRef.current = '';
-    assistantSegmentRef.current = null;
-    streamedTextRef.current = false;
-    toolInteractionRef.current = false;
-    conversationSyncRef.current = false;
     keepSubscribedRef.current = true;
 
     socket.onopen = () => {
       if (startRequest) {
         socket.send(JSON.stringify({ type: 'start', request: startRequest }));
       }
-      setRunning(true);
+      const queuedApproval = pendingApprovalRef.current;
+      if (queuedApproval) {
+        socket.send(JSON.stringify({
+          type: queuedApproval.decision === 'approve' ? 'approve_tool' : 'reject_tool',
+          tool_call_id: queuedApproval.callId,
+          ...(queuedApproval.decision === 'approve' ? { remember: queuedApproval.remember } : {}),
+        }));
+        pendingApprovalRef.current = null;
+        setPendingPermission(null);
+        setPendingToolCallId(null);
+        setPendingToolName('');
+        setPendingToolArguments(null);
+      }
+      setRunning(Boolean(jobIdRef.current) || Boolean(startRequest));
     };
 
     socket.onmessage = (message) => {
       try {
         const envelope = JSON.parse(message.data) as { event?: Record<string, unknown>; seq?: number };
-        if (typeof envelope.seq === 'number' && envelope.seq <= lastSequenceRef.current) return;
-        if (typeof envelope.seq === 'number') lastSequenceRef.current = envelope.seq;
-        if (socketSessionId !== sessionIdRef.current) return;
+        const eventSessionId = typeof (envelope as Record<string, unknown>).session_id === 'string'
+          ? String((envelope as Record<string, unknown>).session_id)
+          : '';
+        const eventJobId = typeof (envelope as Record<string, unknown>).job_id === 'string'
+          ? String((envelope as Record<string, unknown>).job_id)
+          : eventSessionId;
         const payload = (envelope.event || envelope) as Record<string, any>;
         const type = String(payload.type || '');
         const tool = typeof payload.tool === 'string' ? payload.tool : 'unknown';
+        if (type === 'job_started' && eventSessionId && eventJobId) {
+          sessionJobsRef.current[eventSessionId] = eventJobId;
+          localStorage.setItem('script-ai-active-jobs', JSON.stringify(sessionJobsRef.current));
+          setSessions((previous) => previous.map((session) => (
+            session.id === eventSessionId ? { ...session, active_job_id: eventJobId } : session
+          )));
+          if (eventSessionId === sessionIdRef.current) jobIdRef.current = eventJobId;
+        } else if (type === 'done' && eventSessionId && eventJobId) {
+          if (sessionJobsRef.current[eventSessionId] === eventJobId) {
+            delete sessionJobsRef.current[eventSessionId];
+            localStorage.setItem('script-ai-active-jobs', JSON.stringify(sessionJobsRef.current));
+          }
+          setSessions((previous) => previous.map((session) => (
+            session.id === eventSessionId && session.active_job_id === eventJobId
+              ? { ...session, active_job_id: null }
+              : session
+          )));
+          if (eventSessionId === sessionIdRef.current && jobIdRef.current === eventJobId) jobIdRef.current = null;
+        }
+        if (eventSessionId && eventSessionId !== sessionIdRef.current) return;
+        const previousSequence = lastSequencesRef.current[eventJobId] || 0;
+        if (typeof envelope.seq === 'number' && envelope.seq <= previousSequence) return;
+        if (typeof envelope.seq === 'number') lastSequencesRef.current[eventJobId] = envelope.seq;
         if (type === 'context_usage') {
           const tokens = Number(payload.tokens);
           if (payload.source === 'provider' && Number.isFinite(tokens) && tokens > 0) {
             const roundedTokens = Math.round(tokens);
             setProviderContextTokens(roundedTokens);
             setSessions((previous) => previous.map((session) => (
-              session.id === socketSessionId
+              session.id === sessionIdRef.current
                 ? { ...session, current_context_tokens: roundedTokens }
                 : session
             )));
@@ -366,22 +598,39 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
           if (Number.isFinite(hit) && Number.isFinite(miss)) {
             setCacheUsage({ hit: Math.max(0, hit), miss: Math.max(0, miss) });
           }
+        } else if (type === 'context_compacting') {
+          addEvent('正在压缩上下文', `当前约 ${formatTokenCount(Number(payload.tokens) || 0)} tokens`, 'warning');
+        } else if (type === 'context_compacted') {
+          const messages = Array.isArray(payload.messages)
+            ? payload.messages.filter((item): item is ConversationMessage => Boolean(item && (item.role === 'user' || item.role === 'assistant' || item.role === 'tool') && typeof item.content === 'string'))
+            : [];
+          if (messages.length > 0) {
+            conversationSyncRef.current = true;
+            setConversation(messages);
+            setFeedItems(feedItemsFromConversation(messages));
+            setProviderContextTokens(null);
+            setCacheUsage(null);
+            setSessions((previous) => previous.map((session) => (
+              session.id === sessionIdRef.current
+                ? { ...session, current_context_tokens: null }
+                : session
+            )));
+            assistantTextRef.current = '';
+            assistantSegmentRef.current = null;
+            streamedTextRef.current = false;
+            toolInteractionRef.current = false;
+          }
+          addEvent('上下文已自动压缩', payload.source === 'local' ? 'Provider 压缩失败，已使用本地降级压缩' : '已清理并同步压缩后的会话消息', 'success');
         } else if (type === 'session_title') {
           const title = typeof payload.title === 'string' ? payload.title : '';
-          if (title && socketSessionId) {
+          if (title && sessionIdRef.current) {
             setSessions((previous) => previous.map((session) => (
-              session.id === socketSessionId ? { ...session, title } : session
+              session.id === sessionIdRef.current ? { ...session, title } : session
             )));
           }
         } else if (type === 'job_started') {
-          const id = typeof payload.job_id === 'string' ? payload.job_id : null;
-          if (id) {
-            jobIdRef.current = id;
-            if (socketSessionId) {
-              sessionJobsRef.current[socketSessionId] = id;
-              localStorage.setItem('script-ai-active-jobs', JSON.stringify(sessionJobsRef.current));
-            }
-          }
+          const id = eventJobId || null;
+          if (id) jobIdRef.current = id;
         } else if (type === 'tool_call' || type === 'tool_result') {
           assistantSegmentRef.current = null;
           toolInteractionRef.current = true;
@@ -431,9 +680,13 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
         } else if (type === 'approval_required') {
           const callId = typeof payload.tool_call_id === 'string' ? payload.tool_call_id : '';
           if (callId) {
+            pendingApprovalRef.current = null;
             setPendingToolCallId(callId);
             setPendingToolName(tool);
-            setPendingToolArguments(payload.arguments && typeof payload.arguments === 'object' ? payload.arguments as Record<string, unknown> : null);
+            const approvalArguments = payload.arguments && typeof payload.arguments === 'object'
+              ? { ...(payload.arguments as Record<string, unknown>), diff: payload.diff }
+              : null;
+            setPendingToolArguments(approvalArguments);
             setPendingPermission(payload.permission === 'change' ? 'change' : 'command');
           }
         } else if (type === 'text') {
@@ -470,11 +723,11 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
         } else if (type === 'error') {
           const errorMessage = String(payload.message || '无法连接 AI Agent');
           addEvent('Agent 请求失败', errorMessage, 'error');
-          if (errorMessage.includes('后台任务不存在') && socketSessionId) {
-            delete sessionJobsRef.current[socketSessionId];
+          if (errorMessage.includes('后台任务不存在') && sessionIdRef.current) {
+            delete sessionJobsRef.current[sessionIdRef.current];
             localStorage.setItem('script-ai-active-jobs', JSON.stringify(sessionJobsRef.current));
             keepSubscribedRef.current = false;
-            if (socketSessionId === sessionIdRef.current) {
+            if (sessionIdRef.current === sessionIdRef.current) {
               jobIdRef.current = null;
               activeRequestRef.current = '';
               setRunning(false);
@@ -493,14 +746,13 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
             }
           }
           activeRequestRef.current = '';
-          if (socketSessionId) {
-            delete sessionJobsRef.current[socketSessionId];
+          if (sessionIdRef.current) {
+            delete sessionJobsRef.current[sessionIdRef.current];
             localStorage.setItem('script-ai-active-jobs', JSON.stringify(sessionJobsRef.current));
           }
-          if (socketSessionId === sessionIdRef.current) jobIdRef.current = null;
-          keepSubscribedRef.current = false;
+          if (sessionIdRef.current === sessionIdRef.current) jobIdRef.current = null;
+          keepSubscribedRef.current = true;
           setRunning(false);
-          socket.close();
         }
       } catch (error: any) {
         addEvent('Agent 事件解析失败', error?.message || '无效事件', 'error');
@@ -508,15 +760,15 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
     };
 
     socket.onerror = () => {
-      addEvent('AI 连接异常', '任务仍在服务端运行，重新打开工作台后会继续接收结果', 'warning');
+      addEvent('AI 连接异常', jobIdRef.current ? '任务仍在服务端运行，连接恢复后会继续接收结果' : '会话连接将自动恢复', 'warning');
     };
     socket.onclose = () => {
       if (socketRef.current === socket) socketRef.current = null;
-      if (keepSubscribedRef.current && jobIdRef.current) {
-        setRunning(true);
+      if (keepSubscribedRef.current) {
+        setRunning(Boolean(jobIdRef.current));
         reconnectTimerRef.current = window.setTimeout(() => {
           reconnectTimerRef.current = null;
-          if (keepSubscribedRef.current && socketSessionId === sessionIdRef.current && jobIdRef.current && !socketRef.current) connectJob(jobIdRef.current, undefined, socketSessionId);
+          if (keepSubscribedRef.current && !socketRef.current) connectJob(jobIdRef.current || undefined);
         }, 1000);
       } else if (jobIdRef.current) {
         setRunning(false);
@@ -534,22 +786,27 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
       void compressSession();
       return;
     }
+    pendingApprovalRef.current = null;
     setPendingPermission(null);
     setPendingToolCallId(null);
     setPendingToolName('');
     setPendingToolArguments(null);
     setRunning(true);
-    setProviderContextTokens(null);
+    assistantTextRef.current = '';
+    assistantSegmentRef.current = null;
+    streamedTextRef.current = false;
+    toolInteractionRef.current = false;
+    conversationSyncRef.current = false;
     setCacheUsage(null);
     setPrompt('');
     setDraftChanges(null);
     keepSubscribedRef.current = true;
     sessionIdRef.current = sessionId;
-    lastSequenceRef.current = 0;
+    lastSequencesRef.current = {};
     activeRequestRef.current = request;
     assistantTextRef.current = '';
     setFeedItems((previous) => [...previous, { kind: 'message', message: { role: 'user', content: request } }]);
-    connectJob(undefined, {
+    connectJob(jobIdRef.current || undefined, {
       mode: 'agent',
       prompt: request,
       file_name: contextEnabled ? fileName : undefined,
@@ -566,9 +823,12 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
 
 
   const respondToToolApproval = (decision: 'approve' | 'reject', remember = false) => {
+    if (!pendingToolCallId) return;
+    const approval = { callId: pendingToolCallId, decision, remember };
+    pendingApprovalRef.current = approval;
     const socket = socketRef.current;
-    if (!pendingToolCallId || !socket || socket.readyState !== WebSocket.OPEN) {
-      Message.warning('AI 连接已断开，请等待连接恢复后再审批');
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      Message.info('审批决定已暂存，连接恢复后会自动提交');
       return;
     }
     socket.send(JSON.stringify({
@@ -576,6 +836,7 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
       tool_call_id: pendingToolCallId,
       ...(decision === 'approve' ? { remember } : {}),
     }));
+    pendingApprovalRef.current = null;
     setPendingPermission(null);
     setPendingToolCallId(null);
     setPendingToolName('');
@@ -584,12 +845,11 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
 
   const stopAgent = () => {
     if (!running || !socketRef.current || socketRef.current.readyState !== WebSocket.OPEN) return;
-    socketRef.current.send(JSON.stringify({ type: 'cancel' }));
+    const jobId = jobIdRef.current || (sessionIdRef.current ? sessionJobsRef.current[sessionIdRef.current] : null);
+    socketRef.current.send(JSON.stringify({ type: 'cancel', job_id: jobId || null }));
   };
   const compressSession = async () => {
     if (!sessionId || running || conversation.length < 2) return;
-    const confirmed = window.confirm('压缩当前会话的历史上下文？压缩后将用摘要替换旧消息，无法恢复原始历史。');
-    if (!confirmed) return;
     setFeedItems((previous) => [...previous, {
       kind: 'event' as const,
       event: { id: Date.now(), label: '开始压缩上下文', detail: `正在整理当前 ${conversation.length} 条历史消息并生成摘要`, tone: 'warning' as const },
@@ -659,15 +919,25 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
     sessionIdRef.current = sessionId;
     jobIdRef.current = sessionId ? sessionJobsRef.current[sessionId] || null : null;
     keepSubscribedRef.current = visible;
-    if (visible && sessionId && jobIdRef.current && !socketRef.current) connectJob(jobIdRef.current, undefined, sessionId);
-    return () => {
-      keepSubscribedRef.current = false;
-      if (reconnectTimerRef.current !== null) window.clearTimeout(reconnectTimerRef.current);
-      reconnectTimerRef.current = null;
-      socketRef.current?.close();
-      socketRef.current = null;
-    };
+    if (visible && sessionId && jobIdRef.current && !socketRef.current) connectJob(jobIdRef.current);
   }, [visible, sessionId]);
+
+  useEffect(() => {
+    if (visible) return;
+    keepSubscribedRef.current = false;
+    if (reconnectTimerRef.current !== null) window.clearTimeout(reconnectTimerRef.current);
+    reconnectTimerRef.current = null;
+    socketRef.current?.close();
+    socketRef.current = null;
+  }, [visible]);
+
+  useEffect(() => () => {
+    keepSubscribedRef.current = false;
+    if (reconnectTimerRef.current !== null) window.clearTimeout(reconnectTimerRef.current);
+    reconnectTimerRef.current = null;
+    socketRef.current?.close();
+    socketRef.current = null;
+  }, []);
 
   const applyDraft = async (remember = false) => {
     if (!draftChanges || draftChanges.length === 0) return;
@@ -725,14 +995,16 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
   };
 
   const selectSession = (value: string) => {
-    keepSubscribedRef.current = false;
-    socketRef.current?.close();
-    socketRef.current = null;
     sessionIdRef.current = value;
     jobIdRef.current = sessionJobsRef.current[value] || null;
-    lastSequenceRef.current = 0;
+    lastSequencesRef.current = {};
     activeRequestRef.current = '';
-    setRunning(false);
+    keepSubscribedRef.current = true;
+    setRunning(Boolean(jobIdRef.current));
+    const socket = socketRef.current;
+    if (socket?.readyState === WebSocket.OPEN && jobIdRef.current) {
+      socket.send(JSON.stringify({ type: 'subscribe', job_id: jobIdRef.current }));
+    }
     setSessionId(value);
     setDraftChanges(null);
     setPendingPermission(null);
@@ -990,6 +1262,34 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
           <div className="script-ai-permission">
             <strong>{pendingPermission === 'change' ? '该操作需要文件写入权限' : '该操作需要命令执行权限'}</strong>
             <pre className="script-ai-permission-command">{formatToolApproval(pendingToolName, pendingToolArguments)}</pre>
+            {pendingFileChange && (
+              <div className="script-ai-inline-diff">
+                <div className="script-ai-diff-heading">
+                  <span><IconCode /> 执行前变更预览 · {pendingFileChange.path}</span>
+                  <Button
+                    type="text"
+                    size="mini"
+                    onClick={() => setShowFullDiff(true)}
+                    aria-label="查看完整文件 diff"
+                    title="查看完整文件 diff"
+                  >
+                    查看全部
+                  </Button>
+                </div>
+                {diffPreview.length > 0 ? (
+                  <div className="script-ai-diff">
+                    {diffPreview.map((line, index) => (
+                      <div key={line.type + '-' + index} className={line.type === 'remove' ? 'diff-remove' : line.type === 'add' ? 'diff-add' : 'diff-gap'}>
+                        {renderDiffLine(line, index, diffPreview)}
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <pre className="script-ai-new-file-preview">{(pendingFileChange.content || '').slice(0, 2400)}</pre>
+                )}
+                {diffTruncated && <span className="script-ai-diff-more">已缩略显示 {fullDiff.length - diffPreview.length} 行，点击“查看全部”查看完整内容</span>}
+              </div>
+            )}
             <div className="script-ai-permission-actions">
               <Button size="small" type="primary" onClick={() => respondToToolApproval('approve')}>允许</Button>
               <Button size="small" onClick={() => respondToToolApproval('approve', true)}>本会话允许</Button>
@@ -1016,8 +1316,8 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
                 {change.path === filePath && diffPreview.length > 0 ? (
                   <div className="script-ai-diff">
                     {diffPreview.map((line, index) => (
-                      <div key={line.type + '-' + index} className={line.type === 'remove' ? 'diff-remove' : 'diff-add'}>
-                        {(line.type === 'remove' ? '- ' : '+ ') + (line.text || ' ')}
+                      <div key={line.type + '-' + index} className={line.type === 'remove' ? 'diff-remove' : line.type === 'add' ? 'diff-add' : 'diff-gap'}>
+                        {renderDiffLine(line, index, diffPreview)}
                       </div>
                     ))}
                   </div>
@@ -1036,6 +1336,27 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
           </Card>
         )}
       </div>
+
+      <Modal
+        title={'完整变更 · ' + (activePreviewChange?.path || '')}
+        visible={showFullDiff}
+        onCancel={() => setShowFullDiff(false)}
+        footer={null}
+        wrapClassName="script-ai-full-diff-modal-wrap"
+        className="script-ai-full-diff-modal"
+      >
+        {activePreviewChange && (
+          <div className="script-ai-full-diff">
+            {fullDiff.length > 0 ? fullDiff.map((line, index) => (
+              <div key={line.type + '-' + index} className={line.type === 'remove' ? 'diff-remove' : line.type === 'add' ? 'diff-add' : 'diff-gap'}>
+                {renderDiffLine(line, index, fullDiff)}
+              </div>
+            )) : (
+              <pre>{activePreviewChange.content || ''}</pre>
+            )}
+          </div>
+        )}
+      </Modal>
 
       <div className="script-ai-composer">
         {commandSuggestionsVisible && prompt.trimStart().startsWith('/') && !prompt.includes(' ') && !running && (
@@ -1075,8 +1396,10 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
         <div className="script-ai-composer-footer">
           <span>
             当前上下文：{providerContextTokens !== null
-              ? `${formatTokenCount(providerContextTokens)} tokens${cacheUsage ? `（${formatTokenCount(cacheUsage.hit)}）` : ''}`
-              : `估算约 ${formatTokenCount(currentContextTokens)} tokens`}
+              ? `${formatTokenCount(providerContextTokens)} tokens${cacheUsage && !running ? `（${formatTokenCount(cacheUsage.hit)}）` : ''}`
+              : running
+                ? '计算中...'
+                : `估算约 ${formatTokenCount(currentContextTokens)} tokens`}
           </span>
           <Space>
             <Dropdown

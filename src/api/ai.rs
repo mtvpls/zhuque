@@ -1,6 +1,7 @@
 use crate::api::AppState;
 use crate::models::{
-    AiConfig, Claims, CreateEnvVar, CreateTask, CronInput, UpdateEnvVar, UpdateTask,
+    AiConfig, Claims, CreateDependence, CreateEnvVar, CreateTask, CronInput, DependenceType,
+    UpdateEnvVar, UpdateTask,
 };
 use axum::{
     extract::{
@@ -581,9 +582,11 @@ async fn compress_json_messages(
     messages: &mut Vec<Value>,
     config: &AiConfig,
     force: bool,
+    observed_tokens: Option<usize>,
 ) -> Result<CompressionOutcome, String> {
     let total = messages.iter().map(value_tokens).sum::<usize>();
-    if (!force && total <= compression_trigger(config)) || messages.len() <= 1 {
+    let measured_total = total.max(observed_tokens.unwrap_or(0));
+    if (!force && measured_total <= compression_trigger(config)) || messages.len() <= 1 {
         return Ok(CompressionOutcome {
             changed: false,
             provider_usage: None,
@@ -625,12 +628,35 @@ async fn compress_json_messages(
     let recent_start = messages.len().saturating_sub(recent.len());
     let old = &messages[1..recent_start];
     if old.is_empty() {
-        fallback_compact_json_messages(messages, config);
+        // Provider 实际 token 可能包含本地估算遗漏的协议开销或缓存内容；此时仍必须压缩。
+        let source = messages[1..]
+            .iter()
+            .map(|value| {
+                let role = value.get("role").and_then(Value::as_str).unwrap_or("message");
+                let content = value.get("content").and_then(Value::as_str).unwrap_or("");
+                format!("{role}: {content}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let compacted = vec![
+            messages
+                .first()
+                .cloned()
+                .unwrap_or_else(|| json!({"role":"system","content":""})),
+            json!({
+                "role": "system",
+                "content": format!("[历史上下文压缩摘要]\n{}", trim_to_tokens(&source, target)),
+            }),
+        ];
+        let changed = compacted != *messages;
+        if changed {
+            *messages = compacted;
+        }
         return Ok(CompressionOutcome {
-            changed: messages.iter().map(value_tokens).sum::<usize>() < total,
+            changed,
             provider_usage: None,
             request_estimate: 0,
-            source_estimate: 0,
+            source_estimate: estimate_tokens(&source),
         });
     }
 
@@ -866,6 +892,54 @@ fn agent_tools() -> Value {
         json!({
             "type": "function",
             "function": {
+                "name": "list_dependencies",
+                "description": "列出已登记的 Python、Node.js 或 Linux 依赖及其安装状态。",
+                "parameters": {
+                    "type": "object", "properties": {
+                        "type": { "type": "string", "enum": ["nodejs", "python", "linux"] }
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "install_dependency",
+                "description": "通过依赖管理器登记并安装依赖。需要 Python、Node.js 或 Linux 依赖时必须使用此工具，不得使用 shell、pip、npm 或 apt 直接安装。",
+                "parameters": {
+                    "type": "object", "properties": {
+                        "name": { "type": "string" },
+                        "type": { "type": "string", "enum": ["nodejs", "python", "linux"] },
+                        "remark": { "type": "string" }
+                    }, "required": ["name", "type"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "uninstall_dependency",
+                "description": "卸载并删除已登记的依赖。必须先确认依赖 id。",
+                "parameters": {
+                    "type": "object", "properties": { "id": { "type": "integer" } },
+                    "required": ["id"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "reinstall_dependency",
+                "description": "重新安装已登记的依赖。必须先确认依赖 id。",
+                "parameters": {
+                    "type": "object", "properties": { "id": { "type": "integer" } },
+                    "required": ["id"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": "web_search",
                 "description": "联网搜索公开网页，返回标题、摘要和链接；需要实时信息时使用。",
                 "parameters": {
@@ -974,6 +1048,40 @@ fn scope_agent_path(directory: Option<&str>, path: &str) -> String {
     } else {
         format!("{base}/{requested}")
     }
+}
+
+async fn build_file_change_preview(
+    state: &AppState,
+    tool: &str,
+    arguments: &Value,
+    attached_directory: Option<&str>,
+) -> Option<Value> {
+    if !matches!(tool, "edit_file" | "write_file") {
+        return None;
+    }
+
+    let requested_path = arguments.get("path").and_then(Value::as_str)?;
+    let path = scope_agent_path(attached_directory, requested_path);
+    let before = state.script_service.read(&path).await.unwrap_or_default();
+    let after = if tool == "write_file" {
+        arguments.get("content").and_then(Value::as_str)?.to_string()
+    } else {
+        let old_string = arguments.get("old_string").and_then(Value::as_str)?;
+        let new_string = arguments.get("new_string").and_then(Value::as_str)?;
+        let replace_all = arguments.get("replace_all").and_then(Value::as_bool).unwrap_or(true);
+        if replace_all {
+            before.replace(old_string, new_string)
+        } else {
+            before.replacen(old_string, new_string, 1)
+        }
+    };
+
+    Some(json!({
+        "path": path,
+        "before": before,
+        "after": after,
+        "operation": if tool == "write_file" { "write" } else { "edit" },
+    }))
 }
 
 async fn search_workspace(
@@ -1234,7 +1342,8 @@ fn required_tool_permission(name: &str) -> Option<&'static str> {
         "write_file" | "edit_file" | "delete_file" => Some("change"),
         "run_script" | "run_command"
         | "create_task" | "update_task" | "delete_task"
-        | "create_env_var" | "update_env_var" | "delete_env_var" => Some("command"),
+        | "create_env_var" | "update_env_var" | "delete_env_var"
+        | "install_dependency" | "uninstall_dependency" | "reinstall_dependency" => Some("command"),
         _ => None,
     }
 }
@@ -1342,6 +1451,46 @@ async fn execute_agent_tool(
             let path = arguments.get("path").and_then(Value::as_str).unwrap_or("");
             let path = scope_agent_path(attached_directory, path);
             search_workspace(&state.script_service, &path, &query).await
+        }
+        "list_dependencies" => {
+            let dep_type = arguments.get("type").and_then(Value::as_str).and_then(|value| match value {
+                "nodejs" => Some(DependenceType::NodeJS),
+                "python" => Some(DependenceType::Python),
+                "linux" => Some(DependenceType::Linux),
+                _ => None,
+            });
+            let dependencies = state.dependence_service.list(dep_type).await.map_err(|e| e.to_string())?;
+            serde_json::to_value(dependencies).map_err(|e| e.to_string())
+        }
+        "install_dependency" => {
+            let name = argument_string(arguments, "name")?;
+            let dep_type = match argument_string(arguments, "type")?.as_str() {
+                "nodejs" => DependenceType::NodeJS,
+                "python" => DependenceType::Python,
+                "linux" => DependenceType::Linux,
+                value => return Err(format!("不支持的依赖类型: {value}")),
+            };
+            let dependence = state.dependence_service.create(CreateDependence {
+                name,
+                dep_type,
+                remark: arguments.get("remark").and_then(Value::as_str).map(ToOwned::to_owned),
+            }).await.map_err(|e| e.to_string())?;
+            Ok(json!({ "accepted": true, "dependency": dependence, "message": "依赖已加入安装队列" }))
+        }
+        "uninstall_dependency" => {
+            let args: IdToolArgs = parse_tool_args(arguments)?;
+            if !state.dependence_service.delete(args.id).await.map_err(|e| e.to_string())? {
+                return Err("依赖不存在".to_string());
+            }
+            Ok(json!({ "deleted": true, "id": args.id }))
+        }
+        "reinstall_dependency" => {
+            let args: IdToolArgs = parse_tool_args(arguments)?;
+            if state.dependence_service.get(args.id).await.map_err(|e| e.to_string())?.is_none() {
+                return Err("依赖不存在".to_string());
+            }
+            state.dependence_service.reinstall(args.id).await.map_err(|e| e.to_string())?;
+            Ok(json!({ "accepted": true, "id": args.id, "message": "依赖已加入重装队列" }))
         }
         "list_tasks" => {
             let search = arguments.get("search").and_then(Value::as_str);
@@ -1497,6 +1646,7 @@ struct PendingToolApproval {
 
 #[derive(Debug)]
 struct AiJob {
+    job_id: String,
     session_id: Option<String>,
     user_key: String,
     sender: broadcast::Sender<String>,
@@ -1508,6 +1658,10 @@ struct AiJob {
 
 static AI_JOBS: Lazy<RwLock<HashMap<String, Arc<AiJob>>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
+static AI_WS_EVENTS: Lazy<broadcast::Sender<(String, String)>> = Lazy::new(|| {
+    let (sender, _) = broadcast::channel(1024);
+    sender
+});
 
 #[derive(Debug, Deserialize)]
 pub struct AgentWsQuery {
@@ -1519,8 +1673,10 @@ pub struct AgentWsQuery {
 enum AgentWsMessage {
     #[serde(rename = "start")]
     Start { request: AiChatRequest },
+    #[serde(rename = "subscribe")]
+    Subscribe { job_id: Option<String> },
     #[serde(rename = "cancel")]
-    Cancel,
+    Cancel { job_id: Option<String> },
     #[serde(rename = "approve_tool")]
     ApproveTool {
         tool_call_id: String,
@@ -1551,6 +1707,7 @@ async fn wait_for_tool_approval(
     tool: &str,
     arguments: &Value,
     permission: &str,
+    diff: Option<Value>,
 ) -> ToolApprovalDecision {
     {
         let mut pending = job.pending_tool.lock().await;
@@ -1565,6 +1722,7 @@ async fn wait_for_tool_approval(
         "tool": tool,
         "permission": permission,
         "arguments": redact_tool_arguments(tool, arguments),
+        "diff": diff,
     })).await;
 
     loop {
@@ -1597,9 +1755,15 @@ async fn publish_job(job: &Arc<AiJob>, payload: Value) {
     let sequence = {
         let mut events = job.events.write().await;
         let sequence = events.len() as u64 + 1;
-        let message = json!({ "seq": sequence, "event": payload }).to_string();
+        let message = json!({
+            "seq": sequence,
+            "job_id": job.job_id,
+            "session_id": job.session_id,
+            "event": payload,
+        }).to_string();
         events.push(message.clone());
-        let _ = job.sender.send(message);
+        let _ = job.sender.send(message.clone());
+        let _ = AI_WS_EVENTS.send((job.user_key.clone(), message));
         sequence
     };
     let _ = sequence;
@@ -1690,8 +1854,23 @@ async fn run_agent_job(state: Arc<AppState>, request: AiChatRequest, job: Arc<Ai
     let tools = agent_tools();
     let mut allow_commands = request.allow_commands;
     let mut allow_changes = request.allow_changes;
+    let mut observed_context_tokens = load_session_context_tokens(
+        &state,
+        request.session_id.as_deref(),
+        &job.user_key,
+    ).await;
     'agent_loop: loop {
-        if let Err(error) = compress_json_messages(
+        let measured_context_tokens = messages.iter().map(value_tokens).sum::<usize>()
+            .max(observed_context_tokens.unwrap_or(0));
+        let should_compact = messages.len() > 1
+            && measured_context_tokens > compression_trigger(&config);
+        if should_compact {
+            publish_job(&job, json!({
+                "type": "context_compacting",
+                "tokens": measured_context_tokens,
+            })).await;
+        }
+        let compression = compress_json_messages(
             &client,
             &endpoint,
             protocol,
@@ -1700,11 +1879,55 @@ async fn run_agent_job(state: Arc<AppState>, request: AiChatRequest, job: Arc<Ai
             &mut messages,
             &config,
             false,
+            observed_context_tokens,
         )
-        .await
-        {
-            tracing::warn!("{error}; falling back to local context compaction");
-            fallback_compact_json_messages(&mut messages, &config);
+        .await;
+        observed_context_tokens = None;
+        match compression {
+            Ok(outcome) if outcome.changed => {
+                let _ = store_agent_protocol_messages(
+                    &state,
+                    request.session_id.as_deref(),
+                    &job.user_key,
+                    &messages,
+                ).await;
+                clear_session_context_tokens(
+                    &state,
+                    request.session_id.as_deref(),
+                    &job.user_key,
+                ).await;
+                publish_job(&job, json!({
+                    "type": "context_compacted",
+                    "compressed": true,
+                    "messages": agent_history_for_client(&messages),
+                })).await;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!("{error}; falling back to local context compaction");
+                let before_tokens = messages.iter().map(value_tokens).sum::<usize>();
+                fallback_compact_json_messages(&mut messages, &config);
+                let changed = messages.iter().map(value_tokens).sum::<usize>() < before_tokens;
+                if changed {
+                    let _ = store_agent_protocol_messages(
+                        &state,
+                        request.session_id.as_deref(),
+                        &job.user_key,
+                        &messages,
+                    ).await;
+                    clear_session_context_tokens(
+                        &state,
+                        request.session_id.as_deref(),
+                        &job.user_key,
+                    ).await;
+                    publish_job(&job, json!({
+                        "type": "context_compacted",
+                        "compressed": true,
+                        "source": "local",
+                        "messages": agent_history_for_client(&messages),
+                    })).await;
+                }
+            }
         }
         if job.cancel.is_cancelled() {
             publish_job(&job, json!({"type":"cancelled","message":"任务已取消"})).await;
@@ -1712,19 +1935,26 @@ async fn run_agent_job(state: Arc<AppState>, request: AiChatRequest, job: Arc<Ai
             publish_job(&job, json!({"type":"done"})).await;
             return;
         }
-        let response = match call_agent_provider(
-            &client,
-            &endpoint,
-            protocol,
-            &config.api_key,
-            &config.model,
-            &messages,
-            &tools,
-            request.session_id.as_deref().map(|id| id),
-            Some(&job),
-        )
-        .await
-        {
+        let provider_response = tokio::select! {
+            _ = job.cancel.cancelled() => {
+                publish_job(&job, json!({"type":"cancelled","message":"任务已取消"})).await;
+                set_session_job(&state, request.session_id.as_deref(), &job.user_key, None).await;
+                publish_job(&job, json!({"type":"done"})).await;
+                return;
+            }
+            result = call_agent_provider(
+                &client,
+                &endpoint,
+                protocol,
+                &config.api_key,
+                &config.model,
+                &messages,
+                &tools,
+                request.session_id.as_deref().map(|id| id),
+                Some(&job),
+            ) => result,
+        };
+        let response = match provider_response {
             Ok(value) => value,
             Err(error) => {
                 publish_job(&job, json!({"type":"error","message":error})).await;
@@ -1766,6 +1996,70 @@ async fn run_agent_job(state: Arc<AppState>, request: AiChatRequest, job: Arc<Ai
             .unwrap_or_default();
         messages.push(response.clone());
         if tool_calls.is_empty() {
+            if let Some(actual_tokens) = provider_context_tokens(provider_usage, protocol) {
+                if actual_tokens > compression_trigger(&config) {
+                    publish_job(&job, json!({
+                        "type": "context_compacting",
+                        "tokens": actual_tokens,
+                    })).await;
+                    match compress_json_messages(
+                        &client,
+                        &endpoint,
+                        protocol,
+                        &config.api_key,
+                        &config.model,
+                        &mut messages,
+                        &config,
+                        false,
+                        Some(actual_tokens),
+                    ).await {
+                        Ok(outcome) if outcome.changed => {
+                            let _ = store_agent_protocol_messages(
+                                &state,
+                                request.session_id.as_deref(),
+                                &job.user_key,
+                                &messages,
+                            ).await;
+                            clear_session_context_tokens(
+                                &state,
+                                request.session_id.as_deref(),
+                                &job.user_key,
+                            ).await;
+                            publish_job(&job, json!({
+                                "type": "context_compacted",
+                                "compressed": true,
+                                "messages": agent_history_for_client(&messages),
+                            })).await;
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!("{error}; falling back to local context compaction");
+                            let before_tokens = messages.iter().map(value_tokens).sum::<usize>();
+                            fallback_compact_json_messages(&mut messages, &config);
+                            let changed = messages.iter().map(value_tokens).sum::<usize>() < before_tokens;
+                            if changed {
+                                let _ = store_agent_protocol_messages(
+                                    &state,
+                                    request.session_id.as_deref(),
+                                    &job.user_key,
+                                    &messages,
+                                ).await;
+                                clear_session_context_tokens(
+                                    &state,
+                                    request.session_id.as_deref(),
+                                    &job.user_key,
+                                ).await;
+                                publish_job(&job, json!({
+                                    "type": "context_compacted",
+                                    "compressed": true,
+                                    "source": "local",
+                                    "messages": agent_history_for_client(&messages),
+                                })).await;
+                            }
+                        }
+                    }
+                }
+            }
             break;
         }
         for call in tool_calls {
@@ -1791,7 +2085,8 @@ async fn run_agent_job(state: Arc<AppState>, request: AiChatRequest, job: Arc<Ai
             let mut tool_allow_changes = allow_changes;
             if let Some(permission) = required_tool_permission(name) {
                 if !tool_permission_granted(name, tool_allow_commands, tool_allow_changes) {
-                    match wait_for_tool_approval(&job, call_id, name, &arguments, permission).await {
+                    let diff = build_file_change_preview(&state, name, &arguments, request.directory_path.as_deref()).await;
+                    match wait_for_tool_approval(&job, call_id, name, &arguments, permission, diff).await {
                         ToolApprovalDecision::Approved { remember } => {
                             match permission {
                                 "command" => {
@@ -1859,6 +2154,30 @@ pub async fn agent_ws(
     ws.on_upgrade(move |socket| handle_agent_ws(socket, query.job_id, state, sub))
 }
 
+async fn create_agent_job(
+    state: &Arc<AppState>,
+    request: &AiChatRequest,
+    user_key: &str,
+) -> Arc<AiJob> {
+    let job_id = uuid::Uuid::new_v4().to_string();
+    let (job_sender, _) = broadcast::channel(256);
+    let job = Arc::new(AiJob {
+        job_id: job_id.clone(),
+        session_id: request.session_id.clone(),
+        user_key: user_key.to_string(),
+        sender: job_sender,
+        events: RwLock::new(Vec::new()),
+        cancel: CancellationToken::new(),
+        pending_tool: Mutex::new(None),
+        approval_notify: Notify::new(),
+    });
+    set_session_job(state, request.session_id.as_deref(), user_key, Some(&job_id)).await;
+    AI_JOBS.write().await.insert(job_id.clone(), job.clone());
+    publish_job(&job, json!({"type":"job_started","job_id":job_id})).await;
+    tokio::spawn(run_agent_job(state.clone(), request.clone(), job.clone()));
+    job
+}
+
 async fn handle_agent_ws(
     socket: WebSocket,
     requested_job_id: Option<String>,
@@ -1866,114 +2185,73 @@ async fn handle_agent_ws(
     user_key: String,
 ) {
     let (mut sender, mut receiver) = socket.split();
-    let job = if let Some(job_id) = requested_job_id {
-        match AI_JOBS
-            .read()
-            .await
-            .get(&job_id)
-            .filter(|job| job.user_key == user_key)
-            .cloned()
-        {
-            Some(job) => Some(job),
-            None => {
-                let _ = sender
-                    .send(Message::Text(
-                        json!({"type":"error","message":"后台任务不存在或已过期"})
-                            .to_string()
-                            .into(),
-                    ))
-                    .await;
-                return;
-            }
-        }
-    } else {
-        None
-    };
-    let job = match job {
-        Some(job) => job,
-        None => {
-            let Some(Ok(Message::Text(message))) = receiver.next().await else {
-                return;
-            };
-            let Ok(AgentWsMessage::Start { request }) =
-                serde_json::from_str::<AgentWsMessage>(&message)
-            else {
-                let _ = sender
-                    .send(Message::Text(
-                        json!({"type":"error","message":"首条 WebSocket 消息必须是 start"})
-                            .to_string()
-                            .into(),
-                    ))
-                    .await;
-                return;
-            };
-            let job_id = uuid::Uuid::new_v4().to_string();
-            let (job_sender, _) = broadcast::channel(256);
-            let job = Arc::new(AiJob {
-                session_id: request.session_id.clone(),
-                user_key: user_key.clone(),
-                sender: job_sender,
-                events: RwLock::new(Vec::new()),
-                cancel: CancellationToken::new(),
-                pending_tool: Mutex::new(None),
-                approval_notify: Notify::new(),
-            });
-            set_session_job(
-                &state,
-                request.session_id.as_deref(),
-                &user_key,
-                Some(&job_id),
-            )
-            .await;
-            AI_JOBS.write().await.insert(job_id.clone(), job.clone());
-            publish_job(&job, json!({"type":"job_started","job_id":job_id})).await;
-            let job_for_task = job.clone();
-            tokio::spawn(run_agent_job(state, request, job_for_task));
-            job
-        }
-    };
-    let mut events = job.sender.subscribe();
-    let replay = job.events.read().await.clone();
-    let mut last_sequence = 0u64;
-    for message in replay {
-        if let Ok(value) = serde_json::from_str::<Value>(&message) {
-            last_sequence = value
-                .get("seq")
-                .and_then(Value::as_u64)
-                .unwrap_or(last_sequence);
-        }
-        if sender.send(Message::Text(message.into())).await.is_err() {
-            return;
+    let mut all_events = AI_WS_EVENTS.subscribe();
+    let mut current_job: Option<Arc<AiJob>> = None;
+    if let Some(job_id) = requested_job_id {
+        current_job = AI_JOBS.read().await.get(&job_id).filter(|job| job.user_key == user_key).cloned();
+    }
+    let replay_jobs: Vec<Arc<AiJob>> = AI_JOBS.read().await.values()
+        .filter(|job| job.user_key == user_key)
+        .cloned()
+        .collect();
+    for job in replay_jobs {
+        for message in job.events.read().await.clone() {
+            if sender.send(Message::Text(message.into())).await.is_err() { return; }
         }
     }
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
+
     loop {
         tokio::select! {
+            _ = heartbeat.tick() => {
+                if sender.send(Message::Ping(Vec::new().into())).await.is_err() { return; }
+            }
             incoming = receiver.next() => {
                 match incoming {
-                    Some(Ok(Message::Text(message))) => {
-                        match serde_json::from_str::<AgentWsMessage>(&message) {
-                            Ok(AgentWsMessage::Cancel) => job.cancel.cancel(),
-                            Ok(AgentWsMessage::ApproveTool { tool_call_id, remember }) => {
-                                resolve_tool_approval(&job, &tool_call_id, ToolApprovalDecision::Approved { remember }).await;
-                            }
-                            Ok(AgentWsMessage::RejectTool { tool_call_id }) => {
-                                resolve_tool_approval(&job, &tool_call_id, ToolApprovalDecision::Rejected).await;
-                            }
-                            _ => {}
+                    Some(Ok(Message::Text(message))) => match serde_json::from_str::<AgentWsMessage>(&message) {
+                        Ok(AgentWsMessage::Start { request }) => {
+                            current_job = Some(create_agent_job(&state, &request, &user_key).await);
                         }
-                    }
+                        Ok(AgentWsMessage::Subscribe { job_id }) => {
+                            current_job = match job_id {
+                                Some(job_id) => AI_JOBS.read().await.get(&job_id).filter(|job| job.user_key == user_key).cloned(),
+                                None => None,
+                            };
+                            if let Some(job) = current_job.as_ref() {
+                                for message in job.events.read().await.clone() {
+                                    if sender.send(Message::Text(message.into())).await.is_err() { return; }
+                                }
+                            }
+                        }
+                        Ok(AgentWsMessage::Cancel { job_id }) => {
+                            let job = match job_id {
+                                Some(job_id) => AI_JOBS.read().await.get(&job_id).filter(|job| job.user_key == user_key).cloned(),
+                                None => current_job.clone(),
+                            };
+                            if let Some(job) = job { job.cancel.cancel(); }
+                        }
+                        Ok(AgentWsMessage::ApproveTool { tool_call_id, remember }) => {
+                            if let Some(job) = current_job.as_ref() {
+                                resolve_tool_approval(job, &tool_call_id, ToolApprovalDecision::Approved { remember }).await;
+                            }
+                        }
+                        Ok(AgentWsMessage::RejectTool { tool_call_id }) => {
+                            if let Some(job) = current_job.as_ref() {
+                                resolve_tool_approval(job, &tool_call_id, ToolApprovalDecision::Rejected).await;
+                            }
+                        }
+                        _ => {}
+                    },
                     Some(Ok(Message::Close(_))) | None => return,
                     _ => {}
                 }
             }
-            event = events.recv() => {
+            event = all_events.recv() => {
                 match event {
-                    Ok(message) => {
-                        let sequence = serde_json::from_str::<Value>(&message).ok().and_then(|v| v.get("seq").and_then(Value::as_u64)).unwrap_or(0);
-                        if sequence <= last_sequence { continue; }
-                        last_sequence = sequence;
+                    Ok((event_user, message)) if event_user == user_key => {
                         if sender.send(Message::Text(message.into())).await.is_err() { return; }
                     }
+                    Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => return,
                 }
@@ -2519,6 +2797,7 @@ pub async fn compress_session(
         &mut messages,
         &config,
         true,
+        None,
     )
     .await
     {
@@ -2666,6 +2945,41 @@ pub async fn delete_session(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn load_session_context_tokens(
+    state: &AppState,
+    session_id: Option<&str>,
+    user_key: &str,
+) -> Option<usize> {
+    let session_id = session_id.filter(|value| !value.is_empty())?;
+    let pool = state.db_pool.read().await;
+    sqlx::query_scalar::<_, i64>(
+        "SELECT context_tokens FROM ai_sessions WHERE id = ? AND user_key = ? AND context_tokens IS NOT NULL",
+    )
+    .bind(session_id)
+    .bind(user_key)
+    .fetch_optional(&*pool)
+    .await
+    .ok()
+    .flatten()
+    .and_then(|value| usize::try_from(value).ok())
+}
+
+async fn clear_session_context_tokens(
+    state: &AppState,
+    session_id: Option<&str>,
+    user_key: &str,
+) {
+    let Some(session_id) = session_id.filter(|value| !value.is_empty()) else {
+        return;
+    };
+    let pool = state.db_pool.read().await;
+    let _ = sqlx::query("UPDATE ai_sessions SET context_tokens = NULL WHERE id = ? AND user_key = ?")
+        .bind(session_id)
+        .bind(user_key)
+        .execute(&*pool)
+        .await;
+}
+
 async fn set_session_context_tokens(
     state: &AppState,
     session_id: Option<&str>,
@@ -2700,11 +3014,17 @@ async fn set_session_job(
 
 fn agent_history_for_client(messages: &[Value]) -> Vec<Value> {
     messages.iter().filter_map(|message| {
-        let role = message.get("role").and_then(Value::as_str)?;
-        if !matches!(role, "user" | "assistant" | "tool") { return None; }
+        let source_role = message.get("role").and_then(Value::as_str)?;
+        let raw_content = message.get("content").and_then(Value::as_str).unwrap_or("");
+        let role = if source_role == "system" && raw_content.starts_with("[历史上下文压缩摘要]") {
+            "assistant"
+        } else if matches!(source_role, "user" | "assistant" | "tool") {
+            source_role
+        } else {
+            return None;
+        };
         let metadata = message.get("metadata");
         let runtime = metadata.and_then(|value| value.get("runtime_context")).and_then(Value::as_bool) == Some(true);
-        let raw_content = message.get("content").and_then(Value::as_str).unwrap_or("");
         let content = if runtime {
             raw_content.split("\n\n当前请求:\n").nth(1).unwrap_or("")
         } else {
@@ -2739,9 +3059,15 @@ async fn store_agent_protocol_messages(
         .execute(&*pool)
         .await;
     for message in messages {
-        let Some(role) = message.get("role").and_then(Value::as_str) else { continue; };
-        if !matches!(role, "user" | "assistant" | "tool") { continue; }
+        let Some(source_role) = message.get("role").and_then(Value::as_str) else { continue; };
         let content = message.get("content").and_then(Value::as_str).unwrap_or("");
+        let role = if source_role == "system" && content.starts_with("[历史上下文压缩摘要]") {
+            "assistant"
+        } else if matches!(source_role, "user" | "assistant" | "tool") {
+            source_role
+        } else {
+            continue;
+        };
         let is_runtime_context = message.get("metadata").and_then(|value| value.get("runtime_context")).and_then(Value::as_bool) == Some(true);
         let persisted_content = if is_runtime_context {
             message.get("content").and_then(Value::as_str).and_then(|value| value.split("\n\n当前请求:\n").nth(1)).unwrap_or("")
