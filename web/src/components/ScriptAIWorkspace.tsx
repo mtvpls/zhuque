@@ -1055,6 +1055,7 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
             <Dropdown
               trigger="click"
               position="br"
+              triggerProps={{ style: { zIndex: 2147483647 } }}
               droplist={(
                 <Menu selectedKeys={[permissionMode]}>
                   <Menu.Item key="default" onClick={() => setPermissionMode('default')}><Space><IconLock />默认</Space></Menu.Item>
