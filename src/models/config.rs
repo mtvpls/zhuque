@@ -57,6 +57,8 @@ pub struct PythonMirror {
 pub struct AiConfig {
     pub enabled: bool,
     pub provider: String,
+    #[serde(default = "default_ai_protocol")]
+    pub protocol: String,
     pub base_url: String,
     pub api_key: String,
     pub model: String,
@@ -64,6 +66,10 @@ pub struct AiConfig {
     pub context_window_tokens: u32,
     #[serde(default = "default_ai_compression_ratio")]
     pub compression_ratio: u8,
+}
+
+fn default_ai_protocol() -> String {
+    "chat_completions".to_string()
 }
 
 fn default_ai_context_window_tokens() -> u32 {
@@ -87,6 +93,7 @@ impl Default for AiConfig {
         Self {
             enabled: false,
             provider: "OpenAI Compatible".to_string(),
+            protocol: default_ai_protocol(),
             base_url: "https://api.openai.com/v1".to_string(),
             api_key: String::new(),
             model: String::new(),

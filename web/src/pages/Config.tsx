@@ -15,6 +15,7 @@ import {
   Grid,
   Switch,
   Table,
+  Select,
 } from '@arco-design/web-react';
 import { IconSave, IconDownload, IconUpload, IconRefresh } from '@arco-design/web-react/icon';
 import axios from 'axios';
@@ -711,7 +712,14 @@ const Config: React.FC = () => {
                 <FormItem label="Provider 名称" field="provider" rules={[{ required: true, message: '请输入 Provider 名称' }]}>
                   <Input placeholder="OpenAI Compatible / DeepSeek / Ollama" />
                 </FormItem>
-                <FormItem label="Base URL" field="base_url" rules={[{ required: true, message: '请输入 Base URL' }]} extra="服务端会请求 Base URL/chat/completions">
+                <FormItem label="协议" field="protocol" rules={[{ required: true, message: '请选择 AI 协议' }]}>
+                  <Select placeholder="选择 AI 协议">
+                    <Select.Option value="chat_completions">OpenAI Chat Completions（兼容 OpenAI）</Select.Option>
+                    <Select.Option value="responses">OpenAI Responses</Select.Option>
+                    <Select.Option value="claude_messages">Claude Messages</Select.Option>
+                  </Select>
+                </FormItem>
+                <FormItem label="Base URL" field="base_url" rules={[{ required: true, message: '请输入 Base URL' }]}>
                   <Input placeholder="https://api.openai.com/v1" />
                 </FormItem>
                 <FormItem label="API Key" field="api_key">

@@ -24,7 +24,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::HashMap, convert::Infallible, process::Stdio, sync::Arc, time::Duration};
 use tokio::process::Command;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, Mutex, Notify, RwLock};
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
@@ -65,6 +65,7 @@ struct AiConfigResponse {
     enabled: bool,
     provider: String,
     base_url: String,
+    protocol: String,
     api_key: String,
     model: String,
     context_window_tokens: u32,
@@ -77,6 +78,7 @@ impl From<AiConfig> for AiConfigResponse {
             enabled: config.enabled,
             provider: config.provider,
             base_url: config.base_url,
+            protocol: config.protocol,
             api_key: if config.api_key.is_empty() {
                 String::new()
             } else {
@@ -92,6 +94,187 @@ impl From<AiConfig> for AiConfigResponse {
 const COMPRESSED_CONTEXT_TARGET_PERCENT: usize = 60;
 const AI_REQUEST_MAX_ATTEMPTS: usize = 3;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AiProtocol {
+    ChatCompletions,
+    Responses,
+    ClaudeMessages,
+}
+
+impl AiProtocol {
+    fn from_config(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "responses" | "openai_responses" | "response" => Self::Responses,
+            "claude" | "anthropic" | "claude_messages" | "messages" => Self::ClaudeMessages,
+            _ => Self::ChatCompletions,
+        }
+    }
+
+    fn endpoint(&self, base_url: &str) -> String {
+        let base_url = base_url.trim_end_matches('/');
+        let suffix = match self {
+            Self::ChatCompletions => "/chat/completions",
+            Self::Responses => "/responses",
+            Self::ClaudeMessages => "/messages",
+        };
+        if base_url.ends_with(suffix) {
+            base_url.to_string()
+        } else {
+            format!("{base_url}{suffix}")
+        }
+    }
+}
+
+fn protocol_for_config(config: &AiConfig) -> AiProtocol {
+    let configured = AiProtocol::from_config(&config.protocol);
+    if configured == AiProtocol::ChatCompletions {
+        let provider = config.provider.to_ascii_lowercase();
+        if provider.contains("claude") || provider.contains("anthropic") {
+            return AiProtocol::ClaudeMessages;
+        }
+        if provider.contains("response") {
+            return AiProtocol::Responses;
+        }
+    }
+    configured
+}
+
+fn provider_headers(request: reqwest::RequestBuilder, protocol: AiProtocol, api_key: &str) -> reqwest::RequestBuilder {
+    match protocol {
+        AiProtocol::ClaudeMessages => request
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01"),
+        _ => request.bearer_auth(api_key),
+    }
+}
+
+fn text_from_content(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items.iter().filter_map(|item| {
+            item.get("text").and_then(Value::as_str).or_else(|| item.get("content").and_then(Value::as_str))
+        }).collect::<Vec<_>>().join(""),
+        _ => String::new(),
+    }
+}
+
+fn claude_tools(tools: &Value) -> Value {
+    Value::Array(tools.as_array().map(|items| items.iter().filter_map(|tool| {
+        let function = tool.get("function")?;
+        Some(json!({
+            "name": function.get("name")?,
+            "description": function.get("description").and_then(Value::as_str).unwrap_or(""),
+            "input_schema": function.get("parameters").cloned().unwrap_or_else(|| json!({"type":"object","properties":{}})),
+        }))
+    }).collect()).unwrap_or_default())
+}
+
+fn responses_tools(tools: &Value) -> Value {
+    Value::Array(tools.as_array().map(|items| items.iter().filter_map(|tool| {
+        let function = tool.get("function")?;
+        Some(json!({
+            "type": "function",
+            "name": function.get("name")?,
+            "description": function.get("description").and_then(Value::as_str).unwrap_or(""),
+            "parameters": function.get("parameters").cloned().unwrap_or_else(|| json!({"type":"object","properties":{}})),
+            "strict": false,
+        }))
+    }).collect()).unwrap_or_default())
+}
+
+fn message_content_for_protocol(message: &Value, protocol: AiProtocol) -> Value {
+    match protocol {
+        AiProtocol::ChatCompletions => message.get("content").cloned().unwrap_or_else(|| json!("")),
+        AiProtocol::ClaudeMessages => {
+            if message.get("role").and_then(Value::as_str) == Some("tool") {
+                json!([{"type":"tool_result","tool_use_id":message.get("tool_call_id").and_then(Value::as_str).unwrap_or("tool-call"),"content":message.get("content").and_then(Value::as_str).unwrap_or("")}])
+            } else if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+                let mut content = Vec::new();
+                let text = message.get("content").and_then(Value::as_str).unwrap_or("");
+                if !text.is_empty() { content.push(json!({"type":"text","text":text})); }
+                for call in calls {
+                    let function = call.get("function").cloned().unwrap_or(Value::Null);
+                    let arguments = function.get("arguments").and_then(Value::as_str).and_then(|raw| serde_json::from_str::<Value>(raw).ok()).or_else(|| function.get("arguments").cloned()).unwrap_or_else(|| json!({}));
+                    content.push(json!({"type":"tool_use","id":call.get("id").and_then(Value::as_str).unwrap_or("tool-call"),"name":function.get("name").and_then(Value::as_str).unwrap_or(""),"input":arguments}));
+                }
+                Value::Array(content)
+            } else {
+                json!([{"type":"text","text":message.get("content").and_then(Value::as_str).unwrap_or("")}])
+            }
+        }
+        AiProtocol::Responses => message.clone(),
+    }
+}
+
+fn response_output_to_message(value: &Value) -> Option<Value> {
+    let output = value.get("output").and_then(Value::as_array)?;
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    for item in output {
+        match item.get("type").and_then(Value::as_str).unwrap_or("") {
+            "message" => {
+                if let Some(content) = item.get("content") {
+                    text.push_str(&text_from_content(content));
+                }
+            }
+            "function_call" => {
+                tool_calls.push(json!({
+                    "id": item.get("call_id").or_else(|| item.get("id")).cloned().unwrap_or_else(|| json!("tool-call")),
+                    "type": "function",
+                    "function": {"name": item.get("name").cloned().unwrap_or_else(|| json!("")), "arguments": item.get("arguments").cloned().unwrap_or_else(|| json!("{}"))},
+                }));
+            }
+            _ => {}
+        }
+    }
+    if text.is_empty() && tool_calls.is_empty() { return None; }
+    let mut message = json!({"role":"assistant","content":text});
+    if !tool_calls.is_empty() { message["tool_calls"] = Value::Array(tool_calls); }
+    Some(message)
+}
+
+fn claude_response_to_message(value: &Value) -> Option<Value> {
+    let content = value.get("content").and_then(Value::as_array)?;
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    for item in content {
+        match item.get("type").and_then(Value::as_str).unwrap_or("") {
+            "text" => text.push_str(item.get("text").and_then(Value::as_str).unwrap_or("")),
+            "tool_use" => tool_calls.push(json!({"id":item.get("id").cloned().unwrap_or_else(|| json!("tool-call")),"type":"function","function":{"name":item.get("name").cloned().unwrap_or_else(|| json!("")),"arguments":item.get("input").map(Value::to_string).unwrap_or_else(|| "{}".to_string())}})),
+            _ => {}
+        }
+    }
+    if text.is_empty() && tool_calls.is_empty() { return None; }
+    let mut message = json!({"role":"assistant","content":text});
+    if !tool_calls.is_empty() { message["tool_calls"] = Value::Array(tool_calls); }
+    Some(message)
+}
+
+fn protocol_response_to_message(value: &Value, protocol: AiProtocol) -> Option<Value> {
+    match protocol {
+        AiProtocol::Responses => response_output_to_message(value),
+        AiProtocol::ClaudeMessages => claude_response_to_message(value),
+        AiProtocol::ChatCompletions => value.get("choices").and_then(Value::as_array).and_then(|items| items.first()).and_then(|item| item.get("message")).cloned(),
+    }
+}
+
+fn protocol_payload(protocol: AiProtocol, model: &str, messages: &[Value], tools: &Value, stream: bool) -> Value {
+    let clean_messages = messages.iter().map(|message| {
+        let mut message = message.clone();
+        if let Value::Object(object) = &mut message { object.remove("metadata"); }
+        message
+    }).collect::<Vec<_>>();
+    match protocol {
+        AiProtocol::ChatCompletions => json!({"model":model,"stream":stream,"stream_options":{"include_usage":true},"messages":clean_messages,"tools":tools,"tool_choice":"auto"}),
+        AiProtocol::Responses => json!({"model":model,"stream":stream,"input":clean_messages,"tools":responses_tools(tools)}),
+        AiProtocol::ClaudeMessages => {
+            let system = clean_messages.iter().find(|message| message.get("role").and_then(Value::as_str) == Some("system")).and_then(|message| message.get("content")).and_then(Value::as_str).unwrap_or("");
+            let messages = clean_messages.iter().filter(|message| message.get("role").and_then(Value::as_str) != Some("system")).map(|message| json!({"role": if message.get("role").and_then(Value::as_str) == Some("assistant") {"assistant"} else {"user"},"content":message_content_for_protocol(message, protocol)})).collect::<Vec<_>>();
+            json!({"model":model,"max_tokens":8192,"stream":stream,"system":system,"messages":messages,"tools":claude_tools(tools)})
+        }
+    }
+}
+
 fn should_retry_status(status: reqwest::StatusCode) -> bool {
     status.is_server_error()
         || matches!(
@@ -106,15 +289,14 @@ async fn send_json_with_retries(
     client: &Client,
     endpoint: &str,
     api_key: &str,
+    protocol: AiProtocol,
     payload: &Value,
     operation: &str,
     validate: fn(&Value) -> Result<(), String>,
 ) -> Result<Value, String> {
     let mut last_error = String::new();
     for attempt in 1..=AI_REQUEST_MAX_ATTEMPTS {
-        match client
-            .post(endpoint)
-            .bearer_auth(api_key)
+        match provider_headers(client.post(endpoint), protocol, api_key)
             .json(payload)
             .send()
             .await
@@ -158,31 +340,32 @@ async fn send_json_with_retries(
 }
 
 fn validate_compression_response(value: &Value) -> Result<(), String> {
+    if response_output_to_message(value).is_some() || claude_response_to_message(value).is_some() {
+        return Ok(());
+    }
     value
         .get("choices")
         .and_then(Value::as_array)
         .and_then(|choices| choices.first())
         .and_then(|choice| choice.get("message"))
-        .and_then(|message| {
-            message
-                .get("content")
-                .and_then(Value::as_str)
-                .filter(|content| !content.trim().is_empty())
-                .or_else(|| message.get("reasoning_content").and_then(Value::as_str))
-        })
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
         .filter(|content| !content.trim().is_empty())
         .map(|_| ())
-        .ok_or_else(|| "响应缺少摘要内容".to_string())
+        .ok_or_else(|| "AI 压缩响应缺少可用内容".to_string())
 }
 
 fn validate_agent_response(value: &Value) -> Result<(), String> {
+    if response_output_to_message(value).is_some() || claude_response_to_message(value).is_some() {
+        return Ok(());
+    }
     value
         .get("choices")
         .and_then(Value::as_array)
         .and_then(|choices| choices.first())
         .and_then(|choice| choice.get("message"))
         .map(|_| ())
-        .ok_or_else(|| "响应缺少 choices[0].message".to_string())
+        .ok_or_else(|| "AI 响应缺少消息内容".to_string())
 }
 #[derive(Debug, Clone, Copy, Default)]
 struct ProviderUsage {
@@ -208,8 +391,23 @@ struct CompressionOutcome {
     source_estimate: usize,
 }
 
+fn merge_provider_usage(target: &mut Option<ProviderUsage>, incoming: Option<ProviderUsage>) {
+    let Some(incoming) = incoming else { return; };
+    let mut merged = target.unwrap_or_default();
+    if incoming.prompt_tokens.is_some() { merged.prompt_tokens = incoming.prompt_tokens; }
+    if incoming.completion_tokens.is_some() { merged.completion_tokens = incoming.completion_tokens; }
+    if incoming.total_tokens.is_some() { merged.total_tokens = incoming.total_tokens; }
+    if incoming.cache_hit_tokens.is_some() { merged.cache_hit_tokens = incoming.cache_hit_tokens; }
+    if incoming.cache_miss_tokens.is_some() { merged.cache_miss_tokens = incoming.cache_miss_tokens; }
+    *target = Some(merged);
+}
+
 fn provider_usage(value: &Value) -> Option<ProviderUsage> {
-    let usage = value.get("usage")?.as_object()?;
+    let usage = value
+        .get("usage")
+        .or_else(|| value.get("response").and_then(|response| response.get("usage")))
+        .or_else(|| value.get("message").and_then(|message| message.get("usage")))
+        ?.as_object()?;
     let read = |key: &str| usage.get(key).and_then(Value::as_u64).map(|v| v as usize);
     let prompt_tokens = read("prompt_tokens").or_else(|| read("input_tokens"));
     let completion_tokens = read("completion_tokens").or_else(|| read("output_tokens"));
@@ -218,16 +416,13 @@ fn provider_usage(value: &Value) -> Option<ProviderUsage> {
             .zip(completion_tokens)
             .map(|(prompt, completion)| prompt + completion)
     });
-    let cache_hit_tokens = read("prompt_cache_hit_tokens").or_else(|| {
-        usage
-            .get("prompt_tokens_details")
-            .and_then(|details| details.get("cached_tokens"))
-            .and_then(Value::as_u64)
-            .map(|value| value as usize)
-    });
-    let cache_miss_tokens = read("prompt_cache_miss_tokens").or_else(|| {
-        prompt_tokens.zip(cache_hit_tokens).map(|(prompt, hit)| prompt.saturating_sub(hit))
-    });
+    let cache_hit_tokens = read("prompt_cache_hit_tokens")
+        .or_else(|| read("cache_read_input_tokens"))
+        .or_else(|| usage.get("prompt_tokens_details").and_then(|details| details.get("cached_tokens")).and_then(Value::as_u64).map(|value| value as usize))
+        .or_else(|| usage.get("input_token_details").and_then(|details| details.get("cached_tokens")).and_then(Value::as_u64).map(|value| value as usize));
+    let cache_miss_tokens = read("prompt_cache_miss_tokens")
+        .or_else(|| read("cache_creation_input_tokens"))
+        .or_else(|| prompt_tokens.zip(cache_hit_tokens).map(|(prompt, hit)| prompt.saturating_sub(hit)));
     let result = ProviderUsage {
         prompt_tokens,
         completion_tokens,
@@ -241,15 +436,15 @@ fn provider_usage(value: &Value) -> Option<ProviderUsage> {
     .then_some(result)
 }
 
-fn provider_context_tokens(usage: Option<ProviderUsage>) -> Option<usize> {
-    usage.and_then(|value| value.prompt_tokens)
-}
-
-fn provider_context_tokens_without_prompt(
-    usage: Option<ProviderUsage>,
-    prompt: &str,
-) -> Option<usize> {
-    provider_context_tokens(usage).map(|tokens| tokens.saturating_sub(estimate_tokens(prompt)))
+fn provider_context_tokens(usage: Option<ProviderUsage>, protocol: AiProtocol) -> Option<usize> {
+    usage.and_then(|value| {
+        let input = value.prompt_tokens?;
+        if protocol == AiProtocol::ClaudeMessages {
+            Some(input + value.cache_hit_tokens.unwrap_or(0) + value.cache_miss_tokens.unwrap_or(0))
+        } else {
+            Some(input)
+        }
+    })
 }
 
 fn provider_cache_tokens(usage: Option<ProviderUsage>) -> Option<(usize, usize)> {
@@ -380,6 +575,7 @@ fn force_local_compact_json_messages(messages: &mut Vec<Value>, config: &AiConfi
 async fn compress_json_messages(
     client: &Client,
     endpoint: &str,
+    protocol: AiProtocol,
     api_key: &str,
     model: &str,
     messages: &mut Vec<Value>,
@@ -475,30 +671,15 @@ async fn compress_json_messages(
         client,
         endpoint,
         api_key,
-        &json!({
-            "model": model,
-            "stream": false,
-            "messages": summary_messages,
-            "temperature": 0.1,
-            "max_tokens": summary_budget,
-        }),
+        protocol,
+        &protocol_payload(protocol, model, &summary_messages, &json!([]), false),
         "上下文压缩请求",
         validate_compression_response,
     )
     .await?;
     let usage = provider_usage(&response);
-    let summary = response
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|choices| choices.first())
-        .and_then(|choice| choice.get("message"))
-        .and_then(|message| {
-            message
-                .get("content")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .or_else(|| message.get("reasoning_content").and_then(Value::as_str))
-        })
+    let summary = protocol_response_to_message(&response, protocol)
+        .and_then(|message| message.get("content").and_then(Value::as_str).map(str::to_string))
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "上下文压缩响应缺少摘要".to_string())?;
 
@@ -508,7 +689,7 @@ async fn compress_json_messages(
         .unwrap_or_else(|| json!({"role":"system","content":""}))];
     compacted.push(json!({
         "role": "system",
-        "content": format!("[历史上下文压缩摘要]\n{}", trim_to_tokens(summary, summary_budget)),
+        "content": format!("[历史上下文压缩摘要]\n{}", trim_to_tokens(&summary, summary_budget)),
     }));
     compacted.extend(recent);
     *messages = compacted;
@@ -1048,6 +1229,24 @@ async fn web_search(query: &str, limit: usize) -> Result<Value, String> {
     Ok(json!({ "query": query.trim(), "source": "Bing RSS", "results": results }))
 }
 
+fn required_tool_permission(name: &str) -> Option<&'static str> {
+    match name {
+        "write_file" | "edit_file" | "delete_file" => Some("change"),
+        "run_script" | "run_command"
+        | "create_task" | "update_task" | "delete_task"
+        | "create_env_var" | "update_env_var" | "delete_env_var" => Some("command"),
+        _ => None,
+    }
+}
+
+fn tool_permission_granted(name: &str, allow_commands: bool, allow_changes: bool) -> bool {
+    match required_tool_permission(name) {
+        Some("change") => allow_changes,
+        Some("command") => allow_commands,
+        _ => true,
+    }
+}
+
 async fn execute_agent_tool(
     state: &AppState,
     name: &str,
@@ -1057,15 +1256,7 @@ async fn execute_agent_tool(
     attached_directory: Option<&str>,
     cancel: Option<&CancellationToken>,
 ) -> Result<Value, String> {
-    if !allow_changes && matches!(name, "write_file" | "edit_file" | "delete_file") {
-        return Err("操作未执行：系统拦截".to_string());
-    }
-
-    if !allow_commands && matches!(
-        name,
-        "create_task" | "update_task" | "delete_task"
-            | "create_env_var" | "update_env_var" | "delete_env_var"
-    ) {
+    if !tool_permission_granted(name, allow_commands, allow_changes) {
         return Err("操作未执行：系统拦截".to_string());
     }
 
@@ -1292,6 +1483,18 @@ async fn execute_agent_tool(
     }
 }
 
+#[derive(Debug, Clone)]
+enum ToolApprovalDecision {
+    Approved { remember: bool },
+    Rejected,
+}
+
+#[derive(Debug)]
+struct PendingToolApproval {
+    call_id: String,
+    decision: Option<ToolApprovalDecision>,
+}
+
 #[derive(Debug)]
 struct AiJob {
     session_id: Option<String>,
@@ -1299,6 +1502,8 @@ struct AiJob {
     sender: broadcast::Sender<String>,
     events: RwLock<Vec<String>>,
     cancel: CancellationToken,
+    pending_tool: Mutex<Option<PendingToolApproval>>,
+    approval_notify: Notify,
 }
 
 static AI_JOBS: Lazy<RwLock<HashMap<String, Arc<AiJob>>>> =
@@ -1316,6 +1521,76 @@ enum AgentWsMessage {
     Start { request: AiChatRequest },
     #[serde(rename = "cancel")]
     Cancel,
+    #[serde(rename = "approve_tool")]
+    ApproveTool {
+        tool_call_id: String,
+        #[serde(default)]
+        remember: bool,
+    },
+    #[serde(rename = "reject_tool")]
+    RejectTool { tool_call_id: String },
+}
+
+async fn resolve_tool_approval(
+    job: &Arc<AiJob>,
+    call_id: &str,
+    decision: ToolApprovalDecision,
+) {
+    let mut pending = job.pending_tool.lock().await;
+    if pending.as_ref().map(|value| value.call_id.as_str()) == Some(call_id) {
+        if let Some(value) = pending.as_mut() {
+            value.decision = Some(decision);
+        }
+        job.approval_notify.notify_one();
+    }
+}
+
+async fn wait_for_tool_approval(
+    job: &Arc<AiJob>,
+    call_id: &str,
+    tool: &str,
+    arguments: &Value,
+    permission: &str,
+) -> ToolApprovalDecision {
+    {
+        let mut pending = job.pending_tool.lock().await;
+        *pending = Some(PendingToolApproval {
+            call_id: call_id.to_string(),
+            decision: None,
+        });
+    }
+    publish_job(job, json!({
+        "type": "approval_required",
+        "tool_call_id": call_id,
+        "tool": tool,
+        "permission": permission,
+        "arguments": redact_tool_arguments(tool, arguments),
+    })).await;
+
+    loop {
+        if job.cancel.is_cancelled() {
+            let mut pending = job.pending_tool.lock().await;
+            *pending = None;
+            return ToolApprovalDecision::Rejected;
+        }
+        let decision = {
+            let pending = job.pending_tool.lock().await;
+            pending.as_ref().and_then(|value| value.decision.clone())
+        };
+        if let Some(decision) = decision {
+            let mut pending = job.pending_tool.lock().await;
+            *pending = None;
+            return decision;
+        }
+        tokio::select! {
+            _ = job.cancel.cancelled() => {
+                let mut pending = job.pending_tool.lock().await;
+                *pending = None;
+                return ToolApprovalDecision::Rejected;
+            }
+            _ = job.approval_notify.notified() => {}
+        }
+    }
 }
 
 async fn publish_job(job: &Arc<AiJob>, payload: Value) {
@@ -1365,12 +1640,8 @@ async fn run_agent_job(state: Arc<AppState>, request: AiChatRequest, job: Arc<Ai
             return;
         }
     };
-    let base_url = config.base_url.trim_end_matches('/');
-    let endpoint = if base_url.ends_with("/chat/completions") {
-        base_url.to_string()
-    } else {
-        format!("{base_url}/chat/completions")
-    };
+    let protocol = protocol_for_config(&config);
+    let endpoint = protocol.endpoint(&config.base_url);
     let client = match Client::builder().build() {
         Ok(client) => client,
         Err(error) => {
@@ -1417,10 +1688,13 @@ async fn run_agent_job(state: Arc<AppState>, request: AiChatRequest, job: Arc<Ai
         "metadata": {"runtime_context": true},
     }));
     let tools = agent_tools();
+    let mut allow_commands = request.allow_commands;
+    let mut allow_changes = request.allow_changes;
     'agent_loop: loop {
         if let Err(error) = compress_json_messages(
             &client,
             &endpoint,
+            protocol,
             &config.api_key,
             &config.model,
             &mut messages,
@@ -1441,6 +1715,7 @@ async fn run_agent_job(state: Arc<AppState>, request: AiChatRequest, job: Arc<Ai
         let response = match call_agent_provider(
             &client,
             &endpoint,
+            protocol,
             &config.api_key,
             &config.model,
             &messages,
@@ -1459,7 +1734,7 @@ async fn run_agent_job(state: Arc<AppState>, request: AiChatRequest, job: Arc<Ai
             }
         };
         let provider_usage = response.usage;
-        if let Some(tokens) = provider_context_tokens_without_prompt(provider_usage, &request.prompt) {
+        if let Some(tokens) = provider_context_tokens(provider_usage, protocol) {
             set_session_context_tokens(
                 &state,
                 request.session_id.as_deref(),
@@ -1512,12 +1787,39 @@ async fn run_agent_job(state: Arc<AppState>, request: AiChatRequest, job: Arc<Ai
                 json!({"type":"tool_call","tool":name,"arguments":redact_tool_arguments(name, &arguments)}),
             )
             .await;
+            let mut tool_allow_commands = allow_commands;
+            let mut tool_allow_changes = allow_changes;
+            if let Some(permission) = required_tool_permission(name) {
+                if !tool_permission_granted(name, tool_allow_commands, tool_allow_changes) {
+                    match wait_for_tool_approval(&job, call_id, name, &arguments, permission).await {
+                        ToolApprovalDecision::Approved { remember } => {
+                            match permission {
+                                "command" => {
+                                    tool_allow_commands = true;
+                                    if remember { allow_commands = true; }
+                                }
+                                "change" => {
+                                    tool_allow_changes = true;
+                                    if remember { allow_changes = true; }
+                                }
+                                _ => {}
+                            }
+                        }
+                        ToolApprovalDecision::Rejected => {
+                            let content = json!({"error":"操作未执行：用户拒绝"}).to_string();
+                            publish_job(&job, json!({"type":"tool_result","tool":name,"success":false,"result":content})).await;
+                            messages.push(json!({"role":"tool","tool_call_id":call_id,"content":content}));
+                            break 'agent_loop;
+                        }
+                    }
+                }
+            }
             let result = execute_agent_tool(
                 &state,
                 name,
                 &arguments,
-                request.allow_commands,
-                request.allow_changes,
+                tool_allow_commands,
+                tool_allow_changes,
                 request.directory_path.as_deref(),
                 Some(&job.cancel),
             )
@@ -1613,6 +1915,8 @@ async fn handle_agent_ws(
                 sender: job_sender,
                 events: RwLock::new(Vec::new()),
                 cancel: CancellationToken::new(),
+                pending_tool: Mutex::new(None),
+                approval_notify: Notify::new(),
             });
             set_session_job(
                 &state,
@@ -1647,8 +1951,15 @@ async fn handle_agent_ws(
             incoming = receiver.next() => {
                 match incoming {
                     Some(Ok(Message::Text(message))) => {
-                        if matches!(serde_json::from_str::<AgentWsMessage>(&message), Ok(AgentWsMessage::Cancel)) {
-                            job.cancel.cancel();
+                        match serde_json::from_str::<AgentWsMessage>(&message) {
+                            Ok(AgentWsMessage::Cancel) => job.cancel.cancel(),
+                            Ok(AgentWsMessage::ApproveTool { tool_call_id, remember }) => {
+                                resolve_tool_approval(&job, &tool_call_id, ToolApprovalDecision::Approved { remember }).await;
+                            }
+                            Ok(AgentWsMessage::RejectTool { tool_call_id }) => {
+                                resolve_tool_approval(&job, &tool_call_id, ToolApprovalDecision::Rejected).await;
+                            }
+                            _ => {}
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => return,
@@ -1690,12 +2001,8 @@ pub async fn agent(
         return Err((StatusCode::BAD_REQUEST, "请求内容不能为空".into()));
     }
 
-    let base_url = config.base_url.trim_end_matches('/');
-    let endpoint = if base_url.ends_with("/chat/completions") {
-        base_url.to_string()
-    } else {
-        format!("{base_url}/chat/completions")
-    };
+    let protocol = protocol_for_config(&config);
+    let endpoint = protocol.endpoint(&config.base_url);
     let client = Client::builder().build().map_err(internal_error)?;
     let state = state.clone();
 
@@ -1733,6 +2040,7 @@ pub async fn agent(
             let response = match call_agent_provider(
                 &client,
                 &endpoint,
+                protocol,
                 &config.api_key,
                 &config.model,
                 &messages,
@@ -1750,7 +2058,7 @@ pub async fn agent(
                 yield Ok(Event::default().event("agent").data(json!({"type":"text","content":chunk}).to_string()));
             }
             let provider_usage = response.usage;
-            if let Some(tokens) = provider_context_tokens_without_prompt(provider_usage, &request.prompt) {
+            if let Some(tokens) = provider_context_tokens(provider_usage, protocol) {
                 yield Ok(Event::default().event("agent").data(json!({
                     "type": "context_usage",
                     "tokens": tokens,
@@ -1817,6 +2125,49 @@ pub async fn agent(
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
+fn apply_protocol_stream_chunk(
+    data: &str,
+    protocol: AiProtocol,
+    content: &mut String,
+    text_chunks: &mut Vec<String>,
+    tool_calls: &mut Vec<Value>,
+    usage: &mut Option<ProviderUsage>,
+) {
+    let Ok(value) = serde_json::from_str::<Value>(data.trim()) else { return; };
+    merge_provider_usage(usage, provider_usage(&value));
+    match protocol {
+        AiProtocol::Responses => {
+            if let Some(delta) = value.get("delta").and_then(Value::as_str).or_else(|| value.get("text").and_then(Value::as_str)) {
+                content.push_str(delta);
+                text_chunks.push(delta.to_string());
+            }
+            if value.get("type").and_then(Value::as_str) == Some("response.output_item.done") {
+                if let Some(item) = value.get("item").filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call")) {
+                    tool_calls.push(json!({"id": item.get("call_id").or_else(|| item.get("id")).cloned().unwrap_or_else(|| json!("tool-call")), "type":"function", "function":{"name":item.get("name").cloned().unwrap_or_else(|| json!("")),"arguments":item.get("arguments").cloned().unwrap_or_else(|| json!("{}"))}}));
+                }
+            }
+        }
+        AiProtocol::ClaudeMessages => {
+            if let Some(delta) = value.get("delta").and_then(|delta| delta.get("text")).and_then(Value::as_str) {
+                content.push_str(delta);
+                text_chunks.push(delta.to_string());
+            }
+            if value.get("type").and_then(Value::as_str) == Some("content_block_start") {
+                if let Some(block) = value.get("content_block").filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use")) {
+                    tool_calls.push(json!({"id":block.get("id").cloned().unwrap_or_else(|| json!("tool-call")),"type":"function","function":{"name":block.get("name").cloned().unwrap_or_else(|| json!("")),"arguments":""}}));
+                }
+            }
+            if let Some(delta) = value.get("delta").filter(|delta| delta.get("type").and_then(Value::as_str) == Some("input_json_delta")).and_then(|delta| delta.get("partial_json")).and_then(Value::as_str) {
+                if let Some(call) = tool_calls.last_mut() {
+                    let current = call["function"]["arguments"].as_str().unwrap_or("").to_string();
+                    call["function"]["arguments"] = Value::String(current + delta);
+                }
+            }
+        }
+        AiProtocol::ChatCompletions => {}
+    }
+}
+
 fn apply_agent_stream_chunk(
     data: &str,
     content: &mut String,
@@ -1831,9 +2182,7 @@ fn apply_agent_stream_chunk(
     let Ok(value) = serde_json::from_str::<Value>(data) else {
         return;
     };
-    if let Some(parsed_usage) = provider_usage(&value) {
-        *usage = Some(parsed_usage);
-    }
+    merge_provider_usage(usage, provider_usage(&value));
     let Some(choice) = value.get("choices").and_then(Value::as_array).and_then(|items| items.first()) else {
         return;
     };
@@ -1885,6 +2234,7 @@ async fn publish_stream_text(
 async fn call_agent_provider(
     client: &Client,
     endpoint: &str,
+    protocol: AiProtocol,
     api_key: &str,
     model: &str,
     messages: &[Value],
@@ -1892,25 +2242,18 @@ async fn call_agent_provider(
     prompt_cache_key: Option<&str>,
     stream_job: Option<&Arc<AiJob>>,
 ) -> Result<ProviderCallResult, String> {
-    let mut payload = json!({
-        "model": model,
-        "stream": true,
-        "messages": messages.iter().map(|message| {
-            let mut message = message.clone();
-            if let Value::Object(object) = &mut message {
-                object.remove("metadata");
-            }
-            message
-        }).collect::<Vec<_>>(),
-        "tools": tools,
-        "tool_choice": "auto",
-    });
+    let mut payload = protocol_payload(protocol, model, messages, tools, true);
+    if let Value::Object(object) = &mut payload {
+        if protocol == AiProtocol::ChatCompletions {
+            object.insert("tool_choice".to_string(), json!("auto"));
+        }
+    }
     if let Some(key) = prompt_cache_key {
         payload["prompt_cache_key"] = Value::String(key.to_string());
     }
     let mut last_error = String::new();
     for attempt in 1..=AI_REQUEST_MAX_ATTEMPTS {
-        let response = match client.post(endpoint).bearer_auth(api_key).json(&payload).send().await {
+        let response = match provider_headers(client.post(endpoint), protocol, api_key).json(&payload).send().await {
             Ok(response) => response,
             Err(error) => {
                 last_error = format!("AI 请求失败: {error}");
@@ -1949,6 +2292,9 @@ async fn call_agent_provider(
                 buffer.drain(..=index);
                 if let Some(data) = line.strip_prefix("data:") {
                     apply_agent_stream_chunk(data, &mut content, &mut text_chunks, &mut tool_calls, &mut usage);
+                    if protocol != AiProtocol::ChatCompletions {
+                        apply_protocol_stream_chunk(data, protocol, &mut content, &mut text_chunks, &mut tool_calls, &mut usage);
+                    }
                     publish_stream_text(stream_job, &text_chunks, &mut published_text_chunks).await;
                 }
             }
@@ -1962,7 +2308,7 @@ async fn call_agent_provider(
         if text_chunks.is_empty() && tool_calls.is_empty() {
             if let Ok(value) = serde_json::from_str::<Value>(&raw_body) {
                 usage = provider_usage(&value);
-                if let Some(message) = value.get("choices").and_then(Value::as_array).and_then(|items| items.first()).and_then(|item| item.get("message")).cloned() {
+                if let Some(message) = protocol_response_to_message(&value, protocol) {
                     content = message.get("content").and_then(Value::as_str).unwrap_or("").to_string();
                     if !content.is_empty() {
                         text_chunks.push(content.clone());
@@ -2149,12 +2495,8 @@ pub async fn compress_session(
             "AI 尚未配置，请先在系统配置中填写 Provider、API Key 和模型".into(),
         ));
     }
-    let base_url = config.base_url.trim_end_matches('/');
-    let endpoint = if base_url.ends_with("/chat/completions") {
-        base_url.to_string()
-    } else {
-        format!("{base_url}/chat/completions")
-    };
+    let protocol = protocol_for_config(&config);
+    let endpoint = protocol.endpoint(&config.base_url);
     let client = Client::builder().build().map_err(internal_error)?;
     let mut messages = vec![json!({"role":"system","content":""})];
     messages.extend(
@@ -2168,6 +2510,7 @@ pub async fn compress_session(
     let compression_outcome = match compress_json_messages(
         &client,
         &endpoint,
+        protocol,
         &config.api_key,
         &config.model,
         &mut messages,

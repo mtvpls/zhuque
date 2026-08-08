@@ -37,7 +37,6 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
 type PermissionMode = 'default' | 'changes' | 'all';
-type PermissionApproval = 'command' | 'change';
 type EventTone = 'neutral' | 'success' | 'warning' | 'error';
 
 interface AgentEvent {
@@ -109,6 +108,16 @@ type FeedGroup =
   | { kind: 'events'; events: AgentEvent[] }
   | { kind: 'message'; message: ConversationMessage };
 
+const formatToolApproval = (tool: string, argumentsValue: Record<string, unknown> | null) => {
+  if (!argumentsValue) return '';
+  if (tool === 'run_command') return String(argumentsValue.command || '');
+  if (tool === 'run_script') return String(argumentsValue.path || '');
+  if (tool === 'write_file' || tool === 'edit_file' || tool === 'delete_file') {
+    return String(argumentsValue.path || '');
+  }
+  return JSON.stringify(argumentsValue, null, 2);
+};
+
 const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
   visible,
   fileName,
@@ -133,7 +142,9 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [permissionMode, setPermissionMode] = useState<PermissionMode>('default');
   const [pendingPermission, setPendingPermission] = useState<'command' | 'change' | null>(null);
-  const [pendingRequest, setPendingRequest] = useState('');
+  const [pendingToolCallId, setPendingToolCallId] = useState<string | null>(null);
+  const [pendingToolName, setPendingToolName] = useState('');
+  const [pendingToolArguments, setPendingToolArguments] = useState<Record<string, unknown> | null>(null);
   const [showSessions, setShowSessions] = useState(false);
   const [contextEnabled, setContextEnabled] = useState(Boolean(filePath || fileName));
   const [workspaceWidth, setWorkspaceWidth] = useState(360);
@@ -309,25 +320,6 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
   };
 
 
-  const getPendingCommand = (request: string) => {
-    const quoted = request.match(/`([^`]+)`/);
-    if (quoted?.[1]) return quoted[1].trim();
-    return request
-      .replace(/^\s*(请|帮我|麻烦)?\s*(执行|运行|调用|使用)?\s*(命令|shell|终端)?\s*[:：]?\s*/i, '')
-      .trim();
-  };
-
-  const commandPermissionTools = new Set([
-    'run_script',
-    'run_command',
-    'create_task',
-    'update_task',
-    'delete_task',
-    'create_env_var',
-    'update_env_var',
-    'delete_env_var',
-  ]);
-
   const connectJob = (jobId?: string, startRequest?: Record<string, unknown>, socketSessionId = sessionIdRef.current) => {
     const token = localStorage.getItem('token') || '';
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -372,16 +364,7 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
           const hit = Number(payload.hit_tokens);
           const miss = Number(payload.miss_tokens);
           if (Number.isFinite(hit) && Number.isFinite(miss)) {
-            const total = Math.max(0, hit + miss);
             setCacheUsage({ hit: Math.max(0, hit), miss: Math.max(0, miss) });
-            if (total > 0) {
-              setProviderContextTokens(total);
-              setSessions((previous) => previous.map((session) => (
-                session.id === socketSessionId
-                  ? { ...session, current_context_tokens: total }
-                  : session
-              )));
-            }
           }
         } else if (type === 'session_title') {
           const title = typeof payload.title === 'string' ? payload.title : '';
@@ -403,14 +386,34 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
           assistantSegmentRef.current = null;
           toolInteractionRef.current = true;
           const result = typeof payload.result === 'string' ? payload.result : '';
-          if (type === 'tool_call' && commandPermissionTools.has(tool) && permissionMode !== 'all' && !pendingPermission) {
-            setPendingRequest(activeRequestRef.current);
-            setPendingPermission('command');
+          if (type === 'tool_result' && payload.success === false && result.includes('系统拦截')) {
+            setFeedItems((previous) => [
+              ...previous,
+              {
+                kind: 'event',
+                event: {
+                  id: Date.now() + previous.length,
+                  label: '工具被系统拦截 · ' + tool,
+                  detail: result.slice(0, 1600) || '执行失败',
+                  tone: 'error',
+                },
+              },
+            ]);
+            return;
           }
-          if (type === 'tool_result' && payload.success === false && (tool === 'write_file' || tool === 'edit_file' || tool === 'delete_file' || result.includes('系统拦截'))) {
-            const approval: PermissionApproval = tool === 'write_file' || tool === 'edit_file' || tool === 'delete_file' ? 'change' : 'command';
-            setPendingRequest(activeRequestRef.current);
-            setPendingPermission(approval);
+          if (type === 'tool_call') {
+            setFeedItems((previous) => [
+              ...previous,
+              {
+                kind: 'event',
+                event: {
+                  id: Date.now() + previous.length,
+                  label: '调用工具 · ' + tool,
+                  detail: payload.arguments ? JSON.stringify(payload.arguments) : undefined,
+                  tone: 'neutral',
+                },
+              },
+            ]);
             return;
           }
           setFeedItems((previous) => [
@@ -419,14 +422,20 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
               kind: 'event',
               event: {
                 id: Date.now() + previous.length,
-                label: type === 'tool_call' ? '调用工具 · ' + tool : '工具完成 · ' + tool,
-                detail: type === 'tool_call'
-                  ? (payload.arguments ? JSON.stringify(payload.arguments) : undefined)
-                  : (result.slice(0, 1600) || (payload.success ? '无输出' : '执行失败')),
-                tone: type === 'tool_call' ? 'neutral' : (payload.success ? 'success' : 'error'),
+                label: '工具完成 · ' + tool,
+                detail: result.slice(0, 1600) || (payload.success ? '无输出' : '执行失败'),
+                tone: payload.success ? 'success' : 'error',
               },
             },
           ]);
+        } else if (type === 'approval_required') {
+          const callId = typeof payload.tool_call_id === 'string' ? payload.tool_call_id : '';
+          if (callId) {
+            setPendingToolCallId(callId);
+            setPendingToolName(tool);
+            setPendingToolArguments(payload.arguments && typeof payload.arguments === 'object' ? payload.arguments as Record<string, unknown> : null);
+            setPendingPermission(payload.permission === 'change' ? 'change' : 'command');
+          }
         } else if (type === 'text') {
           const chunk = typeof payload.content === 'string' ? payload.content : '';
           if (chunk) {
@@ -464,10 +473,13 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
           if (errorMessage.includes('后台任务不存在') && socketSessionId) {
             delete sessionJobsRef.current[socketSessionId];
             localStorage.setItem('script-ai-active-jobs', JSON.stringify(sessionJobsRef.current));
+            keepSubscribedRef.current = false;
             if (socketSessionId === sessionIdRef.current) {
               jobIdRef.current = null;
-              keepSubscribedRef.current = false;
+              activeRequestRef.current = '';
+              setRunning(false);
             }
+            socket.close();
           }
         } else if (type === 'done') {
           const finalAssistantMessage = assistantTextRef.current || 'Agent 已完成。';
@@ -513,18 +525,19 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
     return socket;
   };
 
-  const handleSubmit = (approval?: PermissionApproval) => {
-    const approved = Boolean(approval);
-    const request = (approved ? pendingRequest : prompt).trim();
+  const handleSubmit = () => {
+    const request = prompt.trim();
     if (!request || running) return;
-    if (!approved && /^\/(compress|compact)$/i.test(request)) {
+    if (/^\/(compress|compact)$/i.test(request)) {
       setPrompt('');
       setCommandSuggestionsVisible(false);
       void compressSession();
       return;
     }
     setPendingPermission(null);
-    setPendingRequest('');
+    setPendingToolCallId(null);
+    setPendingToolName('');
+    setPendingToolArguments(null);
     setRunning(true);
     setProviderContextTokens(null);
     setCacheUsage(null);
@@ -535,9 +548,7 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
     lastSequenceRef.current = 0;
     activeRequestRef.current = request;
     assistantTextRef.current = '';
-    if (!approved) {
-      setFeedItems((previous) => [...previous, { kind: 'message', message: { role: 'user', content: request } }]);
-    }
+    setFeedItems((previous) => [...previous, { kind: 'message', message: { role: 'user', content: request } }]);
     connectJob(undefined, {
       mode: 'agent',
       prompt: request,
@@ -547,11 +558,28 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
       execution_output: contextEnabled ? executionOutput : undefined,
       directory_path: aiDirectoryPath,
       history: conversation,
-      allow_commands: approval === 'command' || permissionMode === 'all',
-      allow_changes: approval === 'change' || permissionMode === 'changes' || permissionMode === 'all',
-      retry: approved,
+      allow_commands: permissionMode === 'all',
+      allow_changes: permissionMode === 'changes' || permissionMode === 'all',
       session_id: sessionId,
     });
+  };
+
+
+  const respondToToolApproval = (decision: 'approve' | 'reject', remember = false) => {
+    const socket = socketRef.current;
+    if (!pendingToolCallId || !socket || socket.readyState !== WebSocket.OPEN) {
+      Message.warning('AI 连接已断开，请等待连接恢复后再审批');
+      return;
+    }
+    socket.send(JSON.stringify({
+      type: decision === 'approve' ? 'approve_tool' : 'reject_tool',
+      tool_call_id: pendingToolCallId,
+      ...(decision === 'approve' ? { remember } : {}),
+    }));
+    setPendingPermission(null);
+    setPendingToolCallId(null);
+    setPendingToolName('');
+    setPendingToolArguments(null);
   };
 
   const stopAgent = () => {
@@ -648,6 +676,9 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
       await onApplyChanges(changes);
       if (remember) setPermissionMode('changes');
       setPendingPermission(null);
+      setPendingToolCallId(null);
+      setPendingToolName('');
+      setPendingToolArguments(null);
       setDraftChanges(null);
       addEvent('多文件修改已落盘', changes.length + ' 个文件立即生效', 'success');
       Message.success('修改已写入脚本工作区并立即生效');
@@ -705,7 +736,6 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
     setSessionId(value);
     setDraftChanges(null);
     setPendingPermission(null);
-    setPendingRequest('');
     setShowSessions(false);
   };
 
@@ -956,17 +986,15 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
           </div>
         )}
 
-        {pendingPermission && (
+        {pendingPermission && pendingToolCallId && (
           <div className="script-ai-permission">
-            <div>
-              <strong>{pendingPermission === 'change' ? '该操作需要文件写入权限' : '该操作需要命令执行权限'}</strong>
-              <code>{pendingPermission === 'command' ? getPendingCommand(pendingRequest) : pendingRequest}</code>
+            <strong>{pendingPermission === 'change' ? '该操作需要文件写入权限' : '该操作需要命令执行权限'}</strong>
+            <pre className="script-ai-permission-command">{formatToolApproval(pendingToolName, pendingToolArguments)}</pre>
+            <div className="script-ai-permission-actions">
+              <Button size="small" type="primary" onClick={() => respondToToolApproval('approve')}>允许</Button>
+              <Button size="small" onClick={() => respondToToolApproval('approve', true)}>本会话允许</Button>
+              <Button size="small" onClick={() => respondToToolApproval('reject')}>拒绝</Button>
             </div>
-            <Space>
-              <Button size="small" type="primary" onClick={() => handleSubmit(pendingPermission)}>允许</Button>
-              <Button size="small" onClick={() => { setPermissionMode(pendingPermission === 'command' ? 'all' : 'changes'); void handleSubmit(pendingPermission); }}>本会话允许</Button>
-              <Button size="small" onClick={() => { setPendingPermission(null); setPendingRequest(''); }}>拒绝</Button>
-            </Space>
           </div>
         )}
 
@@ -1003,7 +1031,7 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
             <Space className="script-ai-diff-actions">
               <Button type="primary" size="small" icon={<IconCheck />} onClick={() => applyDraft(false)}>允许</Button>
               <Button size="small" onClick={() => applyDraft(true)}>本会话允许</Button>
-              <Button size="small" icon={<IconRefresh />} onClick={() => { setDraftChanges(null); setPendingPermission(null); }}>拒绝</Button>
+              <Button size="small" icon={<IconRefresh />} onClick={() => { setDraftChanges(null); setPendingPermission(null); setPendingToolCallId(null); setPendingToolName(''); setPendingToolArguments(null); }}>拒绝</Button>
             </Space>
           </Card>
         )}
@@ -1033,7 +1061,6 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
           value={prompt}
           onChange={(value) => {
             setPrompt(value);
-            setProviderContextTokens(null);
             setCommandSuggestionsVisible(value.trimStart().startsWith('/') && !value.includes(' '));
           }}
           autoSize={{ minRows: 3, maxRows: 6 }}
@@ -1049,7 +1076,7 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
           <span>
             当前上下文：{providerContextTokens !== null
               ? `${formatTokenCount(providerContextTokens)} tokens${cacheUsage ? `（${formatTokenCount(cacheUsage.hit)}）` : ''}`
-              : `约 ${formatTokenCount(currentContextTokens)} tokens`}
+              : `估算约 ${formatTokenCount(currentContextTokens)} tokens`}
           </span>
           <Space>
             <Dropdown
