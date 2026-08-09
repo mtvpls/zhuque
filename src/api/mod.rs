@@ -286,6 +286,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/configs/mirror/config",
             post(config::update_mirror_config),
         )
+        .route(
+            "/api/configs/web-search/config",
+            get(config::get_web_search_config).post(config::update_web_search_config),
+        )
         // 自动备份配置
         .route(
             "/api/configs/auto-backup/config",

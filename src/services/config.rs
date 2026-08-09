@@ -1,5 +1,6 @@
 use crate::models::{
     AiConfig, AutoBackupConfig, CreateSystemConfig, MirrorConfig, SystemConfig, UpdateSystemConfig,
+    WebSearchConfig,
 };
 use anyhow::Result;
 use sqlx::SqlitePool;
@@ -277,6 +278,33 @@ impl ConfigService {
         } else {
             self.create(CreateSystemConfig {
                 key: "ai".to_string(),
+                value: update.value,
+                description: update.description,
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn get_web_search_config(&self) -> Result<WebSearchConfig> {
+        if let Some(config) = self.get_by_key("web_search").await? {
+            Ok(serde_json::from_str::<WebSearchConfig>(&config.value)?)
+        } else {
+            Ok(WebSearchConfig::default())
+        }
+    }
+
+    pub async fn update_web_search_config(&self, config: &WebSearchConfig) -> Result<()> {
+        let value = serde_json::to_string(config)?;
+        let update = UpdateSystemConfig {
+            value,
+            description: Some("联网搜索配置".to_string()),
+        };
+        if self.get_by_key("web_search").await?.is_some() {
+            self.update("web_search", update).await?;
+        } else {
+            self.create(CreateSystemConfig {
+                key: "web_search".to_string(),
                 value: update.value,
                 description: update.description,
             })

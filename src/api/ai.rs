@@ -1349,31 +1349,204 @@ fn xml_tag(item: &str, tag: &str) -> String {
     }).unwrap_or_default()
 }
 
-async fn web_search(query: &str, limit: usize) -> Result<Value, String> {
+fn search_result(title: &str, url: &str, snippet: &str, published_at: Option<&str>) -> Value {
+    let mut result = json!({
+        "title": title,
+        "url": url,
+        "snippet": snippet,
+    });
+    if let Some(published_at) = published_at.filter(|value| !value.is_empty()) {
+        result["published_at"] = Value::String(published_at.to_string());
+    }
+    result
+}
+
+async fn bing_search(client: &Client, query: &str, limit: usize) -> Result<Vec<Value>, String> {
+    let url = format!(
+        "https://www.bing.com/search?format=rss&count={limit}&q={}",
+        urlencoding::encode(query)
+    );
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| format!("联网搜索请求失败: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("搜索服务返回 {}", response.status()));
+    }
+    let body = response
+        .text()
+        .await
+        .map_err(|error| format!("读取搜索结果失败: {error}"))?;
+    Ok(body
+        .split("<item>")
+        .skip(1)
+        .take(limit)
+        .map(|item| search_result(
+            &xml_tag(item, "title"),
+            &xml_tag(item, "link"),
+            &xml_tag(item, "description"),
+            Some(&xml_tag(item, "pubDate")),
+        ))
+        .collect())
+}
+
+async fn tavily_search(client: &Client, query: &str, api_key: &str, limit: usize) -> Result<Vec<Value>, String> {
+    if api_key.trim().is_empty() {
+        return Err("Tavily API Key 未配置".to_string());
+    }
+    let response = client
+        .post("https://api.tavily.com/search")
+        .bearer_auth(api_key)
+        .json(&json!({
+            "query": query,
+            "search_depth": "basic",
+            "max_results": limit,
+            "include_answer": false,
+            "include_raw_content": false,
+        }))
+        .send()
+        .await
+        .map_err(|error| format!("Tavily 搜索请求失败: {error}"))?;
+    let status = response.status();
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|error| format!("读取 Tavily 搜索结果失败: {error}"))?;
+    if !status.is_success() {
+        return Err(format!("Tavily 返回 {status}: {}", body.to_string().chars().take(300).collect::<String>()));
+    }
+    Ok(body
+        .get("results")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(limit)
+        .map(|item| search_result(
+            item.get("title").and_then(Value::as_str).unwrap_or(""),
+            item.get("url").and_then(Value::as_str).unwrap_or(""),
+            item.get("content").and_then(Value::as_str).unwrap_or(""),
+            item.get("published_date").and_then(Value::as_str),
+        ))
+        .collect())
+}
+
+async fn exa_search(client: &Client, query: &str, api_key: &str, limit: usize) -> Result<Vec<Value>, String> {
+    if api_key.trim().is_empty() {
+        return Err("Exa API Key 未配置".to_string());
+    }
+    let response = client
+        .post("https://api.exa.ai/search")
+        .header("x-api-key", api_key)
+        .json(&json!({
+            "query": query,
+            "type": "auto",
+            "numResults": limit,
+            "contents": { "highlights": true },
+        }))
+        .send()
+        .await
+        .map_err(|error| format!("Exa 搜索请求失败: {error}"))?;
+    let status = response.status();
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|error| format!("读取 Exa 搜索结果失败: {error}"))?;
+    if !status.is_success() {
+        return Err(format!("Exa 返回 {status}: {}", body.to_string().chars().take(300).collect::<String>()));
+    }
+    Ok(body
+        .get("results")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(limit)
+        .map(|item| {
+            let highlights = item
+                .get("highlights")
+                .and_then(Value::as_array)
+                .map(|items| items.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "))
+                .unwrap_or_default();
+            let snippet = if highlights.is_empty() {
+                item.get("text").and_then(Value::as_str).unwrap_or("")
+            } else {
+                highlights.as_str()
+            };
+            search_result(
+                item.get("title").and_then(Value::as_str).unwrap_or(""),
+                item.get("url").and_then(Value::as_str).unwrap_or(""),
+                snippet,
+                item.get("publishedDate").and_then(Value::as_str),
+            )
+        })
+        .collect())
+}
+
+async fn searxng_search(client: &Client, query: &str, base_url: &str, limit: usize) -> Result<Vec<Value>, String> {
+    if base_url.trim().is_empty() {
+        return Err("SearXNG 地址未配置".to_string());
+    }
+    let base_url = base_url.trim_end_matches('/');
+    let endpoint = if base_url.ends_with("/search") {
+        base_url.to_string()
+    } else {
+        format!("{base_url}/search")
+    };
+    let url = format!(
+        "{endpoint}?q={}&format=json&language=all",
+        urlencoding::encode(query)
+    );
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| format!("SearXNG 搜索请求失败: {error}"))?;
+    let status = response.status();
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|error| format!("读取 SearXNG 搜索结果失败: {error}"))?;
+    if !status.is_success() {
+        return Err(format!("SearXNG 返回 {status}"));
+    }
+    Ok(body
+        .get("results")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(limit)
+        .map(|item| search_result(
+            item.get("title").and_then(Value::as_str).unwrap_or(""),
+            item.get("url").and_then(Value::as_str).unwrap_or(""),
+            item.get("content").and_then(Value::as_str).unwrap_or(""),
+            item.get("publishedDate").and_then(Value::as_str),
+        ))
+        .collect())
+}
+
+async fn web_search(state: &AppState, query: &str, limit: usize) -> Result<Value, String> {
     if query.trim().is_empty() {
         return Err("搜索关键词不能为空".to_string());
     }
-    let limit = limit.clamp(1, 10);
-    let url = format!(
-        "https://www.bing.com/search?format=rss&count={limit}&q={}",
-        urlencoding::encode(query.trim())
-    );
+    let config = state
+        .config_service
+        .get_web_search_config()
+        .await
+        .map_err(|error| format!("读取联网搜索配置失败: {error}"))?;
+    let limit = limit.clamp(1, 10).min(config.result_count.max(1) as usize);
+    let provider = config.provider.trim().to_ascii_lowercase();
     let client = Client::builder()
         .user_agent("Zhuque/AI-Workbench")
         .build()
         .map_err(|error| format!("创建搜索客户端失败: {error}"))?;
-    let response = client.get(url).send().await.map_err(|error| format!("联网搜索请求失败: {error}"))?;
-    if !response.status().is_success() {
-        return Err(format!("搜索服务返回 {}", response.status()));
-    }
-    let body = response.text().await.map_err(|error| format!("读取搜索结果失败: {error}"))?;
-    let results = body.split("<item>").skip(1).take(limit).map(|item| json!({
-        "title": xml_tag(item, "title"),
-        "url": xml_tag(item, "link"),
-        "snippet": xml_tag(item, "description"),
-        "published_at": xml_tag(item, "pubDate"),
-    })).collect::<Vec<_>>();
-    Ok(json!({ "query": query.trim(), "source": "Bing RSS", "results": results }))
+    let results = match provider.as_str() {
+        "tavily" => tavily_search(&client, query.trim(), &config.api_key, limit).await?,
+        "exa" => exa_search(&client, query.trim(), &config.api_key, limit).await?,
+        "searxng" | "searx" => searxng_search(&client, query.trim(), &config.base_url, limit).await?,
+        "bing" | "" => bing_search(&client, query.trim(), limit).await?,
+        other => return Err(format!("不支持的联网搜索提供商: {other}")),
+    };
+    Ok(json!({ "query": query.trim(), "source": provider, "results": results }))
 }
 
 fn required_tool_permission(name: &str) -> Option<&'static str> {
@@ -1620,7 +1793,7 @@ async fn execute_agent_tool(
         "web_search" => {
             let query = argument_string(arguments, "query")?;
             let limit = arguments.get("limit").and_then(Value::as_u64).unwrap_or(5) as usize;
-            web_search(&query, limit).await
+            web_search(state, &query, limit).await
         }
         "run_script" if allow_commands => {
             let path = argument_string(arguments, "path")?;

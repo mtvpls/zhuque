@@ -48,6 +48,13 @@ interface AiProviderForm {
   models: string;
 }
 
+interface WebSearchConfig {
+  provider: string;
+  api_key: string;
+  base_url: string;
+  result_count: number;
+}
+
 interface SystemInfo {
   cpu_usage: number;
   memory_total: number;
@@ -98,6 +105,9 @@ const Config: React.FC = () => {
   const [providerModelsLoading, setProviderModelsLoading] = useState(false);
   const [availableProviderModels, setAvailableProviderModels] = useState<string[]>([]);
   const [selectedProviderModels, setSelectedProviderModels] = useState<string[]>([]);
+  const [webSearchForm] = Form.useForm<WebSearchConfig>();
+  const [webSearchLoading, setWebSearchLoading] = useState(false);
+  const [webSearchProvider, setWebSearchProvider] = useState('bing');
 
   useEffect(() => {
     const handleResize = () => {
@@ -110,6 +120,7 @@ const Config: React.FC = () => {
   useEffect(() => {
     loadConfig();
     loadAiConfig();
+    loadWebSearchConfig();
     loadLogRetentionConfig();
     loadAiSessionRetentionConfig();
     loadAutoBackupConfig();
@@ -183,6 +194,35 @@ const Config: React.FC = () => {
       })));
     } catch (error) {
       Message.error('加载 AI 配置失败');
+    }
+  };
+
+  const loadWebSearchConfig = async () => {
+    try {
+      const token = localStorage.getItem('token');
+      const res = await axios.get('/api/configs/web-search/config', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      webSearchForm.setFieldsValue(res.data);
+      setWebSearchProvider(res.data.provider || 'bing');
+    } catch (error) {
+      Message.error('加载联网搜索配置失败');
+    }
+  };
+
+  const handleSaveWebSearchConfig = async () => {
+    try {
+      const values = await webSearchForm.validate();
+      setWebSearchLoading(true);
+      const token = localStorage.getItem('token');
+      await axios.post('/api/configs/web-search/config', values, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      Message.success('联网搜索配置已保存');
+    } catch (error: any) {
+      Message.error(error.response?.data || '保存联网搜索配置失败');
+    } finally {
+      setWebSearchLoading(false);
     }
   };
 
@@ -783,7 +823,7 @@ const Config: React.FC = () => {
                 <FormItem label="启用 AI" field="enabled" triggerPropName="checked">
                   <Switch />
                 </FormItem>
-                <div className="ai-provider-list">
+              <div className="ai-provider-list">
                   <div className="ai-provider-list-toolbar">
                     <Typography.Text bold>服务商列表</Typography.Text>
                     <Button type="outline" onClick={() => openProviderModal()}>新增服务商</Button>
@@ -825,6 +865,42 @@ const Config: React.FC = () => {
                 >
                   <InputNumber min={10} max={95} step={1} suffix="%" style={{ width: '100%' }} />
                 </FormItem>
+              </Form>
+              <Divider orientation="left" style={{ margin: '24px 0 16px' }}>联网搜索</Divider>
+              <Form form={webSearchForm} layout="vertical">
+                <FormItem label="搜索提供商" field="provider" rules={[{ required: true, message: '请选择搜索提供商' }]}>
+                  <Select onChange={(value) => {
+                    setWebSearchProvider(value);
+                    webSearchForm.setFieldsValue({
+                      provider: value,
+                      api_key: value === 'searxng' || value === 'bing' ? '' : String(webSearchForm.getFieldValue('api_key') || ''),
+                      base_url: value === 'searxng' ? String(webSearchForm.getFieldValue('base_url') || '') : '',
+                    });
+                  }}>
+                    <Select.Option value="bing">Bing RSS</Select.Option>
+                    <Select.Option value="tavily">Tavily</Select.Option>
+                    <Select.Option value="searxng">SearXNG</Select.Option>
+                    <Select.Option value="exa">Exa</Select.Option>
+                  </Select>
+                </FormItem>
+                {(webSearchProvider === 'tavily' || webSearchProvider === 'exa') && (
+                  <FormItem label="API Key" field="api_key">
+                    <Input.Password placeholder={`${webSearchProvider === 'tavily' ? 'Tavily' : 'Exa'} API Key`} />
+                  </FormItem>
+                )}
+                {webSearchProvider === 'searxng' && (
+                  <FormItem label="SearXNG 地址" field="base_url" extra="必须启用 JSON 输出格式。">
+                    <Input placeholder="https://searx.example.com" />
+                  </FormItem>
+                )}
+                <FormItem label="最多返回结果数" field="result_count" rules={[{ required: true, message: '请输入结果数' }]}>
+                  <InputNumber min={1} max={10} style={{ width: '100%' }} />
+                </FormItem>
+                <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 8 }}>
+                  <Button type="primary" icon={<IconSave />} loading={webSearchLoading} onClick={handleSaveWebSearchConfig}>
+                    保存联网搜索配置
+                  </Button>
+                </div>
               </Form>
               <Modal
                 title={editingProviderIndex === null ? '新增服务商' : '编辑服务商'}

@@ -1,5 +1,5 @@
 use crate::api::AppState;
-use crate::models::{MirrorConfig, UpdateSystemConfig, AutoBackupConfig};
+use crate::models::{AutoBackupConfig, MirrorConfig, UpdateSystemConfig, WebSearchConfig};
 use crate::services::WebDavClient;
 use axum::{
     extract::{Path, State},
@@ -107,6 +107,31 @@ pub async fn update_mirror_config(
     let config = state
         .config_service
         .update_mirror_config(mirror_config)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(config))
+}
+
+// 获取联网搜索配置
+pub async fn get_web_search_config(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let config = state
+        .config_service
+        .get_web_search_config()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(config))
+}
+
+// 更新联网搜索配置
+pub async fn update_web_search_config(
+    State(state): State<Arc<AppState>>,
+    Json(config): Json<WebSearchConfig>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    state
+        .config_service
+        .update_web_search_config(&config)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(config))

@@ -51,6 +51,38 @@ pub struct PythonMirror {
     pub enabled: bool,
     pub index_url: Option<String>, // pip index
 }
+// 联网搜索配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebSearchConfig {
+    #[serde(default = "default_web_search_provider")]
+    pub provider: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default = "default_web_search_result_count")]
+    pub result_count: u32,
+}
+
+fn default_web_search_provider() -> String {
+    "bing".to_string()
+}
+
+fn default_web_search_result_count() -> u32 {
+    10
+}
+
+impl Default for WebSearchConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_web_search_provider(),
+            api_key: String::new(),
+            base_url: String::new(),
+            result_count: default_web_search_result_count(),
+        }
+    }
+}
+
 
 // AI Provider 配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
