@@ -61,8 +61,6 @@ pub struct AiHistoryMessage {
     pub metadata: Option<String>,
 }
 
-const MASKED_API_KEY: &str = "********";
-
 #[derive(Debug, Deserialize)]
 pub struct AiModelsRequest {
     pub name: String,
@@ -100,17 +98,13 @@ impl From<AiConfig> for AiConfigResponse {
                 name: provider.name,
                 protocol: provider.protocol,
                 base_url: provider.base_url,
-                api_key: if provider.api_key.is_empty() { String::new() } else { MASKED_API_KEY.to_string() },
+                api_key: provider.api_key,
                 models: provider.models,
             }).collect(),
             provider: config.provider,
             base_url: config.base_url,
             protocol: config.protocol,
-            api_key: if config.api_key.is_empty() {
-                String::new()
-            } else {
-                MASKED_API_KEY.to_string()
-            },
+            api_key: config.api_key,
             model: config.model,
             context_window_tokens: config.context_window_tokens,
             compression_ratio: config.compression_ratio,
@@ -3212,7 +3206,7 @@ pub async fn list_provider_models(
 ) -> Result<Json<Vec<String>>, (StatusCode, String)> {
     let configured = state.config_service.get_ai_config().await.map_err(internal_error)?;
     let provider = configured.providers.iter().find(|provider| provider.name == request.name);
-    let api_key = if request.api_key.trim().is_empty() || request.api_key == MASKED_API_KEY {
+    let api_key = if request.api_key.trim().is_empty() {
         provider.map(|value| value.api_key.as_str()).unwrap_or("")
     } else {
         request.api_key.as_str()
@@ -3253,15 +3247,6 @@ pub async fn update_config(
     State(state): State<Arc<AppState>>,
     Json(value): Json<AiConfig>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let mut value = value;
-    if value.api_key == MASKED_API_KEY {
-        value.api_key = state
-            .config_service
-            .get_ai_config()
-            .await
-            .map_err(internal_error)?
-            .api_key;
-    }
     let value = value.normalized();
     state
         .config_service

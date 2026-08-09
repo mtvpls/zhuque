@@ -266,19 +266,7 @@ impl ConfigService {
     }
 
     pub async fn update_ai_config(&self, config: &AiConfig) -> Result<()> {
-        let mut config = config.normalized();
-        if let Some(existing) = self.get_by_key("ai").await? {
-            if let Ok(previous) = serde_json::from_str::<AiConfig>(&existing.value) {
-                if config.api_key == "********" { config.api_key = previous.api_key; }
-                for provider in &mut config.providers {
-                    if provider.api_key == "********" {
-                        if let Some(old) = previous.providers.iter().find(|item| item.name == provider.name) {
-                            provider.api_key = old.api_key.clone();
-                        }
-                    }
-                }
-            }
-        }
+        let config = config.normalized();
         let value = serde_json::to_string(&config)?;
         let update = UpdateSystemConfig {
             value,
