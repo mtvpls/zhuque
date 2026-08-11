@@ -11,10 +11,12 @@ import {
   Popconfirm,
   Tag,
   Switch,
+  Select,
 } from '@arco-design/web-react';
 import { IconPlus, IconPlayArrow, IconEdit, IconDelete, IconFile } from '@arco-design/web-react/icon';
 import { subscriptionApi } from '@/api/subscription';
 import type { Subscription } from '@/types';
+import MobileRecordCard from '@/components/MobileRecordCard';
 
 const FormItem = Form.Item;
 
@@ -26,6 +28,7 @@ const Subscriptions: React.FC = () => {
   const [logContent, setLogContent] = useState('');
   const [editingSubscription, setEditingSubscription] = useState<Subscription | null>(null);
   const [form] = Form.useForm();
+  const [isMobile, setIsMobile] = useState(() => window.innerWidth <= 768);
 
   useEffect(() => {
     loadSubscriptions(true);
@@ -33,6 +36,12 @@ const Subscriptions: React.FC = () => {
       loadSubscriptions(false);
     }, 5000);
     return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    const handler = () => setIsMobile(window.innerWidth <= 768);
+    window.addEventListener('resize', handler);
+    return () => window.removeEventListener('resize', handler);
   }, []);
 
   const loadSubscriptions = async (showLoading: boolean = true) => {
@@ -55,16 +64,22 @@ const Subscriptions: React.FC = () => {
     setEditingSubscription(null);
     form.resetFields();
     form.setFieldsValue({
+      subscription_type: 'git',
       branch: 'main',
       schedule: '0 0 * * *',
       enabled: true,
+      auto_resolve_dependencies: false,
     });
     setVisible(true);
   };
 
   const handleEdit = (record: Subscription) => {
     setEditingSubscription(record);
-    form.setFieldsValue(record);
+    form.setFieldsValue({
+      ...record,
+      subscription_type: record.subscription_type || 'git',
+      auto_resolve_dependencies: record.auto_resolve_dependencies || false,
+    });
     setVisible(true);
   };
 
@@ -143,6 +158,32 @@ const Subscriptions: React.FC = () => {
     return <Tag color="gray">{status}</Tag>;
   };
 
+  const renderMobileCard = (record: Subscription) => (
+    <MobileRecordCard
+      key={record.id}
+      eyebrow={record.subscription_type === 'single_file' ? '单文件订阅' : 'Git 仓库订阅'}
+      title={record.name}
+      status={<Space size={6}><Switch size="small" checked={record.enabled} onChange={(checked) => handleToggleEnabled(record.id, checked)} />{getStatusTag(record.last_run_status)}</Space>}
+      fields={[
+        { label: '地址', value: <span title={record.url}>{record.url}</span>, wide: true },
+        { label: '保存路径', value: record.save_path || '-' },
+        { label: '分支', value: record.subscription_type === 'single_file' ? '-' : record.branch || '-' },
+        { label: '定时规则', value: <code>{record.schedule}</code> },
+        { label: '最后运行时间', value: record.last_run_time ? new Date(record.last_run_time).toLocaleString('zh-CN') : '-' },
+      ]}
+      actions={(
+        <>
+          <Button type="text" size="small" icon={<IconPlayArrow />} onClick={() => handleRun(record.id)} title="立即运行">运行</Button>
+          <Button type="text" size="small" icon={<IconFile />} onClick={() => handleViewLog(record)} disabled={!record.last_run_log} title="查看日志">日志</Button>
+          <Button type="text" size="small" icon={<IconEdit />} onClick={() => handleEdit(record)} title="编辑">编辑</Button>
+          <Popconfirm title="确定删除此订阅吗？" onOk={() => handleDelete(record.id)}>
+            <Button type="text" size="small" status="danger" icon={<IconDelete />} title="删除">删除</Button>
+          </Popconfirm>
+        </>
+      )}
+    />
+  );
+
   const columns = [
     {
       title: '名称',
@@ -150,15 +191,29 @@ const Subscriptions: React.FC = () => {
       width: 150,
     },
     {
-      title: '仓库地址',
+      title: '类型',
+      dataIndex: 'subscription_type',
+      width: 110,
+      render: (type: string) => type === 'single_file' ? '单文件' : 'Git仓库',
+    },
+    {
+      title: '地址',
       dataIndex: 'url',
       width: 300,
       ellipsis: true,
     },
     {
+      title: '保存路径',
+      dataIndex: 'save_path',
+      width: 180,
+      ellipsis: true,
+      render: (path: string) => path || '-',
+    },
+    {
       title: '分支',
       dataIndex: 'branch',
       width: 100,
+      render: (branch: string, record: Subscription) => record.subscription_type === 'single_file' ? '-' : branch,
     },
     {
       title: '定时规则',
@@ -242,13 +297,25 @@ const Subscriptions: React.FC = () => {
           </Button>
         }
       >
-        <Table
-          columns={columns}
-          data={subscriptions}
-          loading={loading}
-          pagination={{ pageSize: 10 }}
-          rowKey="id"
-        />
+        {isMobile ? (
+          <div className="mobile-record-list">
+            {loading ? (
+              <div className="mobile-record-list__loading">加载中...</div>
+            ) : subscriptions.length > 0 ? (
+              subscriptions.map(renderMobileCard)
+            ) : (
+              <div className="mobile-record-list__empty">暂无订阅</div>
+            )}
+          </div>
+        ) : (
+          <Table
+            columns={columns}
+            data={subscriptions}
+            loading={loading}
+            pagination={{ pageSize: 10 }}
+            rowKey="id"
+          />
+        )}
       </Card>
 
       <Modal
@@ -263,11 +330,30 @@ const Subscriptions: React.FC = () => {
           <FormItem label="订阅名称" field="name" rules={[{ required: true, message: '请输入订阅名称' }]}>
             <Input placeholder="例如: 京东脚本库" />
           </FormItem>
-          <FormItem label="仓库地址" field="url" rules={[{ required: true, message: '请输入仓库地址' }]}>
-            <Input placeholder="https://github.com/user/repo.git" />
+          <FormItem label="类型" field="subscription_type" rules={[{ required: true, message: '请选择订阅类型' }]}>
+            <Select>
+              <Select.Option value="git">Git仓库</Select.Option>
+              <Select.Option value="single_file">单文件</Select.Option>
+            </Select>
           </FormItem>
-          <FormItem label="分支" field="branch" rules={[{ required: true, message: '请输入分支名' }]}>
-            <Input placeholder="main" />
+          <FormItem label="地址" field="url" rules={[{ required: true, message: '请输入地址' }]}>
+            <Input placeholder="Git仓库地址或单文件URL" />
+          </FormItem>
+          <FormItem shouldUpdate noStyle>
+            {(values) => values.subscription_type === 'single_file' ? (
+              <FormItem label="保存路径（可选）" field="save_path" extra="留空时自动使用订阅地址中的文件名">
+                <Input placeholder="留空自动使用地址中的文件名，例如：example.py" />
+              </FormItem>
+            ) : (
+              <>
+                <FormItem label="分支" field="branch" rules={[{ required: true, message: '请输入分支名' }]}>
+                  <Input placeholder="main" />
+                </FormItem>
+                <FormItem label="自动解析依赖" field="auto_resolve_dependencies" triggerPropName="checked" extra="拉取后解析 package.json 或 requirements.txt，并自动添加不存在的依赖">
+                  <Switch />
+                </FormItem>
+              </>
+            )}
           </FormItem>
           <FormItem label="定时规则" field="schedule" rules={[{ required: true, message: '请输入定时规则' }]}>
             <Input placeholder="0 0 * * * (每天0点)" />

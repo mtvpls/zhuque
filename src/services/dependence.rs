@@ -218,6 +218,78 @@ impl DependenceService {
         Ok(deps)
     }
 
+    /// 自动导入订阅解析出的依赖，不重复添加已有依赖
+    pub async fn ensure_dependencies(&self, dependencies: Vec<(String, DependenceType)>) -> Result<Vec<String>> {
+        let mut added = Vec::new();
+        for (name, dep_type) in dependencies {
+            let name = name.trim().to_string();
+            if name.is_empty() || Self::is_dependency_option(&name) {
+                continue;
+            }
+
+            let exists = {
+                let pool = self.pool.read().await;
+                let rows = sqlx::query_as::<_, Dependence>(
+                    "SELECT * FROM dependences WHERE type = ?",
+                )
+                .bind(dep_type.to_i32())
+                .fetch_all(&*pool)
+                .await?;
+                rows.iter().any(|dep| Self::dependency_key(&dep.name) == Self::dependency_key(&name))
+            };
+
+            if exists {
+                continue;
+            }
+
+            let now = Utc::now();
+            let result = sqlx::query(
+                "INSERT INTO dependences (name, type, status, remark, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&name)
+            .bind(dep_type.to_i32())
+            .bind(DependenceStatus::Installing.to_i32())
+            .bind("订阅自动解析")
+            .bind(now)
+            .bind(now)
+            .execute(&*self.pool.read().await)
+            .await?;
+
+            let dep = self.get(result.last_insert_rowid()).await?
+                .ok_or_else(|| anyhow::anyhow!("Failed to get imported dependency"))?;
+            let pool = self.pool.clone();
+            let semaphore = self.install_semaphore.clone();
+            let display_name = dep.name.clone();
+            tokio::spawn(async move {
+                let _permit = semaphore.acquire().await.unwrap();
+                if let Err(e) = Self::install_dependency(&pool, dep).await {
+                    error!("Failed to install auto-imported dependency: {}", e);
+                }
+            });
+            added.push(display_name);
+        }
+        Ok(added)
+    }
+
+    fn is_dependency_option(name: &str) -> bool {
+        name.starts_with('-') || name.starts_with("git+") || name.starts_with("http://") || name.starts_with("https://")
+    }
+
+    fn dependency_key(name: &str) -> String {
+        let name = name.split(';').next().unwrap_or(name).trim();
+        let name = name.split('#').next().unwrap_or(name).trim();
+        let name = if name.starts_with('@') {
+            name.find('@')
+                .and_then(|start| name[start + 1..].find('@').map(|offset| &name[..start + 1 + offset]))
+                .unwrap_or(name)
+        } else {
+            name.split('@').next().unwrap_or(name)
+        };
+        let name = name.split(['=', '<', '>', '!', '~', '[']).next().unwrap_or(name).trim();
+        name.to_ascii_lowercase().replace('_', "-")
+    }
+
     /// 更新依赖
     pub async fn update(&self, id: i64, update: UpdateDependence) -> Result<Option<Dependence>> {
         let mut query = String::from("UPDATE dependences SET updated_at = ?");

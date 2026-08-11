@@ -170,7 +170,10 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool> {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL UNIQUE,
             url TEXT NOT NULL,
+            subscription_type TEXT NOT NULL DEFAULT 'git',
             branch TEXT NOT NULL DEFAULT 'main',
+            save_path TEXT,
+            auto_resolve_dependencies BOOLEAN NOT NULL DEFAULT 0,
             schedule TEXT NOT NULL,
             enabled BOOLEAN NOT NULL DEFAULT 1,
             last_run_time DATETIME,
@@ -187,6 +190,20 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_subscriptions_enabled ON subscriptions(enabled)")
         .execute(&pool)
         .await?;
+
+    // 订阅字段迁移：兼容已有数据库
+    sqlx::query("ALTER TABLE subscriptions ADD COLUMN subscription_type TEXT NOT NULL DEFAULT 'git'")
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("ALTER TABLE subscriptions ADD COLUMN save_path TEXT")
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("ALTER TABLE subscriptions ADD COLUMN auto_resolve_dependencies BOOLEAN NOT NULL DEFAULT 0")
+        .execute(&pool)
+        .await
+        .ok();
 
     // 创建系统配置表
     sqlx::query(

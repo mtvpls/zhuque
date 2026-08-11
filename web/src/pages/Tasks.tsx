@@ -30,6 +30,7 @@ import { notificationApi } from '@/api/notification';
 import axios from 'axios';
 import type { Task, TaskNotificationConfig, ChannelConfig } from '@/types';
 import { copyTextToClipboard } from '@/utils/clipboard';
+import MobileRecordCard from '@/components/MobileRecordCard';
 
 const FormItem = Form.Item;
 const { Option } = Select;
@@ -76,6 +77,8 @@ const Tasks: React.FC = () => {
   const [editingTask, setEditingTask] = useState<Task | null>(null);
   const [form] = Form.useForm();
   const [isMobile, setIsMobile] = useState(window.innerWidth < 768);
+  const [mobilePage, setMobilePage] = useState(1);
+  const mobilePageSize = 10;
   const [taskEnvFormat, setTaskEnvFormat] = useState<'json' | 'dotenv'>('json');
 
   // 分组相关状态
@@ -192,12 +195,11 @@ const Tasks: React.FC = () => {
 
   useEffect(() => {
     loadTasks();
-  }, [activeTab]);
+  }, [activeTab, searchKeyword]);
 
-  // 搜索关键字变化时重新加载
   useEffect(() => {
-    loadTasks();
-  }, [searchKeyword]);
+    setMobilePage(1);
+  }, [activeTab, searchKeyword]);
 
   const loadGroups = async () => {
     try {
@@ -610,6 +612,55 @@ const Tasks: React.FC = () => {
     return <Tag color={config.color}>{config.text}</Tag>;
   };
 
+  const renderMobileCard = (record: Task) => {
+    const isRunning = runningTasks.has(record.id);
+    const cronValue = record.type === 'cron'
+      ? (Array.isArray(record.cron) ? record.cron.join(' · ') : record.cron)
+      : '非定时任务';
+    return (
+      <MobileRecordCard
+        key={record.id}
+        eyebrow={cronValue}
+        title={record.name}
+        status={(
+          <Space size={4}>
+            <Tag color={record.enabled ? 'green' : 'gray'}>{record.enabled ? '启用' : '禁用'}</Tag>
+            {isRunning && <Tag color="blue">运行中</Tag>}
+          </Space>
+        )}
+        fields={[
+          { label: '类型', value: getTaskTypeTag(record.type) },
+          { label: '最后执行', value: record.last_run_at ? new Date(record.last_run_at).toLocaleString('zh-CN') : '-' },
+          { label: '下次执行', value: record.next_run_at ? new Date(record.next_run_at).toLocaleString('zh-CN') : '-' },
+          { label: '命令', value: <code title={record.command}>{record.command}</code>, wide: true },
+        ]}
+        actions={(
+          <>
+            {isRunning ? (
+              <Popconfirm title="确定终止此任务吗？" onOk={() => handleKill(record.id)}>
+                <Button type="text" size="small" status="warning" icon={<IconStop />}>终止</Button>
+              </Popconfirm>
+            ) : (
+              <Button type="text" size="small" icon={<IconPlayArrow />} onClick={() => handleRun(record.id)}>执行</Button>
+            )}
+            <Button type="text" size="small" icon={<IconFile />} onClick={() => handleViewLog(record)}>日志</Button>
+            <Dropdown droplist={(
+              <Menu>
+                <Menu.Item key="edit" onClick={() => handleEdit(record)} disabled={isRunning}><Space><IconEdit />编辑</Space></Menu.Item>
+                <Menu.Item key="clone" onClick={() => handleClone(record)}><Space><IconCopy />克隆</Space></Menu.Item>
+                <Menu.Item key="toggle" onClick={() => handleToggleEnabled(record.id, !record.enabled)} disabled={isRunning}><Space><IconPoweroff />{record.enabled ? '禁用' : '启用'}</Space></Menu.Item>
+                {webhookToken && <Menu.Item key="webhook" onClick={() => showWebhookUrl(record.id)}><Space><IconLink />Webhook</Space></Menu.Item>}
+                <Menu.Item key="delete" onClick={() => Modal.confirm({ title: '确定删除此任务吗？', onOk: () => handleDelete(record.id) })} disabled={isRunning}><Space><IconDelete />删除</Space></Menu.Item>
+              </Menu>
+            )} position="bl">
+              <Button type="text" size="small" icon={<IconMore />} />
+            </Dropdown>
+          </>
+        )}
+      />
+    );
+  };
+
   const columns = [
     {
       title: '任务名称',
@@ -801,25 +852,55 @@ const Tasks: React.FC = () => {
   ];
 
   const renderTabContent = () => {
+  const mobilePageCount = Math.max(1, Math.ceil(tasks.length / mobilePageSize));
+  const mobileTasks = tasks.slice((mobilePage - 1) * mobilePageSize, mobilePage * mobilePageSize);
+
     return (
       <div>
         <div style={{ marginBottom: 16, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <span style={{ color: '#86909c' }}>
-            共 {tasks.length} 个任务
-          </span>
-          <Button type="primary" icon={<IconPlus />} onClick={handleAdd}>
-            新建任务
-          </Button>
+          <span style={{ color: '#86909c' }}>共 {tasks.length} 个任务</span>
+          <Button type="primary" icon={<IconPlus />} onClick={handleAdd}>新建任务</Button>
         </div>
-        <Table
-          columns={columns}
-          data={tasks}
-          loading={loading}
-          pagination={{ pageSize: 10 }}
-          scroll={{ x: isMobile ? 840 : 1410 }}
-          rowKey="id"
-          rowClassName={(record: Task) => (!record.enabled ? 'task-row-disabled' : '')}
-        />
+        {isMobile ? (
+          <div className="mobile-record-list">
+            {loading ? (
+              <div className="mobile-record-list__loading">加载中...</div>
+            ) : tasks.length > 0 ? (
+              mobileTasks.map(renderMobileCard)
+            ) : (
+              <div className="mobile-record-list__empty">暂无任务</div>
+            )}
+            {!loading && tasks.length > mobilePageSize && (
+              <div className="mobile-record-list__pagination">
+                <Button
+                  size="small"
+                  disabled={mobilePage <= 1}
+                  onClick={() => setMobilePage((page) => Math.max(1, page - 1))}
+                >
+                  上一页
+                </Button>
+                <span>第 {mobilePage} / {mobilePageCount} 页</span>
+                <Button
+                  size="small"
+                  disabled={mobilePage >= mobilePageCount}
+                  onClick={() => setMobilePage((page) => Math.min(mobilePageCount, page + 1))}
+                >
+                  下一页
+                </Button>
+              </div>
+            )}
+          </div>
+        ) : (
+          <Table
+            columns={columns}
+            data={tasks}
+            loading={loading}
+            pagination={{ pageSize: 10 }}
+            scroll={{ x: 1410 }}
+            rowKey="id"
+            rowClassName={(record: Task) => (!record.enabled ? 'task-row-disabled' : '')}
+          />
+        )}
       </div>
     );
   };
@@ -1256,6 +1337,26 @@ const Tasks: React.FC = () => {
             新建分组
           </Button>
         </div>
+        {isMobile ? (
+          <div className="mobile-record-list">
+            {groups.length > 0 ? groups.map((record: any) => (
+              <MobileRecordCard
+                key={record.id}
+                eyebrow={record.created_at ? new Date(record.created_at).toLocaleString('zh-CN') : '任务分组'}
+                title={record.name}
+                fields={[{ label: '描述', value: record.description || '-' }]}
+                actions={(
+                  <>
+                    <Button type="text" size="small" icon={<IconEdit />} onClick={() => handleEditGroup(record)}>编辑</Button>
+                    <Popconfirm title="确定删除此分组吗？" onOk={() => handleDeleteGroup(record.id)}>
+                      <Button type="text" size="small" status="danger" icon={<IconDelete />}>删除</Button>
+                    </Popconfirm>
+                  </>
+                )}
+              />
+            )) : <div className="mobile-record-list__empty">暂无分组</div>}
+          </div>
+        ) : (
         <Table
           columns={[
             {
@@ -1301,6 +1402,7 @@ const Tasks: React.FC = () => {
           pagination={false}
           rowKey="id"
         />
+        )}
       </Modal>
 
       <Modal

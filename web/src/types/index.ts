@@ -57,7 +57,10 @@ export interface Subscription {
   id: number;
   name: string;
   url: string;
+  subscription_type: 'git' | 'single_file';
   branch: string;
+  save_path?: string;
+  auto_resolve_dependencies: boolean;
   schedule: string;
   enabled: boolean;
   last_run_time?: string;

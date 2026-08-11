@@ -13,6 +13,7 @@ import { IconFile, IconRefresh } from '@arco-design/web-react/icon';
 import { logApi } from '@/api/log';
 import { taskApi } from '@/api/task';
 import type { Log } from '@/types';
+import MobileRecordCard from '@/components/MobileRecordCard';
 import './Logs.css';
 
 const { Option } = Select;
@@ -103,6 +104,33 @@ const Logs: React.FC = () => {
     } finally {
       setLogLoading(false);
     }
+  };
+
+  const renderMobileCard = (log: Log) => {
+    const task = tasks.find((item) => item.id === log.task_id);
+    const statusMap: Record<string, { color: string; text: string }> = {
+      success: { color: 'green', text: '成功' },
+      failed: { color: 'red', text: '失败' },
+      running: { color: 'blue', text: '运行中' },
+    };
+    const config = statusMap[log.status] || { color: 'gray', text: log.status };
+    return (
+      <MobileRecordCard
+        key={log.id}
+        eyebrow={new Date(log.created_at).toLocaleString('zh-CN')}
+        title={task?.name || `任务 ${log.task_id}`}
+        status={<Tag color={config.color}>{config.text}</Tag>}
+        fields={[
+          { label: '耗时', value: log.duration ? `${log.duration}ms (${(log.duration / 1000).toFixed(2)}s)` : '-' },
+          { label: '记录编号', value: <code>#{log.id}</code> },
+        ]}
+        actions={(
+          <Button type="text" size="small" icon={<IconFile />} onClick={() => handleViewLog(log)}>
+            查看日志
+          </Button>
+        )}
+      />
+    );
   };
 
   const columns = [
@@ -199,19 +227,38 @@ const Logs: React.FC = () => {
         </Space>
       }
     >
-      <Table
-        columns={columns}
-        data={logs}
-        loading={loading}
-        pagination={{
-          current: pagination.current,
-          pageSize: pagination.pageSize,
-          total: pagination.total,
-          onChange: handlePageChange,
-        }}
-        scroll={{ x: 1000 }}
-        rowKey="id"
-      />
+      {isMobile ? (
+        <div className="mobile-record-list">
+          {loading ? (
+            <div className="mobile-record-list__loading">加载中...</div>
+          ) : logs.length > 0 ? (
+            logs.map(renderMobileCard)
+          ) : (
+            <div className="mobile-record-list__empty">暂无执行日志</div>
+          )}
+          {!loading && logs.length > 0 && pagination.total > pagination.pageSize && (
+            <div className="mobile-record-list__pagination">
+              <Button disabled={pagination.current <= 1} onClick={() => handlePageChange(pagination.current - 1)}>上一页</Button>
+              <span>第 {pagination.current} / {Math.ceil(pagination.total / pagination.pageSize)} 页</span>
+              <Button disabled={pagination.current >= Math.ceil(pagination.total / pagination.pageSize)} onClick={() => handlePageChange(pagination.current + 1)}>下一页</Button>
+            </div>
+          )}
+        </div>
+      ) : (
+        <Table
+          columns={columns}
+          data={logs}
+          loading={loading}
+          pagination={{
+            current: pagination.current,
+            pageSize: pagination.pageSize,
+            total: pagination.total,
+            onChange: handlePageChange,
+          }}
+          scroll={{ x: 1000 }}
+          rowKey="id"
+        />
+      )}
 
       <Modal
         title="执行日志"
