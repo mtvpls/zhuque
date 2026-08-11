@@ -11,6 +11,7 @@ import {
   Popconfirm,
   Tag,
   Switch,
+  Select,
 } from '@arco-design/web-react';
 import { IconPlus, IconPlayArrow, IconEdit, IconDelete, IconFile } from '@arco-design/web-react/icon';
 import { subscriptionApi } from '@/api/subscription';
@@ -55,16 +56,22 @@ const Subscriptions: React.FC = () => {
     setEditingSubscription(null);
     form.resetFields();
     form.setFieldsValue({
+      subscription_type: 'git',
       branch: 'main',
       schedule: '0 0 * * *',
       enabled: true,
+      auto_resolve_dependencies: false,
     });
     setVisible(true);
   };
 
   const handleEdit = (record: Subscription) => {
     setEditingSubscription(record);
-    form.setFieldsValue(record);
+    form.setFieldsValue({
+      ...record,
+      subscription_type: record.subscription_type || 'git',
+      auto_resolve_dependencies: record.auto_resolve_dependencies || false,
+    });
     setVisible(true);
   };
 
@@ -150,15 +157,29 @@ const Subscriptions: React.FC = () => {
       width: 150,
     },
     {
-      title: '仓库地址',
+      title: '类型',
+      dataIndex: 'subscription_type',
+      width: 110,
+      render: (type: string) => type === 'single_file' ? '单文件' : 'Git仓库',
+    },
+    {
+      title: '地址',
       dataIndex: 'url',
       width: 300,
       ellipsis: true,
     },
     {
+      title: '保存路径',
+      dataIndex: 'save_path',
+      width: 180,
+      ellipsis: true,
+      render: (path: string) => path || '-',
+    },
+    {
       title: '分支',
       dataIndex: 'branch',
       width: 100,
+      render: (branch: string, record: Subscription) => record.subscription_type === 'single_file' ? '-' : branch,
     },
     {
       title: '定时规则',
@@ -263,11 +284,30 @@ const Subscriptions: React.FC = () => {
           <FormItem label="订阅名称" field="name" rules={[{ required: true, message: '请输入订阅名称' }]}>
             <Input placeholder="例如: 京东脚本库" />
           </FormItem>
-          <FormItem label="仓库地址" field="url" rules={[{ required: true, message: '请输入仓库地址' }]}>
-            <Input placeholder="https://github.com/user/repo.git" />
+          <FormItem label="类型" field="subscription_type" rules={[{ required: true, message: '请选择订阅类型' }]}>
+            <Select>
+              <Select.Option value="git">Git仓库</Select.Option>
+              <Select.Option value="single_file">单文件</Select.Option>
+            </Select>
           </FormItem>
-          <FormItem label="分支" field="branch" rules={[{ required: true, message: '请输入分支名' }]}>
-            <Input placeholder="main" />
+          <FormItem label="地址" field="url" rules={[{ required: true, message: '请输入地址' }]}>
+            <Input placeholder="Git仓库地址或单文件URL" />
+          </FormItem>
+          <FormItem shouldUpdate noStyle>
+            {(values) => values.subscription_type === 'single_file' ? (
+              <FormItem label="保存路径（可选）" field="save_path" extra="留空时自动使用订阅地址中的文件名">
+                <Input placeholder="留空自动使用地址中的文件名，例如：example.py" />
+              </FormItem>
+            ) : (
+              <>
+                <FormItem label="分支" field="branch" rules={[{ required: true, message: '请输入分支名' }]}>
+                  <Input placeholder="main" />
+                </FormItem>
+                <FormItem label="自动解析依赖" field="auto_resolve_dependencies" triggerPropName="checked" extra="拉取后解析 package.json 或 requirements.txt，并自动添加不存在的依赖">
+                  <Switch />
+                </FormItem>
+              </>
+            )}
           </FormItem>
           <FormItem label="定时规则" field="schedule" rules={[{ required: true, message: '请输入定时规则' }]}>
             <Input placeholder="0 0 * * * (每天0点)" />
