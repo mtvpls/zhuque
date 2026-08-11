@@ -4,7 +4,7 @@
 
 一个轻量级、高性能的定时任务管理平台
 
-[![Rust](https://img.shields.io/badge/Rust-1.70+-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-1.88+-orange.svg)](https://www.rust-lang.org/)
 [![React](https://img.shields.io/badge/React-18-blue.svg)](https://reactjs.org/)
 [![Docker](https://img.shields.io/badge/Docker-ghcr.io-blue.svg)](https://ghcr.io/mtvpls/zhuque)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
@@ -81,8 +81,8 @@ docker-compose up -d
 
 前置要求：
 
-- Rust 1.70+
-- Node.js 18+
+- Rust 1.88+
+- Node.js ^20.19.0 或 >=22.12.0
 - SQLite 3
 
 1. 克隆项目
@@ -353,12 +353,12 @@ docker run -d \
 
 **本地开发示例：**
 
-创建 `.env` 文件（可选）：
+可选环境变量：
 
 ```bash
-DATABASE_URL=sqlite://./data/db/zhuque.db
-RUST_LOG=debug
-TZ=Asia/Shanghai
+export DATA_DIR=./data
+export RUST_LOG=debug
+export TZ=Asia/Shanghai
 ```
 
 ### 默认端口
@@ -376,9 +376,8 @@ TZ=Asia/Shanghai
 
 该目录包含：
 
-- `data/db/` - SQLite 数据库文件
+- `data/app.db` - SQLite 数据库文件
 - `data/scripts/` - 用户上传的脚本文件
-- `data/logs/` - 任务执行日志
 
 ## 📖 API 文档
 

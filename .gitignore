@@ -4,7 +4,6 @@
 *.db
 *.log
 .env
-Cargo.lock
 .claude/
 node_modules/
 dist/
