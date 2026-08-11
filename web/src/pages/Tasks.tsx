@@ -195,12 +195,7 @@ const Tasks: React.FC = () => {
 
   useEffect(() => {
     loadTasks();
-  }, [activeTab]);
-
-  // 搜索关键字变化时重新加载
-  useEffect(() => {
-    loadTasks();
-  }, [searchKeyword]);
+  }, [activeTab, searchKeyword]);
 
   useEffect(() => {
     setMobilePage(1);
