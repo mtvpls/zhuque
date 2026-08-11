@@ -52,7 +52,6 @@ const Config: React.FC = () => {
   const [form] = Form.useForm();
   const [passwordForm] = Form.useForm();
   const [saveLoading, setSaveLoading] = useState(false);
-  const [backupLoading, setBackupLoading] = useState(false);
   const [restoreLoading, setRestoreLoading] = useState(false);
   const [globalLoading, setGlobalLoading] = useState(false);
   const [loadingText, setLoadingText] = useState('');
@@ -387,44 +386,21 @@ const Config: React.FC = () => {
     });
   };
 
-  const handleBackup = async () => {
-    try {
-      setBackupLoading(true);
-      setGlobalLoading(true);
-      setLoadingText('正在创建备份，请稍候...');
-
-      const token = localStorage.getItem('token');
-
-      const response = await axios.get('/api/backup', {
-        headers: { Authorization: `Bearer ${token}` },
-        responseType: 'blob',
-      });
-
-      // 创建下载链接
-      const url = window.URL.createObjectURL(new Blob([response.data]));
-      const link = document.createElement('a');
-      link.href = url;
-
-      // 从响应头获取文件名
-      const contentDisposition = response.headers['content-disposition'];
-      const filename = contentDisposition
-        ? contentDisposition.split('filename=')[1].replace(/"/g, '')
-        : `zhuque_backup_${new Date().getTime()}.tar.gz`;
-
-      link.setAttribute('download', filename);
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      window.URL.revokeObjectURL(url);
-
-      Message.success('备份下载成功');
-    } catch (error: any) {
-      Message.error('备份失败');
-    } finally {
-      setBackupLoading(false);
-      setGlobalLoading(false);
-      setLoadingText('');
+  const handleBackup = () => {
+    const token = localStorage.getItem('token');
+    if (!token) {
+      Message.error('登录状态已失效，请重新登录');
+      return;
     }
+
+    const link = document.createElement('a');
+    link.href = `/api/backup?token=${encodeURIComponent(token)}`;
+    link.download = '';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+
+    Message.info('备份已开始，完成后浏览器将自动下载');
   };
 
   const handleRestoreFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -640,7 +616,6 @@ const Config: React.FC = () => {
                     <Button
                       type="primary"
                       icon={<IconDownload />}
-                      loading={backupLoading}
                       onClick={handleBackup}
                     >
                       创建备份
