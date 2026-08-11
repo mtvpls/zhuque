@@ -5,6 +5,7 @@ export interface MobileRecordField {
   label: string;
   value: React.ReactNode;
   wide?: boolean;
+  noTruncate?: boolean;
 }
 
 interface MobileRecordCardProps {
@@ -35,7 +36,7 @@ const MobileRecordCard: React.FC<MobileRecordCardProps> = ({
     <div className="mobile-record-card__fields">
       {fields.map((field) => (
         <div
-          className={`mobile-record-card__field${field.wide ? ' mobile-record-card__field--wide' : ''}`}
+          className={`mobile-record-card__field${field.wide ? ' mobile-record-card__field--wide' : ''}${field.noTruncate ? ' mobile-record-card__field--no-truncate' : ''}`}
           key={field.label}
         >
           <span className="mobile-record-card__label">{field.label}</span>

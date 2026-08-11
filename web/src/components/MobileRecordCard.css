@@ -95,6 +95,14 @@
   word-break: break-word;
 }
 
+.mobile-record-card__field--wide .mobile-record-card__value {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
 .mobile-record-card__actions {
   display: flex;
   flex-wrap: wrap;
@@ -163,5 +171,22 @@
 
   .mobile-record-card__status {
     max-width: 100%;
+  }
+}
+
+.mobile-record-card__field--no-truncate .mobile-record-card__value {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: nowrap;
+  overflow-wrap: normal;
+  word-break: normal;
+  font-size: 12px;
+  letter-spacing: -0.15px;
+}
+
+@media (max-width: 360px) {
+  .mobile-record-card__field--no-truncate .mobile-record-card__value {
+    font-size: 11px;
+    letter-spacing: -0.3px;
   }
 }
