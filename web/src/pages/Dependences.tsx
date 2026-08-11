@@ -17,6 +17,7 @@ import {
 import { IconPlus, IconRefresh, IconDelete, IconFile, IconMinusCircle } from '@arco-design/web-react/icon';
 import { dependenceApi } from '@/api/dependence';
 import type { Dependence } from '@/types';
+import MobileRecordCard from '@/components/MobileRecordCard';
 
 const FormItem = Form.Item;
 const { Option } = Select;
@@ -249,6 +250,34 @@ const Dependences: React.FC = () => {
     },
   ];
 
+  const renderMobileCard = (record: Dependence) => {
+    const isInstalling = record.status === 0 || record.status === 3;
+    return (
+      <MobileRecordCard
+        key={record.id}
+        eyebrow={record.dep_type === 0 ? 'Node.js' : record.dep_type === 1 ? 'Python' : 'Linux'}
+        title={<code>{record.name}</code>}
+        status={getStatusTag(record.status)}
+        fields={[
+          { label: '备注', value: record.remark || '-' },
+          { label: '创建时间', value: new Date(record.created_at).toLocaleString('zh-CN') },
+        ]}
+        actions={(
+          <>
+            <Button type="text" size="small" icon={<IconFile />} onClick={() => handleViewLog(record)} title="查看日志" />
+            <Button type="text" size="small" icon={<IconRefresh />} onClick={() => handleReinstall(record.id)} disabled={isInstalling} title="重新安装" />
+            <Popconfirm title="确定删除此依赖吗？" onOk={() => handleDelete(record.id)}>
+              <Button type="text" size="small" status="danger" icon={<IconDelete />} disabled={isInstalling} title="删除" />
+            </Popconfirm>
+            <Popconfirm title="仅从数据库移除，不会卸载系统依赖" onOk={() => handleSoftDelete(record.id)}>
+              <Button type="text" size="small" status="warning" icon={<IconMinusCircle />} disabled={isInstalling} title="软删除" />
+            </Popconfirm>
+          </>
+        )}
+      />
+    );
+  };
+
   const renderTabContent = (type: number, typeName: string, typeValue: string) => {
     const filteredData = getFilteredDependences(type);
     return (
@@ -265,13 +294,25 @@ const Dependences: React.FC = () => {
             添加{typeName}依赖
           </Button>
         </div>
-        <Table
-          columns={columns}
-          data={filteredData}
-          loading={loading}
-          pagination={{ pageSize: 10 }}
-          rowKey="id"
-        />
+        {isMobile ? (
+          <div className="mobile-record-list">
+            {loading ? (
+              <div className="mobile-record-list__loading">加载中...</div>
+            ) : filteredData.length > 0 ? (
+              filteredData.map(renderMobileCard)
+            ) : (
+              <div className="mobile-record-list__empty">暂无依赖</div>
+            )}
+          </div>
+        ) : (
+          <Table
+            columns={columns}
+            data={filteredData}
+            loading={loading}
+            pagination={{ pageSize: 10 }}
+            rowKey="id"
+          />
+        )}
       </div>
     );
   };

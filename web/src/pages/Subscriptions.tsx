@@ -16,6 +16,7 @@ import {
 import { IconPlus, IconPlayArrow, IconEdit, IconDelete, IconFile } from '@arco-design/web-react/icon';
 import { subscriptionApi } from '@/api/subscription';
 import type { Subscription } from '@/types';
+import MobileRecordCard from '@/components/MobileRecordCard';
 
 const FormItem = Form.Item;
 
@@ -27,6 +28,7 @@ const Subscriptions: React.FC = () => {
   const [logContent, setLogContent] = useState('');
   const [editingSubscription, setEditingSubscription] = useState<Subscription | null>(null);
   const [form] = Form.useForm();
+  const [isMobile, setIsMobile] = useState(() => window.innerWidth <= 768);
 
   useEffect(() => {
     loadSubscriptions(true);
@@ -34,6 +36,12 @@ const Subscriptions: React.FC = () => {
       loadSubscriptions(false);
     }, 5000);
     return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    const handler = () => setIsMobile(window.innerWidth <= 768);
+    window.addEventListener('resize', handler);
+    return () => window.removeEventListener('resize', handler);
   }, []);
 
   const loadSubscriptions = async (showLoading: boolean = true) => {
@@ -150,6 +158,32 @@ const Subscriptions: React.FC = () => {
     return <Tag color="gray">{status}</Tag>;
   };
 
+  const renderMobileCard = (record: Subscription) => (
+    <MobileRecordCard
+      key={record.id}
+      eyebrow={record.subscription_type === 'single_file' ? '单文件订阅' : 'Git 仓库订阅'}
+      title={record.name}
+      status={<Space size={6}><Switch size="small" checked={record.enabled} onChange={(checked) => handleToggleEnabled(record.id, checked)} />{getStatusTag(record.last_run_status)}</Space>}
+      fields={[
+        { label: '地址', value: <span title={record.url}>{record.url}</span>, wide: true },
+        { label: '保存路径', value: record.save_path || '-' },
+        { label: '分支', value: record.subscription_type === 'single_file' ? '-' : record.branch || '-' },
+        { label: '定时规则', value: <code>{record.schedule}</code> },
+        { label: '最后运行时间', value: record.last_run_time ? new Date(record.last_run_time).toLocaleString('zh-CN') : '-' },
+      ]}
+      actions={(
+        <>
+          <Button type="text" size="small" icon={<IconPlayArrow />} onClick={() => handleRun(record.id)} title="立即运行">运行</Button>
+          <Button type="text" size="small" icon={<IconFile />} onClick={() => handleViewLog(record)} disabled={!record.last_run_log} title="查看日志">日志</Button>
+          <Button type="text" size="small" icon={<IconEdit />} onClick={() => handleEdit(record)} title="编辑">编辑</Button>
+          <Popconfirm title="确定删除此订阅吗？" onOk={() => handleDelete(record.id)}>
+            <Button type="text" size="small" status="danger" icon={<IconDelete />} title="删除">删除</Button>
+          </Popconfirm>
+        </>
+      )}
+    />
+  );
+
   const columns = [
     {
       title: '名称',
@@ -263,13 +297,25 @@ const Subscriptions: React.FC = () => {
           </Button>
         }
       >
-        <Table
-          columns={columns}
-          data={subscriptions}
-          loading={loading}
-          pagination={{ pageSize: 10 }}
-          rowKey="id"
-        />
+        {isMobile ? (
+          <div className="mobile-record-list">
+            {loading ? (
+              <div className="mobile-record-list__loading">加载中...</div>
+            ) : subscriptions.length > 0 ? (
+              subscriptions.map(renderMobileCard)
+            ) : (
+              <div className="mobile-record-list__empty">暂无订阅</div>
+            )}
+          </div>
+        ) : (
+          <Table
+            columns={columns}
+            data={subscriptions}
+            loading={loading}
+            pagination={{ pageSize: 10 }}
+            rowKey="id"
+          />
+        )}
       </Card>
 
       <Modal
