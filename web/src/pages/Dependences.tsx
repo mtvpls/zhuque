@@ -259,8 +259,8 @@ const Dependences: React.FC = () => {
         title={<code>{record.name}</code>}
         status={getStatusTag(record.status)}
         fields={[
-          { label: '备注', value: record.remark || '-' },
-          { label: '创建时间', value: new Date(record.created_at).toLocaleString('zh-CN') },
+          { label: '备注', value: record.remark || '-', tooltip: record.remark || '-' },
+          { label: '创建时间', value: new Date(record.created_at).toLocaleString('zh-CN'), tooltip: new Date(record.created_at).toLocaleString('zh-CN') },
         ]}
         actions={(
           <>

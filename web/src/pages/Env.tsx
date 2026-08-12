@@ -184,8 +184,8 @@ const Env: React.FC = () => {
         />
       )}
       fields={[
-        { label: '变量值', value: <code title={env.value}>{env.value}</code>, wide: true },
-        { label: '创建时间', value: new Date(env.created_at).toLocaleString('zh-CN') },
+        { label: '变量值', value: <code>{env.value}</code>, tooltip: env.value, wide: true },
+        { label: '创建时间', value: new Date(env.created_at).toLocaleString('zh-CN'), tooltip: new Date(env.created_at).toLocaleString('zh-CN') },
         { label: '状态', value: env.enabled ? '已启用' : '已禁用' },
       ]}
       actions={(

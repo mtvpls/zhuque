@@ -630,9 +630,9 @@ const Tasks: React.FC = () => {
         )}
         fields={[
           { label: '类型', value: getTaskTypeTag(record.type) },
-          { label: '最后执行', value: record.last_run_at ? new Date(record.last_run_at).toLocaleString('zh-CN') : '-', wide: true, noTruncate: true },
-          { label: '下次执行', value: record.next_run_at ? new Date(record.next_run_at).toLocaleString('zh-CN') : '-', wide: true, noTruncate: true },
-          { label: '命令', value: <code title={record.command}>{record.command}</code>, wide: true },
+          { label: '最后执行', value: record.last_run_at ? new Date(record.last_run_at).toLocaleString('zh-CN') : '-', wide: true },
+          { label: '下次执行', value: record.next_run_at ? new Date(record.next_run_at).toLocaleString('zh-CN') : '-', wide: true },
+          { label: '命令', value: <code>{record.command}</code>, tooltip: record.command, wide: true },
         ]}
         actions={(
           <>
