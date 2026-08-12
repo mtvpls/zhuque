@@ -36,6 +36,9 @@
 }
 
 .mobile-record-card__title {
+  display: block;
+  width: 100%;
+  max-width: 100%;
   overflow: hidden;
   color: var(--color-text-1);
   font-size: 16px;
@@ -117,6 +120,16 @@
 .mobile-record-card__actions .arco-btn {
   min-width: 34px;
   border-radius: 8px;
+}
+
+.mobile-record-card__tooltip-trigger {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 @keyframes mobile-record-card-in {

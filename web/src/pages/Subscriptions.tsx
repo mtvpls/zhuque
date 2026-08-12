@@ -165,11 +165,11 @@ const Subscriptions: React.FC = () => {
       title={record.name}
       status={<Space size={6}><Switch size="small" checked={record.enabled} onChange={(checked) => handleToggleEnabled(record.id, checked)} />{getStatusTag(record.last_run_status)}</Space>}
       fields={[
-        { label: '地址', value: <span title={record.url}>{record.url}</span>, wide: true },
-        { label: '保存路径', value: record.save_path || '-' },
+        { label: '地址', value: <span>{record.url}</span>, tooltip: record.url, wide: true },
+        { label: '保存路径', value: record.save_path || '-', tooltip: record.save_path || '-' },
         { label: '分支', value: record.subscription_type === 'single_file' ? '-' : record.branch || '-' },
         { label: '定时规则', value: <code>{record.schedule}</code> },
-        { label: '最后运行时间', value: record.last_run_time ? new Date(record.last_run_time).toLocaleString('zh-CN') : '-' },
+        { label: '最后运行时间', value: record.last_run_time ? new Date(record.last_run_time).toLocaleString('zh-CN') : '-', tooltip: record.last_run_time ? new Date(record.last_run_time).toLocaleString('zh-CN') : '-' },
       ]}
       actions={(
         <>
