@@ -6,7 +6,7 @@ use axum::{
     Json,
 };
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::{sqlite::SqliteConnectOptions, Connection, SqliteConnection};
 use std::{
@@ -35,6 +35,13 @@ impl BackupQuery {
     fn totp_code(&self) -> Option<&str> {
         self.totp_code.as_deref().map(str::trim).filter(|code| !code.is_empty())
     }
+}
+
+#[derive(Debug, Serialize)]
+struct BackupError {
+    success: bool,
+    message: &'static str,
+    requires_totp: bool,
 }
 
 // ponytail: Process-local lock; use a filesystem lock if DATA_DIR is shared by multiple instances.
