@@ -14,6 +14,7 @@ import {
 import { IconPlus, IconEdit, IconDelete, IconImport } from '@arco-design/web-react/icon';
 import { envApi } from '@/api/env';
 import type { EnvVar } from '@/types';
+import MobileRecordCard from '@/components/MobileRecordCard';
 
 const FormItem = Form.Item;
 
@@ -162,6 +163,42 @@ const Env: React.FC = () => {
     }
   };
 
+  const renderMobileCard = (env: EnvVar) => (
+    <MobileRecordCard
+      key={env.id}
+      eyebrow={env.remark || '环境变量'}
+      title={<code>{env.key}</code>}
+      status={(
+        <Switch
+          size="small"
+          checked={env.enabled}
+          onChange={async (checked) => {
+            try {
+              await envApi.update(env.id, { enabled: checked });
+              Message.success(checked ? '已启用' : '已禁用');
+              loadEnvVars();
+            } catch (error: any) {
+              Message.error(error.response?.data?.error || '操作失败');
+            }
+          }}
+        />
+      )}
+      fields={[
+        { label: '变量值', value: <code>{env.value}</code>, tooltip: env.value, wide: true },
+        { label: '创建时间', value: new Date(env.created_at).toLocaleString('zh-CN'), tooltip: new Date(env.created_at).toLocaleString('zh-CN') },
+        { label: '状态', value: env.enabled ? '已启用' : '已禁用' },
+      ]}
+      actions={(
+        <>
+          <Button type="secondary" size="small" icon={<IconEdit />} onClick={() => handleEdit(env)}>编辑</Button>
+          <Popconfirm title="确定删除此环境变量吗？" onOk={() => handleDelete(env.id)}>
+            <Button type="text" size="small" status="danger" icon={<IconDelete />}>删除</Button>
+          </Popconfirm>
+        </>
+      )}
+    />
+  );
+
   const columns = [
     {
       title: '变量名',
@@ -286,19 +323,31 @@ const Env: React.FC = () => {
           style={{ width: isMobile ? 260 : 260, maxWidth: '100%' }}
         />
       </div>
-      <Table
-        columns={columns}
-        data={envVars}
-        loading={loading}
-        pagination={{ pageSize: 10 }}
-        scroll={{ x: 1200 }}
-        rowKey="id"
-        rowSelection={{
-          type: 'checkbox',
-          selectedRowKeys,
-          onChange: (keys) => setSelectedRowKeys(keys as number[]),
-        }}
-      />
+      {isMobile ? (
+        <div className="mobile-record-list">
+          {loading ? (
+            <div className="mobile-record-list__loading">加载中...</div>
+          ) : envVars.length > 0 ? (
+            envVars.map(renderMobileCard)
+          ) : (
+            <div className="mobile-record-list__empty">暂无环境变量</div>
+          )}
+        </div>
+      ) : (
+        <Table
+          columns={columns}
+          data={envVars}
+          loading={loading}
+          pagination={{ pageSize: 10 }}
+          scroll={{ x: 1200 }}
+          rowKey="id"
+          rowSelection={{
+            type: 'checkbox',
+            selectedRowKeys,
+            onChange: (keys) => setSelectedRowKeys(keys as number[]),
+          }}
+        />
+      )}
 
       <Modal
         title={editingEnv ? '编辑环境变量' : '新建环境变量'}

@@ -43,10 +43,13 @@ pub async fn create_subscription(
         .create(payload)
         .await
         .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() }))
-            )
+            let message = e.to_string();
+            let status = if message.contains("已存在") || message.contains("不支持") || message.contains("必须") || message.contains("保存路径") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, Json(serde_json::json!({ "error": message })))
         })?;
 
     // 刷新订阅调度器
@@ -61,13 +64,21 @@ pub async fn update_subscription(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
     Json(payload): Json<UpdateSubscription>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let sub = state
         .subscription_service
         .update(id, payload)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .map_err(|e| {
+            let message = e.to_string();
+            let status = if message.contains("不支持") || message.contains("必须") || message.contains("保存路径") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, Json(serde_json::json!({ "error": message })))
+        })?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "订阅不存在" })) ))?;
 
     // 刷新订阅调度器
     if let Err(e) = state.subscription_scheduler.reload_subscriptions().await {

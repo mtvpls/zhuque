@@ -112,7 +112,11 @@ async fn main() -> Result<()> {
     let script_service = Arc::new(ScriptService::new(scripts_dir.clone(), data_dir.join("helpers"), env_service.clone()));
     let dependence_service = Arc::new(DependenceService::new(shared_pool.clone()));
     let task_group_service = Arc::new(TaskGroupService::new(shared_pool.clone()));
-    let subscription_service = Arc::new(SubscriptionService::new(shared_pool.clone(), scripts_dir.clone()));
+    let subscription_service = Arc::new(SubscriptionService::new(
+        shared_pool.clone(),
+        scripts_dir.clone(),
+        dependence_service.clone(),
+    ));
     let config_service = Arc::new(ConfigService::new(shared_pool.clone()));
     let user_service = Arc::new(UserService::new(shared_pool.clone()));
     let mut auth_service = AuthService::new(user_service.clone())?;

@@ -7,7 +7,10 @@ pub struct Subscription {
     pub id: i64,
     pub name: String,
     pub url: String,
+    pub subscription_type: String,
     pub branch: String,
+    pub save_path: Option<String>,
+    pub auto_resolve_dependencies: bool,
     pub schedule: String,
     pub enabled: bool,
     pub last_run_time: Option<DateTime<Utc>>,
@@ -21,7 +24,12 @@ pub struct Subscription {
 pub struct CreateSubscription {
     pub name: String,
     pub url: String,
+    #[serde(default = "default_subscription_type")]
+    pub subscription_type: String,
     pub branch: Option<String>,
+    pub save_path: Option<String>,
+    #[serde(default)]
+    pub auto_resolve_dependencies: bool,
     pub schedule: String,
     pub enabled: Option<bool>,
 }
@@ -30,7 +38,14 @@ pub struct CreateSubscription {
 pub struct UpdateSubscription {
     pub name: Option<String>,
     pub url: Option<String>,
+    pub subscription_type: Option<String>,
     pub branch: Option<String>,
+    pub save_path: Option<String>,
+    pub auto_resolve_dependencies: Option<bool>,
     pub schedule: Option<String>,
     pub enabled: Option<bool>,
+}
+
+fn default_subscription_type() -> String {
+    "git".to_string()
 }

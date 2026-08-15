@@ -6,7 +6,10 @@ const API_BASE = '/api/subscriptions';
 export interface CreateSubscription {
   name: string;
   url: string;
+  subscription_type: 'git' | 'single_file';
   branch?: string;
+  save_path?: string;
+  auto_resolve_dependencies?: boolean;
   schedule: string;
   enabled?: boolean;
 }
@@ -14,7 +17,10 @@ export interface CreateSubscription {
 export interface UpdateSubscription {
   name?: string;
   url?: string;
+  subscription_type?: 'git' | 'single_file';
   branch?: string;
+  save_path?: string;
+  auto_resolve_dependencies?: boolean;
   schedule?: string;
   enabled?: boolean;
 }
