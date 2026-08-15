@@ -16,7 +16,7 @@ use services::TerminalService;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[cfg(feature = "jemalloc")]
@@ -92,11 +92,8 @@ async fn main() -> Result<()> {
             max_backups: None,
         };
 
-        if let Err(e) = restore_latest_backup(&backup_config, &data_dir).await {
-            error!("Failed to restore backup on startup: {}", e);
-        } else {
-            info!("Backup restored successfully");
-        }
+        restore_latest_backup(&backup_config, &data_dir).await?;
+        info!("Startup backup restore handling completed");
     }
 
     // 初始化数据库
@@ -321,8 +318,6 @@ async fn restore_latest_backup(
     data_dir: &PathBuf,
 ) -> Result<()> {
     use services::WebDavClient;
-    use flate2::read::GzDecoder;
-    use tar::Archive;
 
     let client = WebDavClient::new(
         backup_config.webdav_url.clone(),
@@ -357,22 +352,54 @@ async fn restore_latest_backup(
 
     info!("Downloaded backup file: {} bytes", tokio::fs::metadata(&temp_file).await?.len());
 
-    // 清空 data 目录
-    if data_dir.exists() {
-        tokio::fs::remove_dir_all(&data_dir).await?;
+    let restore_result: Result<()> = async {
+        let rollback_path = data_dir.parent().unwrap_or(std::path::Path::new(".")).join(format!(
+            "zhuque_before_startup_restore_{}.tar.gz",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let has_current_data = data_dir.join("app.db").is_file();
+
+        if has_current_data {
+            api::backup::create_backup_file(data_dir.clone(), rollback_path.clone()).await?;
+        }
+
+        let staging_dir = match api::backup::prepare_backup_file(&temp_file, data_dir).await {
+            Ok(path) => path,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&rollback_path).await;
+                return Err(e.into());
+            }
+        };
+
+        match api::backup::activate_prepared_backup(data_dir, &staging_dir).await {
+            Ok(()) => {
+                let _ = tokio::fs::remove_file(&rollback_path).await;
+                Ok(())
+            }
+            Err(restore_error) if has_current_data => {
+                match api::backup::restore_backup_file(&rollback_path, data_dir).await {
+                    Ok(()) => {
+                        let _ = tokio::fs::remove_file(&rollback_path).await;
+                        warn!(
+                            "Startup restore failed, current data was rolled back: {}",
+                            restore_error
+                        );
+                        Ok(())
+                    }
+                    Err(rollback_error) => Err(anyhow::anyhow!(
+                        "restore failed: {}; rollback failed: {}; rollback archive: {}",
+                        restore_error,
+                        rollback_error,
+                        rollback_path.display()
+                    )),
+                }
+            }
+            Err(e) => Err(e.into()),
+        }
     }
-    tokio::fs::create_dir_all(&data_dir).await?;
-
-    // 解压备份文件
-    let file_data = std::fs::read(&temp_file)?;
-    let decoder = GzDecoder::new(&file_data[..]);
-    let mut archive = Archive::new(decoder);
-
-    let parent_dir = data_dir.parent().unwrap_or(std::path::Path::new("."));
-    archive.unpack(parent_dir)?;
-
-    // 删除临时文件
+    .await;
     let _ = tokio::fs::remove_file(&temp_file).await;
+    restore_result?;
 
     info!("Backup restored successfully");
 
