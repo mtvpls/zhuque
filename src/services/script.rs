@@ -93,25 +93,41 @@ impl ScriptService {
         }
     }
 
+    fn prepend_path_var(existing: Option<&String>, prefix: &Path) -> String {
+        let mut paths = vec![prefix.to_path_buf()];
+        if let Some(existing) = existing {
+            paths.extend(std::env::split_paths(existing));
+        }
+        std::env::join_paths(paths)
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| {
+                let separator = if cfg!(windows) { ";" } else { ":" };
+                match existing {
+                    Some(value) if !value.is_empty() => {
+                        format!("{}{}{}", prefix.display(), separator, value)
+                    }
+                    _ => prefix.to_string_lossy().into_owned(),
+                }
+            })
+    }
+
     /// 获取基础环境变量
     fn get_base_env(&self) -> HashMap<String, String> {
-        let helpers = self.helpers_dir.to_string_lossy();
-        let sys_path = std::env::var("PATH").unwrap_or_default();
-        let sys_pypath = std::env::var("PYTHONPATH").unwrap_or_default();
-        let sys_nodepath = std::env::var("NODE_PATH").unwrap_or_default();
-
         let mut env_vars = HashMap::new();
-        env_vars.insert("PATH".to_string(), format!("{}:{}", helpers, sys_path));
-        env_vars.insert("PYTHONPATH".to_string(), if sys_pypath.is_empty() {
-            helpers.to_string()
-        } else {
-            format!("{}:{}", helpers, sys_pypath)
-        });
-        env_vars.insert("NODE_PATH".to_string(), if sys_nodepath.is_empty() {
-            helpers.to_string()
-        } else {
-            format!("{}:{}", helpers, sys_nodepath)
-        });
+        #[cfg(windows)]
+        env_vars.extend(std::env::vars());
+        env_vars.insert(
+            "PATH".to_string(),
+            Self::prepend_path_var(std::env::var("PATH").ok().as_ref(), &self.helpers_dir),
+        );
+        env_vars.insert(
+            "PYTHONPATH".to_string(),
+            Self::prepend_path_var(std::env::var("PYTHONPATH").ok().as_ref(), &self.helpers_dir),
+        );
+        env_vars.insert(
+            "NODE_PATH".to_string(),
+            Self::prepend_path_var(std::env::var("NODE_PATH").ok().as_ref(), &self.helpers_dir),
+        );
         env_vars.insert("HOME".to_string(), std::env::var("HOME").unwrap_or_default());
         env_vars.insert("USER".to_string(), std::env::var("USER").unwrap_or_default());
         env_vars.insert("SHELL".to_string(), std::env::var("SHELL").unwrap_or_default());
@@ -133,6 +149,43 @@ impl ScriptService {
             if let Ok(custom_vars) = serde_json::from_str::<HashMap<String, String>>(json_str) {
                 env_vars.extend(custom_vars);
             }
+        }
+
+        #[cfg(windows)]
+        for canonical in ["PATH", "PYTHONPATH", "NODE_PATH", "HOME"] {
+            if let Some(value) = env_vars
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(canonical))
+                .map(|(_, value)| value.clone())
+            {
+                env_vars.retain(|key, _| !key.eq_ignore_ascii_case(canonical));
+                env_vars.insert(canonical.to_string(), value);
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            let system_root = env_vars
+                .get("SystemRoot")
+                .cloned()
+                .or_else(|| env_vars.get("WINDIR").cloned())
+                .or_else(|| {
+                    env_vars
+                        .get("ComSpec")
+                        .and_then(|value| Path::new(value).parent()?.parent())
+                        .map(|path| path.to_string_lossy().into_owned())
+                })
+                .unwrap_or_else(|| "C:\\Windows".to_string());
+            env_vars.insert("SystemRoot".to_string(), system_root.clone());
+            env_vars.insert("WINDIR".to_string(), system_root);
+
+            let temp = env_vars
+                .get("TEMP")
+                .cloned()
+                .or_else(|| env_vars.get("TMP").cloned())
+                .unwrap_or_else(|| std::env::temp_dir().to_string_lossy().into_owned());
+            env_vars.insert("TEMP".to_string(), temp.clone());
+            env_vars.insert("TMP".to_string(), temp);
         }
 
         env_vars

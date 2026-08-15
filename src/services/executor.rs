@@ -171,6 +171,33 @@ impl Executor {
         }
     }
 
+    fn prepend_path_var(existing: Option<&String>, prefix: &std::path::Path) -> String {
+        let mut paths = vec![prefix.to_path_buf()];
+        if let Some(existing) = existing {
+            paths.extend(std::env::split_paths(existing));
+        }
+        std::env::join_paths(paths)
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| {
+                let separator = if cfg!(windows) { ";" } else { ":" };
+                match existing {
+                    Some(value) if !value.is_empty() => {
+                        format!("{}{}{}", prefix.display(), separator, value)
+                    }
+                    _ => prefix.to_string_lossy().into_owned(),
+                }
+            })
+    }
+
+    fn schedule_token_cleanup(&self, execution_id: &str) {
+        let token_registry = self.token_registry.clone();
+        let execution_id = execution_id.to_string();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            token_registry.write().await.remove(&execution_id);
+        });
+    }
+
     async fn kill_process_tree(pid: u32) -> bool {
         #[cfg(windows)]
         {
@@ -459,9 +486,10 @@ except Exception as e:
         tokio::fs::write(
             dir.join("notify.py"),
             r#"import subprocess as _sp
+import os as _os
 
 def send(title: str, content: str) -> None:
-    _sp.run(['notify', title, content])
+    _sp.run(['notify.cmd' if _os.name == 'nt' else 'notify', title, content])
 
 sendNotify = send
 "#,
@@ -474,7 +502,8 @@ sendNotify = send
 const { spawnSync } = require('child_process');
 
 function sendNotify(title, content) {
-    spawnSync('notify', [String(title), String(content)], { stdio: 'inherit' });
+    const command = process.platform === 'win32' ? 'notify.cmd' : 'notify';
+    spawnSync(command, [String(title), String(content)], { stdio: 'inherit' });
 }
 
 module.exports = { sendNotify };
@@ -488,11 +517,18 @@ module.exports.default = sendNotify;
             r#"import { spawnSync } from 'child_process';
 
 export function sendNotify(title: string, content: string): void {
-    spawnSync('notify', [String(title), String(content)], { stdio: 'inherit' });
+    const command = process.platform === 'win32' ? 'notify.cmd' : 'notify';
+    spawnSync(command, [String(title), String(content)], { stdio: 'inherit' });
 }
 
 export default sendNotify;
 "#,
+        )
+        .await?;
+
+        tokio::fs::write(
+            dir.join("notify.cmd"),
+            "@echo off\r\npython \"%~dp0notify\" %*\r\n",
         )
         .await?;
 
@@ -513,30 +549,17 @@ export default sendNotify;
             }
         }
 
-        let helpers_str = helpers_dir.to_string_lossy();
-
-        let old_path = env_vars.get("PATH").cloned().unwrap_or_default();
-        env_vars.insert("PATH".to_string(), format!("{}:{}", helpers_str, old_path));
-
-        let old_pypath = env_vars.get("PYTHONPATH").cloned().unwrap_or_default();
-        let new_pypath = if old_pypath.is_empty() {
-            helpers_str.to_string()
-        } else {
-            format!("{}:{}", helpers_str, old_pypath)
-        };
-        env_vars.insert("PYTHONPATH".to_string(), new_pypath);
-
-        let old_node_path = env_vars.get("NODE_PATH").cloned().unwrap_or_default();
-        let new_node_path = if old_node_path.is_empty() {
-            helpers_str.to_string()
-        } else {
-            format!("{}:{}", helpers_str, old_node_path)
-        };
-        env_vars.insert("NODE_PATH".to_string(), new_node_path);
+        for key in ["PATH", "PYTHONPATH", "NODE_PATH"] {
+            let value = Self::prepend_path_var(env_vars.get(key), helpers_dir);
+            env_vars.insert(key.to_string(), value);
+        }
 
         env_vars.insert(
             "ZHUQUE_NOTIFY_URL".to_string(),
-            "http://127.0.0.1:3000/api/notify/send".to_string(),
+            format!(
+                "http://127.0.0.1:{}/api/notify/send",
+                std::env::var("PORT").unwrap_or_else(|_| "3000".to_string())
+            ),
         );
         env_vars.insert("ZHUQUE_NOTIFY_TOKEN".to_string(), token.to_string());
     }
@@ -618,6 +641,7 @@ export default sendNotify;
                             self.log_channels.write().await.remove(&execution_id);
                             self.log_buffers.write().await.remove(&execution_id);
                             self.executions.write().await.remove(&execution_id);
+                            self.schedule_token_cleanup(&execution_id);
                             return Ok((execution_id, output, "failed"));
                         }
                     }
@@ -630,6 +654,7 @@ export default sendNotify;
 
                         self.log_channels.write().await.remove(&execution_id);
                         self.executions.write().await.remove(&execution_id);
+                        self.schedule_token_cleanup(&execution_id);
                         return Ok((execution_id, output, "failed"));
                     }
                 }
@@ -648,15 +673,27 @@ export default sendNotify;
         debug!("Adjusted command: {}", adjusted_command);
 
         let mut cmd = Self::shell_command(&adjusted_command);
-        cmd.current_dir(&working_dir)
-            .env_clear()
-            .envs(env_vars.clone())
+        cmd.current_dir(&working_dir);
+        cmd.env_clear();
+        cmd.envs(env_vars.clone())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = cmd.spawn()?;
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                self.schedule_token_cleanup(&execution_id);
+                return Err(e.into());
+            }
+        };
 
         // 注册进程
-        let pid = child.id().ok_or_else(|| anyhow!("Failed to get process ID"))?;
+        let pid = match child.id() {
+            Some(pid) => pid,
+            None => {
+                self.schedule_token_cleanup(&execution_id);
+                return Err(anyhow!("Failed to get process ID"));
+            }
+        };
         self.running_tasks.write().await.insert(task.id, pid);
 
         // 通知运行状态变化
@@ -742,7 +779,13 @@ export default sendNotify;
         }
 
         // 等待进程结束
-        let status_code = child.wait().await?;
+        let status_code = match child.wait().await {
+            Ok(status) => status,
+            Err(e) => {
+                self.schedule_token_cleanup(&execution_id);
+                return Err(e.into());
+            }
+        };
         let success = status_code.success();
 
         // 检查是否被手动终止
@@ -752,6 +795,7 @@ export default sendNotify;
                 "\n[KILLED] Task '{}' was manually terminated (PID: {})",
                 task.name, pid
             ));
+            self.schedule_token_cleanup(&execution_id);
             return Ok((execution_id, output, "killed"));
         }
 
@@ -845,7 +889,7 @@ export default sendNotify;
         let _ = self.running_tasks_notifier.send(update);
 
         // 清理 notify token
-        self.token_registry.write().await.remove(&execution_id);
+        self.schedule_token_cleanup(&execution_id);
 
         // 先确定最终状态，再发通知
         final_status = if overall_success { "success" } else { "failed" };
@@ -943,6 +987,7 @@ export default sendNotify;
 
                     self.executions.write().await.remove(&info.execution_id);
                     self.log_channels.write().await.remove(&info.execution_id);
+                    self.schedule_token_cleanup(&info.execution_id);
                     self.log_buffers.write().await.remove(&info.execution_id);
 
                     let running_list: Vec<i64> = self.running_tasks.read().await.keys().copied().collect();
@@ -1035,6 +1080,10 @@ export default sendNotify;
     async fn parse_env(&self, env_json: &Option<String>) -> HashMap<String, String> {
         let mut env_vars = HashMap::new();
 
+        // Windows runtime components require system variables in the child environment.
+        #[cfg(windows)]
+        env_vars.extend(std::env::vars());
+
         // 添加基础环境变量
         env_vars.insert("PATH".to_string(), std::env::var("PATH").unwrap_or_default());
         env_vars.insert("HOME".to_string(), std::env::var("HOME").unwrap_or_default());
@@ -1049,6 +1098,43 @@ export default sendNotify;
             if let Ok(custom_vars) = serde_json::from_str::<HashMap<String, String>>(json_str) {
                 env_vars.extend(custom_vars);
             }
+        }
+
+        #[cfg(windows)]
+        for canonical in ["PATH", "PYTHONPATH", "NODE_PATH", "HOME"] {
+            if let Some(value) = env_vars
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(canonical))
+                .map(|(_, value)| value.clone())
+            {
+                env_vars.retain(|key, _| !key.eq_ignore_ascii_case(canonical));
+                env_vars.insert(canonical.to_string(), value);
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            let system_root = env_vars
+                .get("SystemRoot")
+                .cloned()
+                .or_else(|| env_vars.get("WINDIR").cloned())
+                .or_else(|| {
+                    env_vars
+                        .get("ComSpec")
+                        .and_then(|value| std::path::Path::new(value).parent()?.parent())
+                        .map(|path| path.to_string_lossy().into_owned())
+                })
+                .unwrap_or_else(|| "C:\\Windows".to_string());
+            env_vars.insert("SystemRoot".to_string(), system_root.clone());
+            env_vars.insert("WINDIR".to_string(), system_root);
+
+            let temp = env_vars
+                .get("TEMP")
+                .cloned()
+                .or_else(|| env_vars.get("TMP").cloned())
+                .unwrap_or_else(|| std::env::temp_dir().to_string_lossy().into_owned());
+            env_vars.insert("TEMP".to_string(), temp.clone());
+            env_vars.insert("TMP".to_string(), temp);
         }
 
         env_vars
@@ -1073,11 +1159,10 @@ export default sendNotify;
         // 调整命令以适应工作目录
         let adjusted_command = self.adjust_command_for_working_dir(command, &working_dir);
 
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg(&adjusted_command)
-            .current_dir(&working_dir)
-            .env_clear()
+        let mut command = Self::shell_command(&adjusted_command);
+        command.current_dir(&working_dir);
+        command.env_clear();
+        let mut child = command
             .envs(env_vars.clone())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
