@@ -306,6 +306,7 @@ pub async fn execute_script(
     State(state): State<Arc<AppState>>,
     Path(path): Path<String>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+    let started_at = std::time::Instant::now();
     let (execution_id, stream) = state
         .script_service
         .execute_script(&path, None)
@@ -317,12 +318,26 @@ pub async fn execute_script(
         yield Ok(Event::default().event("execution_id").data(execution_id));
 
         let mut s = Box::pin(stream);
+        let mut status = "success";
         while let Some(result) = s.next().await {
             match result {
-                Ok(line) => yield Ok(Event::default().data(line)),
-                Err(e) => yield Ok(Event::default().data(format!("[ERROR] {}", e))),
+                Ok(line) => {
+                    if line.starts_with("[EXIT] Process exited with code ") && !line.ends_with("code 0") {
+                        status = "failed";
+                    }
+                    yield Ok(Event::default().data(line));
+                }
+                Err(e) => {
+                    status = "failed";
+                    yield Ok(Event::default().data(format!("[ERROR] {}", e)));
+                }
             }
         }
+        yield Ok(Event::default().data(format!(
+            "[NOTIFY] 模拟发送通知: 脚本运行完成，结果={}，耗时={}ms",
+            status,
+            started_at.elapsed().as_millis()
+        )));
     };
 
     Ok(Sse::new(sse_stream).keep_alive(KeepAlive::default()))
@@ -333,6 +348,7 @@ pub async fn execute_content(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<ExecuteContentRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+    let started_at = std::time::Instant::now();
     let (execution_id, stream) = state
         .script_service
         .execute_content(&payload.content, &payload.script_type, payload.env.as_deref(), payload.file_path.as_deref())
@@ -344,12 +360,26 @@ pub async fn execute_content(
         yield Ok(Event::default().event("execution_id").data(execution_id));
 
         let mut s = Box::pin(stream);
+        let mut status = "success";
         while let Some(result) = s.next().await {
             match result {
-                Ok(line) => yield Ok(Event::default().data(line)),
-                Err(e) => yield Ok(Event::default().data(format!("[ERROR] {}", e))),
+                Ok(line) => {
+                    if line.starts_with("[EXIT] Process exited with code ") && !line.ends_with("code 0") {
+                        status = "failed";
+                    }
+                    yield Ok(Event::default().data(line));
+                }
+                Err(e) => {
+                    status = "failed";
+                    yield Ok(Event::default().data(format!("[ERROR] {}", e)));
+                }
             }
         }
+        yield Ok(Event::default().data(format!(
+            "[NOTIFY] 模拟发送通知: 脚本调试完成，结果={}，耗时={}ms",
+            status,
+            started_at.elapsed().as_millis()
+        )));
     };
 
     Ok(Sse::new(sse_stream).keep_alive(KeepAlive::default()))
