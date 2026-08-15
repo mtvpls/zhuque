@@ -564,21 +564,71 @@ const Config: React.FC = () => {
     });
   };
 
-  const handleBackup = () => {
+  const handleBackup = async () => {
     const token = localStorage.getItem('token');
     if (!token) {
       Message.error('登录状态已失效，请重新登录');
       return;
     }
 
-    const link = document.createElement('a');
-    link.href = `/api/backup?token=${encodeURIComponent(token)}`;
-    link.download = '';
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
+    let totpEnabled = false;
+    try {
+      const totpStatus = await axios.get('/api/auth/totp/status', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      totpEnabled = totpStatus.data.enabled;
+    } catch (error) {
+      console.error('Failed to check TOTP status:', error);
+      Message.error('读取TOTP配置失败，无法创建备份');
+      return;
+    }
 
-    Message.info('备份已开始，完成后浏览器将自动下载');
+    const startDownload = (totpCode?: string) => {
+      const params = new URLSearchParams({ token });
+      if (totpCode) {
+        params.set('totp_code', totpCode);
+      }
+
+      const link = document.createElement('a');
+      link.href = `/api/backup?${params.toString()}`;
+      link.download = '';
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+
+      Message.info('备份已开始，完成后浏览器将自动下载');
+    };
+
+    if (!totpEnabled) {
+      startDownload();
+      return;
+    }
+
+    let totpCode = '';
+    Modal.confirm({
+      maskClosable: false,
+      title: '创建备份',
+      content: (
+        <div>
+          <p style={{ marginBottom: 8 }}>已启用TOTP，请输入验证码后创建备份。</p>
+          <Input
+            placeholder="请输入6位验证码"
+            maxLength={6}
+            onChange={(value) => {
+              totpCode = value;
+            }}
+            autoFocus
+          />
+        </div>
+      ),
+      onOk: async () => {
+        if (!totpCode || totpCode.length !== 6) {
+          Message.error('请输入6位验证码');
+          return Promise.reject();
+        }
+        startDownload(totpCode);
+      },
+    });
   };
 
   const handleRestoreFile = async (e: React.ChangeEvent<HTMLInputElement>) => {

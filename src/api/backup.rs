@@ -1,11 +1,12 @@
 use axum::{
     body::Body,
-    extract::{Multipart, State},
+    extract::{Multipart, Query, State},
     http::{header, StatusCode},
     response::IntoResponse,
     Json,
 };
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
+use serde::Deserialize;
 use serde_json::json;
 use sqlx::{sqlite::SqliteConnectOptions, Connection, SqliteConnection};
 use std::{
@@ -24,6 +25,17 @@ use crate::models::db::init_db;
 const MAX_UNPACKED_BACKUP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_BACKUP_ENTRIES: usize = 100_000;
 const RESTORE_STAGING_PREFIX: &str = ".zhuque_restore_";
+
+#[derive(Debug, Deserialize)]
+pub struct BackupQuery {
+    pub totp_code: Option<String>,
+}
+
+impl BackupQuery {
+    fn totp_code(&self) -> Option<&str> {
+        self.totp_code.as_deref().map(str::trim).filter(|code| !code.is_empty())
+    }
+}
 
 // ponytail: Process-local lock; use a filesystem lock if DATA_DIR is shared by multiple instances.
 static BACKUP_OPERATION_LOCK: Mutex<()> = Mutex::const_new(());
@@ -318,8 +330,69 @@ fn database_url(data_dir: &Path) -> String {
 }
 
 pub async fn create_backup(
-    State(_state): State<Arc<AppState>>,
-) -> Result<impl IntoResponse, StatusCode> {
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<BackupQuery>,
+) -> impl IntoResponse {
+    let totp_enabled = match state.totp_service.is_enabled().await {
+        Ok(enabled) => enabled,
+        Err(e) => {
+            error!("Failed to check TOTP status before backup: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(BackupError {
+                    success: false,
+                    message: "读取TOTP配置失败，备份已取消",
+                    requires_totp: false,
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    if totp_enabled {
+        match query.totp_code() {
+            Some(code) => match state.totp_service.verify_code(code).await {
+                Ok(true) => info!("TOTP verification successful before backup"),
+                Ok(false) => {
+                    error!("Invalid TOTP code before backup");
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(BackupError {
+                            success: false,
+                            message: "TOTP验证码错误",
+                            requires_totp: false,
+                        }),
+                    )
+                        .into_response();
+                }
+                Err(e) => {
+                    error!("Failed to verify TOTP before backup: {}", e);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(BackupError {
+                            success: false,
+                            message: "TOTP验证失败",
+                            requires_totp: false,
+                        }),
+                    )
+                        .into_response();
+                }
+            },
+            None => {
+                error!("TOTP is enabled but no code provided for backup");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(BackupError {
+                        success: false,
+                        message: "需要提供TOTP验证码",
+                        requires_totp: true,
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     let data_dir = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "./data".into()));
     let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
     let backup_filename = format!("zhuque_backup_{}.tar.gz", timestamp);
@@ -329,36 +402,50 @@ pub async fn create_backup(
     let parent_dir = data_dir.parent().unwrap_or(Path::new("."));
     let backup_path = parent_dir.join(&backup_filename);
 
-    create_backup_file(data_dir, backup_path.clone())
-        .await
-        .map_err(|e| {
-            error!("Failed to create backup: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    if let Err(e) = create_backup_file(data_dir, backup_path.clone()).await {
+        error!("Failed to create backup: {}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(BackupError {
+                success: false,
+                message: "创建备份失败",
+                requires_totp: false,
+            }),
+        )
+            .into_response();
+    }
 
-    // 读取备份文件
-    let backup_data = fs::read(&backup_path).await.map_err(|e| {
-        error!("Failed to read backup file: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let backup_data = match fs::read(&backup_path).await {
+        Ok(data) => data,
+        Err(e) => {
+            error!("Failed to read backup file: {}", e);
+            let _ = fs::remove_file(&backup_path).await;
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(BackupError {
+                    success: false,
+                    message: "读取备份文件失败",
+                    requires_totp: false,
+                }),
+            )
+                .into_response();
+        }
+    };
 
     info!("Backup created successfully: {} bytes", backup_data.len());
-
-    // 删除临时备份文件
     let _ = fs::remove_file(&backup_path).await;
 
-    // 返回文件下载响应
     let content_disposition = format!("attachment; filename=\"{}\"", backup_filename);
-    Ok((
+    (
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, "application/gzip".to_string()),
             (header::CONTENT_DISPOSITION, content_disposition),
         ],
         Body::from(backup_data),
-    ))
+    )
+        .into_response()
 }
-
 pub async fn restore_backup(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
