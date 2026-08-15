@@ -1,9 +1,6 @@
 use crate::services::{ConfigService, WebDavClient};
 use anyhow::Result;
-use flate2::write::GzEncoder;
-use flate2::Compression;
-use std::sync::Arc;
-use tar::Builder;
+use std::{path::PathBuf, sync::Arc};
 use tokio::sync::RwLock;
 use tokio_cron_scheduler::{Job, JobScheduler};
 use tracing::{error, info};
@@ -126,34 +123,20 @@ impl BackupScheduler {
         remote_path: Option<&str>,
         max_backups: Option<u32>,
     ) -> Result<()> {
-        let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "./data".into());
+        let data_dir = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "./data".into()));
+        if !data_dir.is_dir() {
+            anyhow::bail!("Data directory does not exist: {}", data_dir.display());
+        }
         let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
         let backup_filename = format!("zhuque_backup_{}.tar.gz", timestamp);
+        let temp_file = std::env::temp_dir().join(&backup_filename);
 
-        // 创建备份文件
         info!("Creating backup archive...");
-
-        // 在后台线程中执行阻塞的 tar 操作，避免阻塞 tokio 运行时
-        let data_dir_clone = data_dir.clone();
-        let tar_gz_data = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
-            let mut tar_gz_data = Vec::new();
-            {
-                let encoder = GzEncoder::new(&mut tar_gz_data, Compression::default());
-                let mut tar = Builder::new(encoder);
-                tar.append_dir_all("data", &data_dir_clone)
-                    .map_err(|e| anyhow::anyhow!("Failed to create tar archive: {}", e))?;
-                tar.finish()
-                    .map_err(|e| anyhow::anyhow!("Failed to finish tar archive: {}", e))?;
-            }
-            Ok(tar_gz_data)
-        }).await??;
-
-        // 保存到临时文件
-        let temp_dir = std::env::temp_dir();
-        let temp_file = temp_dir.join(&backup_filename);
-        tokio::fs::write(&temp_file, &tar_gz_data).await?;
-
-        info!("Backup archive created: {} bytes", tar_gz_data.len());
+        crate::api::backup::create_backup_file(data_dir, temp_file.clone()).await?;
+        info!(
+            "Backup archive created: {} bytes",
+            tokio::fs::metadata(&temp_file).await?.len()
+        );
 
         // 上传到 WebDAV
         info!("Uploading to WebDAV...");

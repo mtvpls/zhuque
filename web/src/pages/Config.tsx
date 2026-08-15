@@ -614,7 +614,6 @@ const Config: React.FC = () => {
         const response = await axios.post('/api/backup/restore', formData, {
           headers: {
             Authorization: `Bearer ${token}`,
-            'Content-Type': 'multipart/form-data',
           },
         });
 

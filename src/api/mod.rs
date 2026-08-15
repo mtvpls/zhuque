@@ -25,7 +25,6 @@ use crate::services::{
 
 #[cfg(not(target_os = "android"))]
 use crate::services::TerminalService;
-use anyhow::Result;
 use axum::{
     extract::DefaultBodyLimit,
     http::{StatusCode, Uri},
@@ -61,32 +60,6 @@ pub struct AppState {
     pub db_pool: Arc<RwLock<SqlitePool>>,
     pub system_log_collector: SystemLogCollector,
     pub notification_service: Arc<NotificationService>,
-}
-
-impl AppState {
-    pub async fn reinit_database(&self) -> Result<()> {
-        use crate::models::db::init_db;
-
-        let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "./data".into());
-        let database_url = format!("sqlite://{}/app.db", data_dir);
-
-        // 关闭旧连接池
-        {
-            let old_pool = self.db_pool.read().await;
-            old_pool.close().await;
-        }
-
-        // 创建新连接池
-        let new_pool = init_db(&database_url).await?;
-
-        // 更新连接池
-        {
-            let mut pool = self.db_pool.write().await;
-            *pool = new_pool;
-        }
-
-        Ok(())
-    }
 }
 
 async fn index() -> impl IntoResponse {
