@@ -106,7 +106,6 @@ async fn main() -> Result<()> {
     let log_service = Arc::new(LogService::new(shared_pool.clone()));
     let login_log_service = Arc::new(LoginLogService::new(shared_pool.clone()));
     let env_service = Arc::new(EnvService::new(shared_pool.clone()));
-    let script_service = Arc::new(ScriptService::new(scripts_dir.clone(), data_dir.join("helpers"), env_service.clone()));
     let dependence_service = Arc::new(DependenceService::new(shared_pool.clone()));
     let task_group_service = Arc::new(TaskGroupService::new(shared_pool.clone()));
     let subscription_service = Arc::new(SubscriptionService::new(
@@ -115,6 +114,12 @@ async fn main() -> Result<()> {
         dependence_service.clone(),
     ));
     let config_service = Arc::new(ConfigService::new(shared_pool.clone()));
+    let script_service = Arc::new(ScriptService::new(
+        scripts_dir.clone(),
+        data_dir.join("helpers"),
+        env_service.clone(),
+        config_service.clone(),
+    ));
     let user_service = Arc::new(UserService::new(shared_pool.clone()));
     let mut auth_service = AuthService::new(user_service.clone())?;
     auth_service.set_config_service(config_service.clone());

@@ -313,7 +313,7 @@ pub async fn execute_script(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // 首先发送execution_id
+
     let sse_stream = async_stream::stream! {
         yield Ok(Event::default().event("execution_id").data(execution_id));
 
@@ -333,11 +333,13 @@ pub async fn execute_script(
                 }
             }
         }
-        yield Ok(Event::default().data(format!(
-            "[NOTIFY] 模拟发送通知: 脚本运行完成，结果={}，耗时={}ms",
-            status,
-            started_at.elapsed().as_millis()
-        )));
+        if state.script_service.manual_result_notification_allowed(status).await {
+            yield Ok(Event::default().data(format!(
+                "[NOTIFY] 模拟发送通知: 脚本运行完成，结果={}，耗时={}ms",
+                status,
+                started_at.elapsed().as_millis()
+            )));
+        }
     };
 
     Ok(Sse::new(sse_stream).keep_alive(KeepAlive::default()))
@@ -355,7 +357,7 @@ pub async fn execute_content(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // 首先发送execution_id
+
     let sse_stream = async_stream::stream! {
         yield Ok(Event::default().event("execution_id").data(execution_id));
 
@@ -375,11 +377,13 @@ pub async fn execute_content(
                 }
             }
         }
-        yield Ok(Event::default().data(format!(
-            "[NOTIFY] 模拟发送通知: 脚本调试完成，结果={}，耗时={}ms",
-            status,
-            started_at.elapsed().as_millis()
-        )));
+        if state.script_service.manual_result_notification_allowed(status).await {
+            yield Ok(Event::default().data(format!(
+                "[NOTIFY] 模拟发送通知: 脚本调试完成，结果={}，耗时={}ms",
+                status,
+                started_at.elapsed().as_millis()
+            )));
+        }
     };
 
     Ok(Sse::new(sse_stream).keep_alive(KeepAlive::default()))

@@ -221,7 +221,7 @@ impl Scheduler {
         tokio::spawn(async move {
             let start_time = chrono::Utc::now();
 
-            let (_execution_id, mut output, status) = match executor.execute(&task).await {
+            let (_execution_id, output, status) = match executor.execute(&task).await {
                 Ok(result) => result,
                 Err(e) => {
                     error!("Task execution error: {}", e);
@@ -230,10 +230,6 @@ impl Scheduler {
             };
 
             let duration = (chrono::Utc::now() - start_time).num_milliseconds();
-            output.push_str(&format!(
-                "\n[NOTIFY] 模拟发送通知: 任务 '{}' 结果={}，耗时={}ms\n",
-                task.name, status, duration
-            ));
 
             // 更新任务执行信息
             if let Err(e) = task_service.update_run_info(task.id, start_time, duration).await {

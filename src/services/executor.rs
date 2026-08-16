@@ -1,5 +1,5 @@
 use crate::models::Task;
-use crate::models::config::TaskNotificationConfig;
+use crate::models::config::{NotificationConfig, TaskNotificationConfig};
 use crate::services::{EnvService, ConfigService, NotificationService, NotifyTokenRegistry};
 use crate::utils::python_detector::PYTHON_CMD;
 use anyhow::{anyhow, Result};
@@ -458,6 +458,10 @@ token = os.environ.get("ZHUQUE_NOTIFY_TOKEN", "")
 title   = sys.argv[1] if len(sys.argv) > 1 else ""
 content = sys.argv[2] if len(sys.argv) > 2 else ""
 
+if os.environ.get("ZHUQUE_NOTIFY_MODE", "real") == "simulate":
+    print(f"[NOTIFY] 模拟发送通知: 标题={title}，内容={content}", flush=True)
+    sys.exit(0)
+
 if not url or not token:
     sys.exit(0)
 
@@ -540,6 +544,7 @@ export default sendNotify;
         env_vars: &mut HashMap<String, String>,
         token: &str,
         helpers_dir: &std::path::Path,
+        mode: &str,
     ) {
         // 懒重建：如果 helper 文件丢失（如数据目录被清理），在此重建
         let bin_path = helpers_dir.join("notify");
@@ -562,10 +567,49 @@ export default sendNotify;
             ),
         );
         env_vars.insert("ZHUQUE_NOTIFY_TOKEN".to_string(), token.to_string());
+        env_vars.insert("ZHUQUE_NOTIFY_MODE".to_string(), mode.to_string());
     }
 
     /// 执行任务并返回 (execution_id, output, success)
     pub async fn execute(&self, task: &Task) -> Result<(String, String, &'static str)> {
+        self.execute_with_mode(task, "real").await
+    }
+
+    pub async fn execute_simulated(&self, task: &Task) -> Result<(String, String, &'static str)> {
+        self.execute_with_mode(task, "simulate").await
+    }
+
+    pub async fn should_notify_result(&self, status: &str, task_notification_json: Option<&str>) -> bool {
+        let config = match self.config_service.get_by_key("notification_config").await {
+            Ok(Some(value)) => match serde_json::from_str::<NotificationConfig>(&value.value) {
+                Ok(config) => config,
+                Err(_) => return false,
+            },
+            _ => return false,
+        };
+        if !config.enabled {
+            return false;
+        }
+        if let Some(task_notification) = task_notification_json
+            .and_then(|value| serde_json::from_str::<TaskNotificationConfig>(value).ok())
+            .filter(|value| value.enabled)
+        {
+            return match status {
+                "success" => task_notification.on_success.unwrap_or(config.on_success),
+                "failed" => task_notification.on_failure.unwrap_or(config.on_failure),
+                "killed" => task_notification.on_killed.unwrap_or(config.on_killed),
+                _ => false,
+            };
+        }
+        match status {
+            "success" => config.on_success,
+            "failed" => config.on_failure,
+            "killed" => config.on_killed,
+            _ => false,
+        }
+    }
+
+    async fn execute_with_mode(&self, task: &Task, notify_mode: &str) -> Result<(String, String, &'static str)> {
         // 防止并发重入：如果该任务已在运行中，跳过本次触发
         if self.running_tasks.read().await.contains_key(&task.id) {
             info!(
@@ -614,7 +658,7 @@ export default sendNotify;
 
         // 注册 notify token 并注入环境变量
         self.token_registry.write().await.insert(execution_id.clone(), task.id);
-        Self::inject_notify_env(&mut env_vars, &execution_id, &self.helpers_dir).await;
+        Self::inject_notify_env(&mut env_vars, &execution_id, &self.helpers_dir, notify_mode).await;
 
         debug!("Working directory: {:?}", working_dir);
 
@@ -895,27 +939,29 @@ export default sendNotify;
         final_status = if overall_success { "success" } else { "failed" };
 
         // 平台级任务通知（后台发送，不阻塞返回）
-        if let Some(notif_svc) = &self.notification_service {
-            let status = final_status;
-            let output_tail: String = output
-                .lines()
-                .rev()
-                .take(20)
-                .collect::<Vec<&str>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<&str>>()
-                .join("\n");
-            let notif_svc = notif_svc.clone();
-            let task_name = task.name.clone();
-            let status = status.to_string();
-            let task_notification = task.notification.as_deref()
-                .and_then(|s| serde_json::from_str::<TaskNotificationConfig>(s).ok());
-            tokio::spawn(async move {
-                notif_svc
-                    .notify_task_result(&task_name, &status, duration, &output_tail, task_notification)
-                    .await;
-            });
+        if notify_mode == "real" {
+            if let Some(notif_svc) = &self.notification_service {
+                let status = final_status;
+                let output_tail: String = output
+                    .lines()
+                    .rev()
+                    .take(20)
+                    .collect::<Vec<&str>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<&str>>()
+                    .join("\n");
+                let notif_svc = notif_svc.clone();
+                let task_name = task.name.clone();
+                let status = status.to_string();
+                let task_notification = task.notification.as_deref()
+                    .and_then(|s| serde_json::from_str::<TaskNotificationConfig>(s).ok());
+                tokio::spawn(async move {
+                    notif_svc
+                        .notify_task_result(&task_name, &status, duration, &output_tail, task_notification)
+                        .await;
+                });
+            }
         }
 
         if overall_success {
