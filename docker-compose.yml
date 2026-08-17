@@ -7,7 +7,7 @@ services:
     ports:
       - "3000:3000"
     volumes:
-      - /root/data:/app/data
+      - ./data:/app/data
     environment:
       - DATA_DIR=/app/data
       - RUST_LOG=info

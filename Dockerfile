@@ -44,8 +44,7 @@ RUN apt-get update \
         python3 \
         python3-pip \
         unzip \
-    && ln -s /usr/bin/python3 /usr/local/bin/python \
-    && rm -rf /var/lib/apt/lists/*
+    && ln -s /usr/bin/python3 /usr/local/bin/python
 
 COPY --from=bun-runtime /usr/local/bin/bun /usr/local/bin/bun
 RUN ln -s /usr/local/bin/bun /usr/local/bin/bunx

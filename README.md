@@ -74,7 +74,7 @@ docker run -d \
 或使用 Docker Compose：
 
 ```bash
-docker-compose up -d
+docker compose up -d
 ```
 
 ### 开发环境
@@ -130,7 +130,7 @@ docker run -d \
 #### 方式二：Docker Compose
 
 ```bash
-docker-compose up -d
+docker compose up -d
 ```
 
 #### 方式三：手动部署
