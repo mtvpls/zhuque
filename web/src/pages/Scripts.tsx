@@ -32,6 +32,7 @@ import {
   IconCopy,
   IconDragArrow,
   IconRobot,
+  IconBug,
 } from '@arco-design/web-react/icon';
 import Editor from '@monaco-editor/react';
 import axios from 'axios';
@@ -78,6 +79,7 @@ const Scripts: React.FC = () => {
   const [isArchiveUploading, setIsArchiveUploading] = useState(false);
   const [aiVisible, setAiVisible] = useState(false);
   const [aiDirectoryPath, setAiDirectoryPath] = useState<string | undefined>();
+  const [isMobile, setIsMobile] = useState(() => window.innerWidth <= 768);
   const [form] = Form.useForm();
   const [folderForm] = Form.useForm();
   const [renameForm] = Form.useForm();
@@ -85,6 +87,12 @@ const Scripts: React.FC = () => {
   useEffect(() => {
     loadFiles();
   }, [currentPath]);
+
+  useEffect(() => {
+    const handleResize = () => setIsMobile(window.innerWidth <= 768);
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
 
   const loadFiles = async () => {
     setLoading(true);
@@ -1027,8 +1035,10 @@ const Scripts: React.FC = () => {
                 size="small"
                 icon={<IconRobot />}
                 onClick={() => setAiVisible((visible) => !visible)}
+                aria-label="AI 工作台"
+                title="AI 工作台"
               >
-                AI 工作台
+                {!isMobile && 'AI 工作台'}
               </Button>
               {selectedFile && (<>
               {!isEditing && !isDebugging && (
@@ -1038,8 +1048,10 @@ const Scripts: React.FC = () => {
                     size="small"
                     icon={<IconEdit />}
                     onClick={() => setIsEditing(true)}
+                    aria-label="编辑"
+                    title="编辑"
                   >
-                    编辑
+                    {!isMobile && '编辑'}
                   </Button>
                   {isExecutable(selectedFile.name) && (
                     <>
@@ -1048,15 +1060,20 @@ const Scripts: React.FC = () => {
                         size="small"
                         icon={<IconPlayArrow />}
                         onClick={() => handleRun(selectedFile)}
+                        aria-label="运行"
+                        title="运行"
                       >
-                        运行
+                        {!isMobile && '运行'}
                       </Button>
                       <Button
                         type="primary"
                         size="small"
+                        icon={<IconBug />}
                         onClick={handleDebug}
+                        aria-label="调试"
+                        title="调试"
                       >
-                        调试
+                        {!isMobile && '调试'}
                       </Button>
                     </>
                   )}

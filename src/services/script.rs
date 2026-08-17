@@ -1,5 +1,6 @@
 use crate::models::ScriptFile;
-use crate::services::EnvService;
+use crate::models::config::NotificationConfig;
+use crate::services::{ConfigService, EnvService};
 use crate::utils::python_detector::PYTHON_CMD;
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
@@ -73,15 +74,22 @@ pub struct ScriptService {
     helpers_dir: PathBuf,
     running_processes: Arc<RwLock<HashMap<String, u32>>>, // execution_id -> PID
     env_service: Arc<EnvService>,
+    config_service: Arc<ConfigService>,
 }
 
 impl ScriptService {
-    pub fn new(base_path: PathBuf, helpers_dir: PathBuf, env_service: Arc<EnvService>) -> Self {
+    pub fn new(
+        base_path: PathBuf,
+        helpers_dir: PathBuf,
+        env_service: Arc<EnvService>,
+        config_service: Arc<ConfigService>,
+    ) -> Self {
         Self {
             base_path,
             helpers_dir,
             running_processes: Arc::new(RwLock::new(HashMap::new())),
             env_service,
+            config_service,
         }
     }
 
@@ -93,25 +101,41 @@ impl ScriptService {
         }
     }
 
+    fn prepend_path_var(existing: Option<&String>, prefix: &Path) -> String {
+        let mut paths = vec![prefix.to_path_buf()];
+        if let Some(existing) = existing {
+            paths.extend(std::env::split_paths(existing));
+        }
+        std::env::join_paths(paths)
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| {
+                let separator = if cfg!(windows) { ";" } else { ":" };
+                match existing {
+                    Some(value) if !value.is_empty() => {
+                        format!("{}{}{}", prefix.display(), separator, value)
+                    }
+                    _ => prefix.to_string_lossy().into_owned(),
+                }
+            })
+    }
+
     /// 获取基础环境变量
     fn get_base_env(&self) -> HashMap<String, String> {
-        let helpers = self.helpers_dir.to_string_lossy();
-        let sys_path = std::env::var("PATH").unwrap_or_default();
-        let sys_pypath = std::env::var("PYTHONPATH").unwrap_or_default();
-        let sys_nodepath = std::env::var("NODE_PATH").unwrap_or_default();
-
         let mut env_vars = HashMap::new();
-        env_vars.insert("PATH".to_string(), format!("{}:{}", helpers, sys_path));
-        env_vars.insert("PYTHONPATH".to_string(), if sys_pypath.is_empty() {
-            helpers.to_string()
-        } else {
-            format!("{}:{}", helpers, sys_pypath)
-        });
-        env_vars.insert("NODE_PATH".to_string(), if sys_nodepath.is_empty() {
-            helpers.to_string()
-        } else {
-            format!("{}:{}", helpers, sys_nodepath)
-        });
+        #[cfg(windows)]
+        env_vars.extend(std::env::vars());
+        env_vars.insert(
+            "PATH".to_string(),
+            Self::prepend_path_var(std::env::var("PATH").ok().as_ref(), &self.helpers_dir),
+        );
+        env_vars.insert(
+            "PYTHONPATH".to_string(),
+            Self::prepend_path_var(std::env::var("PYTHONPATH").ok().as_ref(), &self.helpers_dir),
+        );
+        env_vars.insert(
+            "NODE_PATH".to_string(),
+            Self::prepend_path_var(std::env::var("NODE_PATH").ok().as_ref(), &self.helpers_dir),
+        );
         env_vars.insert("HOME".to_string(), std::env::var("HOME").unwrap_or_default());
         env_vars.insert("USER".to_string(), std::env::var("USER").unwrap_or_default());
         env_vars.insert("SHELL".to_string(), std::env::var("SHELL").unwrap_or_default());
@@ -135,7 +159,68 @@ impl ScriptService {
             }
         }
 
+        #[cfg(windows)]
+        for canonical in ["PATH", "PYTHONPATH", "NODE_PATH", "HOME"] {
+            if let Some(value) = env_vars
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(canonical))
+                .map(|(_, value)| value.clone())
+            {
+                env_vars.retain(|key, _| !key.eq_ignore_ascii_case(canonical));
+                env_vars.insert(canonical.to_string(), value);
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            let system_root = env_vars
+                .get("SystemRoot")
+                .cloned()
+                .or_else(|| env_vars.get("WINDIR").cloned())
+                .or_else(|| {
+                    env_vars
+                        .get("ComSpec")
+                        .and_then(|value| Path::new(value).parent()?.parent())
+                        .map(|path| path.to_string_lossy().into_owned())
+                })
+                .unwrap_or_else(|| "C:\\Windows".to_string());
+            env_vars.insert("SystemRoot".to_string(), system_root.clone());
+            env_vars.insert("WINDIR".to_string(), system_root);
+
+            let temp = env_vars
+                .get("TEMP")
+                .cloned()
+                .or_else(|| env_vars.get("TMP").cloned())
+                .unwrap_or_else(|| std::env::temp_dir().to_string_lossy().into_owned());
+            env_vars.insert("TEMP".to_string(), temp.clone());
+            env_vars.insert("TMP".to_string(), temp);
+        }
+
         env_vars
+    }
+
+    pub async fn manual_notification_enabled(&self) -> bool {
+        let config = match self.config_service.get_by_key("notification_config").await {
+            Ok(Some(value)) => serde_json::from_str::<NotificationConfig>(&value.value).ok(),
+            _ => None,
+        };
+        config.map(|value| value.enabled).unwrap_or(false)
+    }
+
+    pub async fn manual_result_notification_allowed(&self, status: &str) -> bool {
+        let config = match self.config_service.get_by_key("notification_config").await {
+            Ok(Some(value)) => serde_json::from_str::<NotificationConfig>(&value.value).ok(),
+            _ => None,
+        };
+        config.map(|value| {
+            value.enabled
+                && match status {
+                    "success" => value.on_success,
+                    "failed" => value.on_failure,
+                    "killed" => value.on_killed,
+                    _ => false,
+                }
+        }).unwrap_or(false)
     }
 
     pub async fn init(&self) -> Result<()> {
@@ -435,7 +520,10 @@ impl ScriptService {
         // 设置工作目录为脚本所在目录
         cmd.current_dir(working_dir);
         cmd.env_clear();
-        cmd.envs(self.parse_env(env_json).await);
+        let mut env_vars = self.parse_env(env_json).await;
+        let notify_mode = if self.manual_notification_enabled().await { "simulate" } else { "off" };
+        env_vars.insert("ZHUQUE_NOTIFY_MODE".to_string(), notify_mode.to_string());
+        cmd.envs(env_vars);
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
@@ -562,7 +650,10 @@ impl ScriptService {
 
         cmd.current_dir(&work_dir);
         cmd.env_clear();
-        cmd.envs(self.parse_env(env_json).await);
+        let mut env_vars = self.parse_env(env_json).await;
+        let notify_mode = if self.manual_notification_enabled().await { "simulate" } else { "off" };
+        env_vars.insert("ZHUQUE_NOTIFY_MODE".to_string(), notify_mode.to_string());
+        cmd.envs(env_vars);
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
