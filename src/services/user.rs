@@ -67,8 +67,9 @@ impl UserService {
 
     // 验证密码
     pub async fn verify_password(&self, username: &str, password: &str) -> Result<bool> {
-        let user = self.get_by_username(username).await?
-            .ok_or_else(|| anyhow!("User not found"))?;
+        let Some(user) = self.get_by_username(username).await? else {
+            return Ok(false);
+        };
         Ok(verify(password, &user.password_hash)?)
     }
 

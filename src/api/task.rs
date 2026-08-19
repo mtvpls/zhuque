@@ -86,6 +86,13 @@ pub async fn create_task(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    let task = state
+        .task_service
+        .get(task.id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
     Ok((StatusCode::CREATED, Json(task)))
 }
 
@@ -94,18 +101,26 @@ pub async fn update_task(
     Path(id): Path<i64>,
     Json(payload): Json<UpdateTask>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let task = state
+    state
         .task_service
         .update(id, payload)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
 
+    // 只更新当前任务，避免重载过程中返回旧的 next_run_at
     state
         .scheduler
         .update_task_in_scheduler(id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let task = state
+        .task_service
+        .get(id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
 
     Ok(Json(task))
 }
