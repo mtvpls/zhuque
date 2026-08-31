@@ -59,9 +59,9 @@ impl AuthService {
 
     /// 第一步登录：验证用户名密码
     pub async fn login_step_one(&self, request: &LoginRequest) -> Result<LoginStepOneResponse> {
-        // 使用 UserService 验证用户名密码
+        // 使用统一错误验证用户名密码，避免泄露用户是否存在
         if !self.user_service.verify_password(&request.username, &request.password).await? {
-            return Err(anyhow!("Invalid username or password"));
+            return Err(anyhow!("用户名或密码错误"));
         }
 
         // 检查是否启用TOTP
