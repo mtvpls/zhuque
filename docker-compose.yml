@@ -1,3 +1,5 @@
+version: '3.8'
+
 services:
   zhuque:
     build:
@@ -9,7 +11,7 @@ services:
     volumes:
       - ./data:/app/data
     environment:
-      - DATA_DIR=/app/data
+      - DATABASE_URL=sqlite:///app/data/db/zhuque.db
       - RUST_LOG=info
       - TZ=Asia/Shanghai
     restart: unless-stopped
