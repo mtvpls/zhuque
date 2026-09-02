@@ -294,6 +294,13 @@ impl ScriptService {
         Ok(content)
     }
 
+    /// Read a file without assuming it is UTF-8 text.
+    pub async fn read_bytes(&self, path: &str) -> Result<Vec<u8>> {
+        self.validate_path(path)?;
+        let full_path = self.base_path.join(path);
+        Ok(tokio::fs::read(full_path).await?)
+    }
+
     pub async fn write(&self, path: &str, content: &str) -> Result<()> {
         self.write_bytes(path, content.as_bytes()).await
     }

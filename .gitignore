@@ -1,5 +1,6 @@
 /target
 /data
+/web/data
 /logs
 *.db
 *.log

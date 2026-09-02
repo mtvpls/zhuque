@@ -2,7 +2,7 @@ use crate::api::AppState;
 use axum::{
     body::Bytes,
     extract::{Multipart, Path, State},
-    http::StatusCode,
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse,
@@ -13,6 +13,26 @@ use futures::stream::{Stream, StreamExt};
 use serde::Deserialize;
 use std::convert::Infallible;
 use std::sync::Arc;
+
+fn content_type_for_path(path: &str) -> &'static str {
+    let extension = std::path::Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    match extension.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "ico" => "image/x-icon",
+        "svg" => "image/svg+xml",
+        "avif" => "image/avif",
+        _ => "application/octet-stream",
+    }
+}
 
 #[derive(Deserialize)]
 pub struct ListQuery {
@@ -60,11 +80,17 @@ pub async fn get_script(
     Path(path): Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let content = state.script_service
-        .read(&path)
+        .read_bytes(&path)
         .await
         .map_err(|_| StatusCode::NOT_FOUND)?;
 
-    Ok(content)
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(content_type_for_path(&path)),
+    );
+
+    Ok((headers, content))
 }
 
 pub async fn update_script(

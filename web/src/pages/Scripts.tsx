@@ -48,12 +48,16 @@ interface ScriptFile {
   isDirectory?: boolean;
 }
 
+const isImageFile = (fileName: string): boolean =>
+  /\.(png|jpe?g|gif|webp|bmp|ico|svg|avif)$/i.test(fileName);
+
 const Scripts: React.FC = () => {
   const [files, setFiles] = useState<ScriptFile[]>([]);
   const [loading, setLoading] = useState(false);
   const [currentPath, setCurrentPath] = useState('');
   const [selectedFile, setSelectedFile] = useState<ScriptFile | null>(null);
   const [fileContent, setFileContent] = useState('');
+  const [filePreviewUrl, setFilePreviewUrl] = useState<string | null>(null);
   const [contentLoading, setContentLoading] = useState(false);
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
@@ -93,6 +97,14 @@ const Scripts: React.FC = () => {
     window.addEventListener('resize', handleResize);
     return () => window.removeEventListener('resize', handleResize);
   }, []);
+
+  useEffect(() => {
+    return () => {
+      if (filePreviewUrl) {
+        window.URL.revokeObjectURL(filePreviewUrl);
+      }
+    };
+  }, [filePreviewUrl]);
 
   const loadFiles = async () => {
     setLoading(true);
@@ -188,6 +200,7 @@ const Scripts: React.FC = () => {
     setSelectedFile(file);
     setContentLoading(true);
     setFileContent('');
+    setFilePreviewUrl(null);
     setHasUnsavedChanges(false);
     setIsEditing(false);
     setIsDebugging(false);
@@ -196,12 +209,21 @@ const Scripts: React.FC = () => {
       const token = localStorage.getItem('token');
       const res = await axios.get(`/api/scripts/${file.path}`, {
         headers: { Authorization: `Bearer ${token}` },
+        ...(isImageFile(file.name) ? { responseType: 'blob' as const } : {}),
       });
-      // 如果返回的是对象（JSON文件），转换为字符串
-      const content = typeof res.data === 'object'
-        ? JSON.stringify(res.data, null, 2)
-        : res.data;
-      setFileContent(content);
+      if (isImageFile(file.name)) {
+        setFilePreviewUrl(window.URL.createObjectURL(res.data));
+      } else {
+        // 确保非图片响应始终作为文本处理，避免 Axios 将数字等内容解析为非字符串
+        const content = typeof res.data === 'string'
+          ? res.data
+          : res.data == null
+            ? ''
+            : typeof res.data === 'object'
+              ? JSON.stringify(res.data, null, 2)
+              : String(res.data);
+        setFileContent(content);
+      }
     } catch (error: any) {
       Message.error('读取文件失败');
     } finally {
@@ -1041,7 +1063,7 @@ const Scripts: React.FC = () => {
                 {!isMobile && 'AI 工作台'}
               </Button>
               {selectedFile && (<>
-              {!isEditing && !isDebugging && (
+              {!isEditing && !isDebugging && !isImageFile(selectedFile.name) && (
                 <>
                   <Button
                     type="outline"
@@ -1165,6 +1187,25 @@ const Scripts: React.FC = () => {
             <Spin />
           </div>
         ) : selectedFile ? (
+          filePreviewUrl ? (
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                height: '100%',
+                padding: '24px',
+                overflow: 'auto',
+                backgroundColor: '#1e1e1e',
+              }}
+            >
+              <img
+                src={filePreviewUrl}
+                alt={selectedFile.name}
+                style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }}
+              />
+            </div>
+          ) :
           isDebugging ? (
             // 调试模式：左右分屏
             <div style={{ display: 'flex', height: '100%' }}>
