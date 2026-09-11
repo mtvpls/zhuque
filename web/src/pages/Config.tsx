@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   Card,
   Form,
@@ -25,6 +25,7 @@ import { authApi } from '@/api/auth';
 import { loginLogApi, type LoginLog } from '@/api/loginLog';
 import dayjs from 'dayjs';
 import './Config.css';
+import { useBlocker } from 'react-router-dom';
 
 const FormItem = Form.Item;
 const { Title, Text } = Typography;
@@ -107,6 +108,13 @@ const Config: React.FC = () => {
   const [webSearchForm] = Form.useForm<WebSearchConfig>();
   const [webSearchLoading, setWebSearchLoading] = useState(false);
   const [webSearchProvider, setWebSearchProvider] = useState('bing');
+  const [mirrorDirty, setMirrorDirty] = useState(false);
+  const [aiMainDirty, setAiMainDirty] = useState(false);
+  const [providerDirty, setProviderDirty] = useState(false);
+  const [webSearchDirty, setWebSearchDirty] = useState(false);
+  const hasUnsavedChanges = mirrorDirty || aiMainDirty || providerDirty || webSearchDirty;
+  const routeBlocker = useBlocker(hasUnsavedChanges);
+  const routePromptShownRef = useRef(false);
 
   useEffect(() => {
     const handleResize = () => {
@@ -175,6 +183,7 @@ const Config: React.FC = () => {
         headers: { Authorization: `Bearer ${token}` },
       });
       form.setFieldsValue(res.data);
+      setMirrorDirty(false);
     } catch (error: any) {
       Message.error('加载配置失败');
     }
@@ -191,6 +200,8 @@ const Config: React.FC = () => {
         ...provider,
         models: (provider.models || []).join('\n'),
       })));
+      setAiMainDirty(false);
+      setProviderDirty(false);
     } catch (error) {
       Message.error('加载 AI 配置失败');
     }
@@ -204,12 +215,13 @@ const Config: React.FC = () => {
       });
       webSearchForm.setFieldsValue(res.data);
       setWebSearchProvider(res.data.provider || 'bing');
+      setWebSearchDirty(false);
     } catch (error) {
       Message.error('加载联网搜索配置失败');
     }
   };
 
-  const handleSaveWebSearchConfig = async () => {
+  const handleSaveWebSearchConfig = async (): Promise<boolean> => {
     try {
       const values = await webSearchForm.validate();
       setWebSearchLoading(true);
@@ -218,8 +230,11 @@ const Config: React.FC = () => {
         headers: { Authorization: `Bearer ${token}` },
       });
       Message.success('联网搜索配置已保存');
+      setWebSearchDirty(false);
+      return true;
     } catch (error: any) {
       Message.error(error.response?.data || '保存联网搜索配置失败');
+      return false;
     } finally {
       setWebSearchLoading(false);
     }
@@ -258,13 +273,14 @@ const Config: React.FC = () => {
       if (editingProviderIndex === null) next.push(values);
       else next[editingProviderIndex] = values;
       setAiProviders(next);
+      setProviderDirty(true);
       setProviderModalVisible(false);
     } catch (error: any) {
       if (error?.message) Message.error(error.message);
     }
   };
 
-  const handleSaveAiConfig = async () => {
+  const handleSaveAiConfig = async (): Promise<boolean> => {
     try {
       const values = await aiForm.validate();
       setAiLoading(true);
@@ -288,8 +304,12 @@ const Config: React.FC = () => {
         headers: { Authorization: `Bearer ${token}` },
       });
       Message.success('AI 配置已保存');
+      setAiMainDirty(false);
+      setProviderDirty(false);
+      return true;
     } catch (error: any) {
       Message.error(error.response?.data || '保存 AI 配置失败');
+      return false;
     } finally {
       setAiLoading(false);
     }
@@ -538,7 +558,7 @@ const Config: React.FC = () => {
     });
   };
 
-  const handleSave = async () => {
+  const handleSave = async (): Promise<boolean> => {
     try {
       const values = await form.validate();
       setSaveLoading(true);
@@ -549,8 +569,11 @@ const Config: React.FC = () => {
       });
 
       Message.success('保存成功');
+      setMirrorDirty(false);
+      return true;
     } catch (error: any) {
       Message.error(error.response?.data?.error || '保存失败');
+      return false;
     } finally {
       setSaveLoading(false);
     }
@@ -562,7 +585,90 @@ const Config: React.FC = () => {
       pip_index: 'https://pypi.tuna.tsinghua.edu.cn/simple',
       apt_source: 'https://mirrors.tuna.tsinghua.edu.cn/ubuntu/',
     });
+    setMirrorDirty(true);
   };
+
+  const saveAiArea = async (): Promise<boolean> => {
+    let saved = true;
+    if (aiMainDirty || providerDirty) saved = await handleSaveAiConfig();
+    if (saved && webSearchDirty) saved = await handleSaveWebSearchConfig();
+    return saved;
+  };
+
+  const showUnsavedChangesDialog = (
+    title: string,
+    save: () => Promise<boolean>,
+    discard: () => void,
+    cancel: () => void,
+  ) => {
+    let dialog: ReturnType<typeof Modal.confirm> | null = null;
+    dialog = Modal.confirm({
+      title,
+      content: '当前区域有未保存的修改，要如何处理？',
+      okText: '保存并离开',
+      cancelText: '取消',
+      maskClosable: false,
+      onOk: async () => {
+        const saved = await save();
+        if (!saved) return Promise.reject();
+      },
+      onCancel: cancel,
+      footer: (_cancelButtonNode, okButtonNode) => (
+        <Space>
+          <Button onClick={() => { dialog?.close(); cancel(); }}>取消</Button>
+          <Button onClick={() => { dialog?.close(); discard(); }}>不保存</Button>
+          {okButtonNode}
+        </Space>
+      ),
+    });
+  };
+
+  const handleTabChange = (nextTab: string) => {
+    if (nextTab === activeTab) return;
+    const currentDirty = activeTab === 'mirror'
+      ? mirrorDirty
+      : activeTab === 'ai'
+        ? aiMainDirty || providerDirty || webSearchDirty
+        : false;
+    if (!currentDirty) {
+      setActiveTab(nextTab);
+      return;
+    }
+
+    const areaName = activeTab === 'mirror' ? '镜像源配置' : 'AI 配置';
+    showUnsavedChangesDialog(
+      `${areaName}有未保存的修改`,
+      async () => {
+        const saved = activeTab === 'mirror' ? await handleSave() : await saveAiArea();
+        if (saved) setActiveTab(nextTab);
+        return saved;
+      },
+      () => setActiveTab(nextTab),
+      () => undefined,
+    );
+  };
+
+  useEffect(() => {
+    if (routeBlocker.state !== 'blocked' || routePromptShownRef.current) return;
+    routePromptShownRef.current = true;
+    showUnsavedChangesDialog(
+      '配置有未保存的修改',
+      async () => {
+        const saved = activeTab === 'mirror' ? await handleSave() : activeTab === 'ai' ? await saveAiArea() : true;
+        routePromptShownRef.current = false;
+        if (saved) routeBlocker.proceed();
+        return saved;
+      },
+      () => {
+        routePromptShownRef.current = false;
+        routeBlocker.proceed();
+      },
+      () => {
+        routePromptShownRef.current = false;
+        routeBlocker.reset();
+      },
+    );
+  }, [routeBlocker, activeTab, mirrorDirty, aiMainDirty, providerDirty, webSearchDirty]);
 
   const handleBackup = async () => {
     const token = localStorage.getItem('token');
@@ -745,7 +851,7 @@ const Config: React.FC = () => {
         transition: 'opacity 0.3s'
       }}>
       <Card title="系统配置">
-        <Tabs activeTab={activeTab} onChange={setActiveTab} type="card">
+        <Tabs activeTab={activeTab} onChange={handleTabChange} type="card">
           <TabPane key="mirror" title="镜像源配置">
             <div style={{ padding: '16px 24px' }}>
               <div style={{ marginBottom: 16, display: 'flex', justifyContent: 'flex-end' }}>
@@ -764,7 +870,7 @@ const Config: React.FC = () => {
                 </Space>
               </div>
 
-              <Form form={form} layout="vertical">
+              <Form form={form} layout="vertical" onChange={() => setMirrorDirty(true)}>
                 <Title heading={6}>Node.js 镜像源</Title>
                 <FormItem
                   label="NPM Registry"
@@ -844,7 +950,7 @@ const Config: React.FC = () => {
                   保存配置
                 </Button>
               </div>
-              <Form form={aiForm} layout="vertical">
+              <Form form={aiForm} layout="vertical" onChange={() => setAiMainDirty(true)}>
                 <FormItem label="启用 AI" field="enabled" triggerPropName="checked">
                   <Switch />
                 </FormItem>
@@ -869,7 +975,10 @@ const Config: React.FC = () => {
                       </div>
                       <Space>
                         <Button type="text" size="small" onClick={() => openProviderModal(index)}>编辑</Button>
-                        <Button type="text" size="small" status="danger" onClick={() => setAiProviders((items) => items.filter((_, itemIndex) => itemIndex !== index))}>删除</Button>
+                        <Button type="text" size="small" status="danger" onClick={() => {
+                          setAiProviders((items) => items.filter((_, itemIndex) => itemIndex !== index));
+                          setProviderDirty(true);
+                        }}>删除</Button>
                       </Space>
                     </div>
                   ))}
@@ -892,9 +1001,10 @@ const Config: React.FC = () => {
                 </FormItem>
               </Form>
               <Divider orientation="left" style={{ margin: '24px 0 16px' }}>联网搜索</Divider>
-              <Form form={webSearchForm} layout="vertical">
+              <Form form={webSearchForm} layout="vertical" onChange={() => setWebSearchDirty(true)}>
                 <FormItem label="搜索提供商" field="provider" rules={[{ required: true, message: '请选择搜索提供商' }]}>
                   <Select onChange={(value) => {
+                    setWebSearchDirty(true);
                     setWebSearchProvider(value);
                     webSearchForm.setFieldsValue({
                       provider: value,

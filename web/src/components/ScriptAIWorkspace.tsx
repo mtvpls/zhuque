@@ -26,7 +26,6 @@ import {
   IconLock,
   IconEdit,
   IconUnlock,
-  IconPlayArrow,
   IconPlus,
   IconRefresh,
   IconRobot,
@@ -53,15 +52,23 @@ export interface AgentFileChange {
   content?: string;
 }
 
+export interface AiFileContext {
+  name: string;
+  path: string;
+}
+
 interface ScriptAIWorkspaceProps {
   visible: boolean;
   fileName?: string;
   filePath?: string;
   fileContent: string;
-  executionOutput?: string;
+  attachedFile?: AiFileContext;
   aiDirectoryPath?: string;
   onClose: () => void;
+  onRemoveFileContext?: () => void;
   onRemoveDirectoryContext?: () => void;
+  onFileContextChange?: (file?: AiFileContext) => void;
+  onDirectoryContextChange?: (path?: string) => void;
   onApplyChanges: (changes: AgentFileChange[]) => Promise<void>;
 }
 
@@ -82,6 +89,8 @@ interface AiSession {
   active_job_id?: string | null;
   current_context_tokens?: number | null;
   model?: string | null;
+  file_path?: string | null;
+  directory_path?: string | null;
   updated_at: string;
 }
 
@@ -292,10 +301,13 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
   fileName,
   filePath,
   fileContent,
-  executionOutput,
+  attachedFile,
   aiDirectoryPath,
   onClose,
+  onRemoveFileContext,
   onRemoveDirectoryContext,
+  onFileContextChange,
+  onDirectoryContextChange,
   onApplyChanges,
 }) => {
   const [prompt, setPrompt] = useState('');
@@ -329,7 +341,7 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
   const [showFullDiff, setShowFullDiff] = useState(false);
   const [showSessions, setShowSessions] = useState(false);
   const pendingApprovalRef = useRef<{ callId: string; decision: 'approve' | 'reject'; remember: boolean } | null>(null);
-  const [contextEnabled, setContextEnabled] = useState(Boolean(filePath || fileName));
+  const contextEnabled = Boolean(attachedFile);
   const [workspaceWidth, setWorkspaceWidth] = useState(360);
   const [isMobileViewport, setIsMobileViewport] = useState(() => window.matchMedia('(max-width: 1024px), (hover: none) and (pointer: coarse)').matches);
   const resizeState = useRef<{ startX: number; startWidth: number } | null>(null);
@@ -348,10 +360,26 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
   const lastSequencesRef = useRef<Record<string, number>>({});
   const sessionIdRef = useRef<string | null>(null);
   const feedRef = useRef<HTMLDivElement | null>(null);
+  const persistedContextRef = useRef('');
+  const pendingContextRestoreRef = useRef<string | null>(null);
 
-  useEffect(() => {
-    setContextEnabled(!aiDirectoryPath && Boolean(filePath || fileName));
-  }, [aiDirectoryPath, filePath, fileName]);
+  const contextKey = (filePath?: string | null, directoryPath?: string | null) => JSON.stringify([
+    filePath || '',
+    directoryPath || '',
+  ]);
+
+  const restoreSessionContext = (session?: AiSession) => {
+    const filePath = session?.file_path || undefined;
+    const directoryPath = session?.directory_path || undefined;
+    const key = contextKey(filePath, directoryPath);
+    persistedContextRef.current = key;
+    pendingContextRestoreRef.current = key;
+    onFileContextChange?.(filePath ? {
+      name: filePath.split('/').filter(Boolean).pop() || filePath,
+      path: filePath,
+    } : undefined);
+    onDirectoryContextChange?.(directoryPath);
+  };
 
   useEffect(() => {
     const media = window.matchMedia('(max-width: 1024px), (hover: none) and (pointer: coarse)');
@@ -395,9 +423,47 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
         if (session.active_job_id) sessionJobsRef.current[session.id] = session.active_job_id;
       }
       localStorage.setItem('script-ai-active-jobs', JSON.stringify(sessionJobsRef.current));
-      setSessionId((current) => current && list.some((item) => item.id === current) ? current : list[0]?.id || null);
+      const selectedSession = list.find((item) => item.id === sessionIdRef.current) || list[0];
+      if (attachedFile?.path || aiDirectoryPath) {
+        persistedContextRef.current = contextKey(attachedFile?.path, aiDirectoryPath);
+        pendingContextRestoreRef.current = null;
+      } else {
+        restoreSessionContext(selectedSession);
+      }
+      setSessionId(selectedSession?.id || null);
     })().catch(() => undefined).finally(() => setLoadingSession(false));
   }, [visible]);
+
+  useEffect(() => {
+    if (!sessionId) return;
+    const currentKey = contextKey(attachedFile?.path, aiDirectoryPath);
+    if (pendingContextRestoreRef.current !== null) {
+      if (currentKey === pendingContextRestoreRef.current) pendingContextRestoreRef.current = null;
+      return;
+    }
+    if (currentKey === persistedContextRef.current) return;
+    persistedContextRef.current = currentKey;
+    setSessions((previous) => previous.map((session) => (
+      session.id === sessionId
+        ? {
+            ...session,
+            file_path: attachedFile?.path || null,
+            directory_path: aiDirectoryPath || null,
+          }
+        : session
+    )));
+    void fetch(`/api/ai/sessions/${encodeURIComponent(sessionId)}/context`, {
+      method: 'PUT',
+      headers: {
+        Authorization: `Bearer ${localStorage.getItem('token') || ''}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        file_path: attachedFile?.path || null,
+        directory_path: aiDirectoryPath || null,
+      }),
+    }).catch(() => undefined);
+  }, [sessionId, attachedFile?.path, aiDirectoryPath]);
 
   useEffect(() => {
     if (!sessionId) {
@@ -480,9 +546,8 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
 
   const currentContextTokens = useMemo(() => estimateContextTokens([
     ...conversation.map((message) => message.content),
-    contextEnabled ? fileContent : undefined,
-    contextEnabled ? executionOutput : undefined,
-  ]), [conversation, contextEnabled, fileContent, executionOutput]);
+    contextEnabled ? attachedFile?.path : undefined,
+  ]), [conversation, contextEnabled, attachedFile?.path]);
 
   const hasDiff = Boolean(draftChanges && draftChanges.length > 0);
   const currentChange = draftChanges?.find((change) => change.path === filePath);
@@ -837,10 +902,8 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
     connectJob(jobIdRef.current || undefined, {
       mode: 'agent',
       prompt: request,
-      file_name: contextEnabled ? fileName : undefined,
-      file_path: contextEnabled ? filePath : undefined,
-      file_content: contextEnabled ? fileContent : undefined,
-      execution_output: contextEnabled ? executionOutput : undefined,
+      file_name: contextEnabled ? attachedFile?.name : undefined,
+      file_path: contextEnabled ? attachedFile?.path : undefined,
       directory_path: aiDirectoryPath,
       history: conversation,
       allow_commands: permissionMode === 'all',
@@ -1038,6 +1101,8 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
     setDraftChanges(null);
     setPendingPermission(null);
     setShowSessions(false);
+    const selectedSession = sessions.find((session) => session.id === value);
+    restoreSessionContext(selectedSession);
   };
 
   const createSession = async () => {
@@ -1199,23 +1264,21 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
       <div className="script-ai-context">
         <div className="script-ai-context-row script-ai-context-main-row">
           <div className="script-ai-section-label">当前上下文</div>
-          {contextEnabled ? (
+          {contextEnabled && attachedFile ? (
             <>
-              <Tag color="blue"><IconFile /> {fileName || '未选择文件'}</Tag>
-              {filePath && filePath.replace(/[\\/]?[^\\/]+$/, '') && (
-                <span className="script-ai-path">{filePath.replace(/[\\/]?[^\\/]+$/, '')}</span>
-              )}
+              <Tag color="blue"><IconFile /> {attachedFile.name}</Tag>
+              <span className="script-ai-path">{attachedFile.path}</span>
               <Button
                 type="text"
                 size="small"
                 icon={<IconClose />}
-                onClick={() => setContextEnabled(false)}
-                aria-label="移除当前脚本上下文"
-                title="移除当前脚本上下文"
+                onClick={onRemoveFileContext}
+                aria-label="移除附加文件"
+                title="移除附加文件"
               />
             </>
           ) : (
-            !aiDirectoryPath && <span className="script-ai-context-empty">未附加脚本上下文</span>
+            !aiDirectoryPath && <span className="script-ai-context-empty">未附加文件上下文</span>
           )}
           {aiDirectoryPath && (
             <>
@@ -1233,9 +1296,7 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
             </>
           )}
         </div>
-        {contextEnabled && executionOutput && (
-          <Tag color="orange" className="script-ai-output-tag"><IconPlayArrow /> 已附加最近一次执行输出</Tag>
-        )}
+
       </div>
 
       <div className="script-ai-feed" ref={feedRef}>

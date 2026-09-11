@@ -37,7 +37,7 @@ import {
 import Editor from '@monaco-editor/react';
 import axios from 'axios';
 import { copyTextToClipboard } from '@/utils/clipboard';
-import ScriptAIWorkspace, { type AgentFileChange } from '@/components/ScriptAIWorkspace';
+import ScriptAIWorkspace, { type AgentFileChange, type AiFileContext } from '@/components/ScriptAIWorkspace';
 
 interface ScriptFile {
   name: string;
@@ -82,6 +82,7 @@ const Scripts: React.FC = () => {
   const [archiveUploadProgress, setArchiveUploadProgress] = useState(0);
   const [isArchiveUploading, setIsArchiveUploading] = useState(false);
   const [aiVisible, setAiVisible] = useState(false);
+  const [aiFileContext, setAiFileContext] = useState<AiFileContext | undefined>();
   const [aiDirectoryPath, setAiDirectoryPath] = useState<string | undefined>();
   const [isMobile, setIsMobile] = useState(() => window.innerWidth <= 768);
   const [form] = Form.useForm();
@@ -768,6 +769,20 @@ const Scripts: React.FC = () => {
                         </Menu.Item>
                       )}
                       {!file.isDirectory && (
+                        <Menu.Item
+                          key="attachAiFile"
+                          onClick={() => {
+                            setAiFileContext({ name: file.name, path: file.path });
+                            setAiVisible(true);
+                          }}
+                        >
+                          <Space>
+                            <IconRobot />
+                            附加文件到 AI
+                          </Space>
+                        </Menu.Item>
+                      )}
+                      {!file.isDirectory && (
                         <Menu.Item key="copyPath" onClick={() => handleCopyPath(file)}>
                           <Space>
                             <IconCopy />
@@ -1302,10 +1317,13 @@ const Scripts: React.FC = () => {
         fileName={selectedFile?.name}
         filePath={selectedFile?.path}
         fileContent={fileContent}
-        executionOutput={logContent}
+        attachedFile={aiFileContext}
         aiDirectoryPath={aiDirectoryPath}
         onClose={() => setAiVisible(false)}
+        onRemoveFileContext={() => setAiFileContext(undefined)}
         onRemoveDirectoryContext={() => setAiDirectoryPath(undefined)}
+        onFileContextChange={setAiFileContext}
+        onDirectoryContextChange={setAiDirectoryPath}
         onApplyChanges={handleApplyAIChanges}
       />
 
