@@ -832,7 +832,8 @@ fn agent_tools() -> Value {
                         "cron": { "type": "string", "description": "cron 表达式，也可传字符串数组" },
                         "type": { "type": "string", "enum": ["cron", "manual", "startup"] },
                         "enabled": { "type": "boolean" }, "env": { "type": "string" },
-                        "working_dir": { "type": "string" }, "timeout": { "type": "integer", "minimum": 0 }
+                        "working_dir": { "type": "string" }, "timeout": { "type": "integer", "minimum": 0 },
+                        "startup_supplement_enabled": { "type": "boolean", "description": "启动后对已错过且今天尚未执行的每日一次定时任务补执行" }
                     },
                     "required": ["name", "command", "cron"]
                 }
@@ -849,7 +850,8 @@ fn agent_tools() -> Value {
                         "id": { "type": "integer" }, "name": { "type": "string" }, "command": { "type": "string" },
                         "cron": { "type": "string" }, "type": { "type": "string", "enum": ["cron", "manual", "startup"] },
                         "enabled": { "type": "boolean" }, "env": { "type": "string" }, "working_dir": { "type": "string" },
-                        "timeout": { "type": "integer", "minimum": 0 }
+                        "timeout": { "type": "integer", "minimum": 0 },
+                        "startup_supplement_enabled": { "type": "boolean", "description": "启动后对已错过且今天尚未执行的每日一次定时任务补执行" }
                     },
                     "required": ["id"]
                 }
@@ -1256,6 +1258,7 @@ struct CreateTaskToolArgs {
     group_id: Option<i64>,
     working_dir: Option<String>,
     timeout: Option<i64>,
+    startup_supplement_enabled: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1273,6 +1276,7 @@ struct UpdateTaskToolArgs {
     group_id: Option<i64>,
     working_dir: Option<String>,
     timeout: Option<i64>,
+    startup_supplement_enabled: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1303,6 +1307,7 @@ fn task_summary(task: &crate::models::Task) -> Value {
         "enabled": task.enabled,
         "working_dir": task.working_dir,
         "timeout": task.timeout,
+        "startup_supplement_enabled": task.startup_supplement_enabled,
         "last_run_at": task.last_run_at,
         "next_run_at": task.next_run_at,
     })
@@ -1722,6 +1727,7 @@ async fn execute_agent_tool(
                 working_dir: args.working_dir,
                 notification: None,
                 timeout: args.timeout.unwrap_or(0).max(0),
+                startup_supplement_enabled: args.startup_supplement_enabled.unwrap_or(false),
             }).await.map_err(|e| e.to_string())?;
             state.scheduler.add_task_to_scheduler(task.id).await.map_err(|e| e.to_string())?;
             Ok(json!({ "task": task_summary(&task) }))
@@ -1741,6 +1747,7 @@ async fn execute_agent_tool(
                 working_dir: args.working_dir,
                 notification: None,
                 timeout: args.timeout.map(|value| value.max(0)),
+                startup_supplement_enabled: args.startup_supplement_enabled,
             }).await.map_err(|e| e.to_string())?.ok_or_else(|| "任务不存在".to_string())?;
             state.scheduler.update_task_in_scheduler(args.id).await.map_err(|e| e.to_string())?;
             Ok(json!({ "task": task_summary(&task) }))

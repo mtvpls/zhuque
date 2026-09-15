@@ -31,6 +31,7 @@ pub struct Task {
     pub working_dir: Option<String>, // 自定义工作目录
     pub notification: Option<String>, // JSON 格式的任务级通知配置（TaskNotificationConfig）
     pub timeout: i64, // 执行超时（秒），0 表示不超时
+    pub startup_supplement_enabled: bool,
     pub last_run_at: Option<DateTime<Utc>>,
     pub last_run_duration: Option<i64>, // 毫秒
     pub next_run_at: Option<DateTime<Utc>>,
@@ -61,6 +62,7 @@ impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for Task {
             working_dir: row.try_get("working_dir").ok().flatten(),
             notification: row.try_get("notification").ok().flatten(),
             timeout: row.try_get::<Option<i64>, _>("timeout").ok().flatten().unwrap_or(0),
+            startup_supplement_enabled: row.try_get::<Option<bool>, _>("startup_supplement_enabled").ok().flatten().unwrap_or(false),
             last_run_at: row.try_get("last_run_at")?,
             last_run_duration: row.try_get("last_run_duration")?,
             next_run_at: row.try_get("next_run_at")?,
@@ -86,6 +88,8 @@ pub struct CreateTask {
     pub notification: Option<String>, // JSON 格式的任务级通知配置
     #[serde(default)]
     pub timeout: i64, // 执行超时（秒），0 表示不超时
+    #[serde(default)]
+    pub startup_supplement_enabled: bool,
 }
 
 // 用于接收前端输入的 cron，支持字符串或数组
@@ -120,6 +124,7 @@ pub struct UpdateTask {
     pub working_dir: Option<String>,
     pub notification: Option<String>, // JSON 格式的任务级通知配置
     pub timeout: Option<i64>, // 执行超时（秒），0 表示不超时
+    pub startup_supplement_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]

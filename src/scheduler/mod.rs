@@ -6,6 +6,7 @@ pub use backup_scheduler::BackupScheduler;
 
 use crate::services::{Executor, LogService, TaskService};
 use anyhow::Result;
+use chrono::{DateTime, Local, TimeZone, Utc};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -22,6 +23,36 @@ fn normalize_cron_expr(expr: &str) -> String {
         // 已经是6字段或其他格式，保持原样
         expr.to_string()
     }
+}
+
+fn today_single_execution(task: &crate::models::Task, now: DateTime<Local>) -> Option<DateTime<Local>> {
+    let today = now.date_naive();
+    let day_start = today
+        .and_hms_opt(0, 0, 0)
+        .and_then(|value| Local.from_local_datetime(&value).single())?;
+    let cursor = day_start - chrono::Duration::seconds(1);
+    let mut execution_time = None;
+    let mut execution_count = 0;
+
+    for cron_expr in &task.cron {
+        let normalized = normalize_cron_expr(cron_expr);
+        let schedule = cron::Schedule::from_str(&normalized).ok()?;
+        for occurrence in schedule.after(&cursor).take(2) {
+            let occurrence_date = occurrence.date_naive();
+            if occurrence_date > today {
+                break;
+            }
+            if occurrence_date == today {
+                execution_count += 1;
+                if execution_count > 1 {
+                    return None;
+                }
+                execution_time = Some(occurrence);
+            }
+        }
+    }
+
+    execution_time
 }
 
 pub struct Scheduler {
@@ -203,6 +234,67 @@ impl Scheduler {
         }
 
         Ok(job_ids)
+    }
+
+    pub async fn run_startup_supplement_tasks(&self) -> Result<()> {
+        let tasks = self.task_service.get_startup_supplement_tasks().await?;
+        let now = Local::now();
+
+        for task in tasks {
+            let Some(scheduled_time) = today_single_execution(&task, now) else {
+                info!(
+                    "Skipping startup supplement for task '{}' (id={}): cron is invalid, has no execution today, or runs more than once today",
+                    task.name, task.id
+                );
+                continue;
+            };
+
+            if task
+                .last_run_at
+                .map(|last_run_at| last_run_at.with_timezone(&Local).date_naive() == now.date_naive())
+                .unwrap_or(false)
+            {
+                info!("Skipping startup supplement for task '{}': already ran today", task.name);
+                continue;
+            }
+
+            if now <= scheduled_time {
+                info!(
+                    "Skipping startup supplement for task '{}': today's scheduled time has not passed",
+                    task.name
+                );
+                continue;
+            }
+
+            if self.executor.list_running().await.contains(&task.id) {
+                info!("Skipping startup supplement for task '{}': task is already running", task.name);
+                continue;
+            }
+
+            info!("Running startup supplement task: {}", task.name);
+            let start_time = Utc::now();
+            let (output, status) = match self.executor.execute(&task).await {
+                Ok((_execution_id, output, status)) => (output, status.to_string()),
+                Err(error) => {
+                    error!("Failed to execute startup supplement task {}: {}", task.name, error);
+                    (format!("Execution error: {}", error), "failed".to_string())
+                }
+            };
+            let duration = (Utc::now() - start_time).num_milliseconds();
+
+            if let Err(error) = self.task_service.update_run_info(task.id, start_time, duration).await {
+                error!("Failed to update startup supplement task run info: {}", error);
+            }
+            if let Err(error) = self
+                .log_service
+                .create(task.id, output, status, Some(duration), start_time)
+                .await
+            {
+                error!("Failed to save startup supplement task log: {}", error);
+            }
+        }
+
+        Ok(())
     }
 
     pub async fn run_task_now(&self, task_id: i64) -> Result<()> {

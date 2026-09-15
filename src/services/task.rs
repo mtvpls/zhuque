@@ -72,8 +72,8 @@ impl TaskService {
 
         let now = Utc::now();
         let result = sqlx::query(
-            "INSERT INTO tasks (name, command, cron, type, enabled, env, pre_command, post_command, group_id, working_dir, notification, timeout, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO tasks (name, command, cron, type, enabled, env, pre_command, post_command, group_id, working_dir, notification, timeout, startup_supplement_enabled, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&create.name)
         .bind(&create.command)
@@ -87,6 +87,7 @@ impl TaskService {
         .bind(&create.working_dir)
         .bind(&create.notification)
         .bind(create.timeout)
+        .bind(create.startup_supplement_enabled)
         .bind(now)
         .bind(now)
         .execute(&*pool)
@@ -154,6 +155,10 @@ impl TaskService {
             query.push_str(", timeout = ?");
             params.push(timeout.to_string());
         }
+        if let Some(startup_supplement_enabled) = update.startup_supplement_enabled {
+            query.push_str(", startup_supplement_enabled = ?");
+            params.push(startup_supplement_enabled.to_string());
+        }
 
         query.push_str(" WHERE id = ?");
         params.push(id.to_string());
@@ -200,6 +205,9 @@ impl TaskService {
         if let Some(timeout) = update.timeout {
             q = q.bind(timeout);
         }
+        if let Some(startup_supplement_enabled) = update.startup_supplement_enabled {
+            q = q.bind(startup_supplement_enabled);
+        }
 
         q = q.bind(id);
         q.execute(&*pool).await?;
@@ -230,6 +238,16 @@ impl TaskService {
         let tasks = sqlx::query_as::<_, Task>("SELECT * FROM tasks WHERE enabled = 1 AND type = 'startup'")
             .fetch_all(&*pool)
             .await?;
+        Ok(tasks)
+    }
+
+    pub async fn get_startup_supplement_tasks(&self) -> Result<Vec<Task>> {
+        let pool = self.pool.read().await;
+        let tasks = sqlx::query_as::<_, Task>(
+            "SELECT * FROM tasks WHERE enabled = 1 AND type = 'cron' AND startup_supplement_enabled = 1",
+        )
+        .fetch_all(&*pool)
+        .await?;
         Ok(tasks)
     }
 

@@ -69,6 +69,7 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool> {
             pre_command TEXT,
             post_command TEXT,
             group_id INTEGER,
+            startup_supplement_enabled BOOLEAN NOT NULL DEFAULT 0,
             last_run_at DATETIME,
             last_run_duration INTEGER,
             next_run_at DATETIME,
@@ -247,6 +248,11 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool> {
         .execute(&pool)
         .await
         .ok(); // 忽略错误，字段可能已存在
+
+    sqlx::query("ALTER TABLE tasks ADD COLUMN startup_supplement_enabled BOOLEAN NOT NULL DEFAULT 0")
+        .execute(&pool)
+        .await
+        .ok();
 
     // 数据库迁移：添加 duration 字段到 logs 表
     sqlx::query("ALTER TABLE logs ADD COLUMN duration INTEGER")
