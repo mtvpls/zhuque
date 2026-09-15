@@ -61,6 +61,9 @@ mod terminal_impl {
             let mut cmd = CommandBuilder::new(shell);
             cmd.env("TERM", "xterm-256color");
 
+            // 设置 UTF-8 locale
+            cmd.env("LC_ALL", "C.UTF-8");
+
             // 设置工作目录为 scripts 目录
             cmd.cwd(&self.working_dir);
 

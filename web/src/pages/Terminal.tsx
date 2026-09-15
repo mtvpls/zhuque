@@ -135,6 +135,9 @@ const Terminal: React.FC = () => {
       }, 100);
     };
 
+    // 复用同一个解码器：多字节字符可能被切在 WebSocket 帧边界，stream 模式会缓存不完整字节序列
+    const decoder = new TextDecoder();
+
     ws.onmessage = async (event) => {
       // 处理文本消息（可能是 session 初始化消息）
       if (typeof event.data === 'string') {
@@ -154,11 +157,9 @@ const Terminal: React.FC = () => {
 
       // 处理二进制消息（PTY 输出）
       if (event.data instanceof Blob) {
-        const text = await event.data.text();
-        term.write(text);
+        term.write(decoder.decode(await event.data.arrayBuffer(), { stream: true }));
       } else if (event.data instanceof ArrayBuffer) {
-        const text = new TextDecoder().decode(event.data);
-        term.write(text);
+        term.write(decoder.decode(event.data, { stream: true }));
       } else {
         // 其他类型直接写入
         term.write(event.data);
