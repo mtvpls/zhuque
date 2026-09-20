@@ -245,7 +245,7 @@ async fn main() -> Result<()> {
         #[cfg(not(target_os = "android"))]
         terminal_service,
         totp_service,
-        scheduler,
+        scheduler: scheduler.clone(),
         subscription_scheduler,
         backup_scheduler,
         db_pool: shared_pool,
@@ -266,6 +266,7 @@ async fn main() -> Result<()> {
     let task_service_clone = task_service.clone();
     let log_service_clone = log_service.clone();
     let executor_clone = executor.clone();
+    let scheduler_clone = scheduler.clone();
     tokio::spawn(async move {
         // 等待依赖安装完成
         if let Ok(_) = deps_done_rx.await {
@@ -306,6 +307,10 @@ async fn main() -> Result<()> {
                 Err(e) => {
                     error!("Failed to get startup tasks: {}", e);
                 }
+            }
+
+            if let Err(e) = scheduler_clone.run_startup_supplement_tasks().await {
+                error!("Failed to run startup supplement tasks: {}", e);
             }
         }
     });

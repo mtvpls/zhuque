@@ -30,7 +30,7 @@ use axum::{
     http::{StatusCode, Uri},
     middleware,
     response::IntoResponse,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use serde_json::json;
@@ -243,6 +243,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/ai/sessions/:id/messages",
             get(ai::get_session_messages).post(ai::compress_session),
         )
+        .route("/api/ai/sessions/:id/context", put(ai::update_session_context))
         .route("/api/ai/agent", post(ai::agent))
         .route("/api/ai/ws", get(ai::agent_ws))
         // 系统配置管理

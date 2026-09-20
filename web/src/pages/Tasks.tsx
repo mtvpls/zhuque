@@ -69,6 +69,81 @@ const jsonToDotEnv = (json: string): string => {
   }
 };
 
+type StartupSupplementCronSummary =
+  | { status: 'valid'; occurrenceCount: number }
+  | { status: 'invalid' }
+  | { status: 'none' };
+
+const parseCronField = (field: string, min: number, max: number, names?: Record<string, number>): Set<number> | null => {
+  const values = new Set<number>();
+  for (const rawPart of field.toUpperCase().split(',')) {
+    const [rawBase, rawStep] = rawPart.split('/');
+    const step = rawStep ? Number(rawStep) : 1;
+    if (!Number.isInteger(step) || step < 1) return null;
+
+    let base = rawBase;
+    let start = min;
+    let end = max;
+    if (base !== '*') {
+      if (base.includes('-')) {
+        const [rawStart, rawEnd] = base.split('-');
+        const parsedStart = names?.[rawStart] ?? Number(rawStart);
+        const parsedEnd = names?.[rawEnd] ?? Number(rawEnd);
+        if (!Number.isInteger(parsedStart) || !Number.isInteger(parsedEnd)) return null;
+        start = parsedStart;
+        end = parsedEnd;
+      } else {
+        const value = names?.[base] ?? Number(base);
+        if (!Number.isInteger(value)) return null;
+        start = value;
+        end = value;
+      }
+    }
+
+    if (start < min || end > max || start > end) return null;
+    for (let value = start; value <= end; value += step) values.add(value);
+  }
+  return values;
+};
+
+const getStartupSupplementCronSummary = (cron: unknown): StartupSupplementCronSummary => {
+  const expressions = Array.isArray(cron) ? cron : [cron];
+  if (expressions.length === 0 || expressions.some(value => typeof value !== 'string' || !value.trim())) {
+    return { status: 'invalid' };
+  }
+
+  const monthNames = { JAN: 1, FEB: 2, MAR: 3, APR: 4, MAY: 5, JUN: 6, JUL: 7, AUG: 8, SEP: 9, OCT: 10, NOV: 11, DEC: 12 };
+  const dayNames = { SUN: 0, MON: 1, TUE: 2, WED: 3, THU: 4, FRI: 5, SAT: 6 };
+  const today = new Date();
+  let occurrenceCount = 0;
+
+  for (const expression of expressions as string[]) {
+    const fields = expression.trim().split(/\s+/);
+    if (fields.length !== 5 && fields.length !== 6) return { status: 'invalid' };
+    const [secondField, minuteField, hourField, dayOfMonthField, monthField, dayOfWeekField] = fields.length === 5
+      ? ['0', ...fields]
+      : fields;
+    const seconds = parseCronField(secondField, 0, 59);
+    const minutes = parseCronField(minuteField, 0, 59);
+    const hours = parseCronField(hourField, 0, 23);
+    const daysOfMonth = parseCronField(dayOfMonthField, 1, 31);
+    const months = parseCronField(monthField, 1, 12, monthNames);
+    const daysOfWeek = parseCronField(dayOfWeekField, 0, 7, dayNames);
+    if (!seconds || !minutes || !hours || !daysOfMonth || !months || !daysOfWeek) return { status: 'invalid' };
+
+    const cronDayOfWeek = today.getDay();
+    const normalizedDaysOfWeek = new Set([...daysOfWeek].map(day => day === 7 ? 0 : day));
+    if (!months.has(today.getMonth() + 1) || !daysOfMonth.has(today.getDate()) || !normalizedDaysOfWeek.has(cronDayOfWeek)) continue;
+
+    occurrenceCount += hours.size * minutes.size * seconds.size;
+    if (occurrenceCount > 1) return { status: 'valid', occurrenceCount };
+  }
+
+  return occurrenceCount === 0
+    ? { status: 'none' }
+    : { status: 'valid', occurrenceCount };
+};
+
 const Tasks: React.FC = () => {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [runningTasks, setRunningTasks] = useState<Set<number>>(new Set());
@@ -346,6 +421,7 @@ const Tasks: React.FC = () => {
       enabled: true,
       cron: ['*/5 * * * *'],
       timeout: 0,
+      startup_supplement_enabled: false,
     });
     setTaskEnvFormat('json');
     resetNotifState(null);
@@ -358,6 +434,7 @@ const Tasks: React.FC = () => {
     const formData = {
       ...task,
       cron: Array.isArray(task.cron) ? task.cron : [task.cron],
+      startup_supplement_enabled: task.startup_supplement_enabled ?? false,
     };
     form.setFieldsValue(formData);
     setTaskEnvFormat('json');
@@ -378,6 +455,7 @@ const Tasks: React.FC = () => {
       enabled: task.enabled,
       working_dir: task.working_dir,
       timeout: task.timeout,
+      startup_supplement_enabled: task.startup_supplement_enabled ?? false,
       pre_command: task.pre_command,
       post_command: task.post_command,
       env: task.env,
@@ -394,6 +472,7 @@ const Tasks: React.FC = () => {
 
       if (values.type !== 'cron') {
         values.cron = ['0 0 * * *'];
+        values.startup_supplement_enabled = false;
       }
 
       if (values.env && taskEnvFormat === 'dotenv') {
@@ -1089,6 +1168,49 @@ const Tasks: React.FC = () => {
                   style={{ width: 200 }}
                 />
               </FormItem>
+
+              <Form.Item noStyle shouldUpdate={(prev, next) =>
+                prev.type !== next.type ||
+                prev.cron !== next.cron ||
+                prev.startup_supplement_enabled !== next.startup_supplement_enabled
+              }>
+                {(values) => {
+                  if (values.type !== 'cron') return null;
+                  const summary = getStartupSupplementCronSummary(values.cron);
+                  const showWarning = values.startup_supplement_enabled && (
+                    summary.status === 'invalid' ||
+                    (summary.status === 'valid' && summary.occurrenceCount > 1)
+                  );
+                  return (
+                    <>
+                      <FormItem
+                        label="启动时补充执行"
+                        field="startup_supplement_enabled"
+                        triggerPropName="checked"
+                        extra="启动并完成依赖安装后，若今天的定时点已过去且任务今天尚未执行，则补执行一次。"
+                      >
+                        <Switch />
+                      </FormItem>
+                      {showWarning ? (
+                        <div style={{
+                          marginTop: -8,
+                          marginBottom: 16,
+                          padding: '8px 12px',
+                          color: '#d48806',
+                          background: '#fffbe6',
+                          border: '1px solid #ffe58f',
+                          borderRadius: 4,
+                          lineHeight: 1.6,
+                        }}>
+                          ⚠️ {summary.status === 'invalid'
+                            ? '当前 Cron 表达式无法解析，启动时补充执行不会生效。'
+                            : '当前 Cron 表达式今天包含多个执行时段，启动时补充执行仅支持每天执行一次的任务。'}
+                        </div>
+                      ) : null}
+                    </>
+                  );
+                }}
+              </Form.Item>
 
               <FormItem
                 label="前置命令"

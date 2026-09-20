@@ -35,8 +35,6 @@ pub struct AiChatRequest {
     pub prompt: String,
     pub file_name: Option<String>,
     pub file_path: Option<String>,
-    pub file_content: Option<String>,
-    pub execution_output: Option<String>,
     pub directory_path: Option<String>,
     #[serde(default)]
     pub history: Vec<AiHistoryMessage>,
@@ -834,7 +832,8 @@ fn agent_tools() -> Value {
                         "cron": { "type": "string", "description": "cron 表达式，也可传字符串数组" },
                         "type": { "type": "string", "enum": ["cron", "manual", "startup"] },
                         "enabled": { "type": "boolean" }, "env": { "type": "string" },
-                        "working_dir": { "type": "string" }, "timeout": { "type": "integer", "minimum": 0 }
+                        "working_dir": { "type": "string" }, "timeout": { "type": "integer", "minimum": 0 },
+                        "startup_supplement_enabled": { "type": "boolean", "description": "启动后对已错过且今天尚未执行的每日一次定时任务补执行" }
                     },
                     "required": ["name", "command", "cron"]
                 }
@@ -851,7 +850,8 @@ fn agent_tools() -> Value {
                         "id": { "type": "integer" }, "name": { "type": "string" }, "command": { "type": "string" },
                         "cron": { "type": "string" }, "type": { "type": "string", "enum": ["cron", "manual", "startup"] },
                         "enabled": { "type": "boolean" }, "env": { "type": "string" }, "working_dir": { "type": "string" },
-                        "timeout": { "type": "integer", "minimum": 0 }
+                        "timeout": { "type": "integer", "minimum": 0 },
+                        "startup_supplement_enabled": { "type": "boolean", "description": "启动后对已错过且今天尚未执行的每日一次定时任务补执行" }
                     },
                     "required": ["id"]
                 }
@@ -1258,6 +1258,7 @@ struct CreateTaskToolArgs {
     group_id: Option<i64>,
     working_dir: Option<String>,
     timeout: Option<i64>,
+    startup_supplement_enabled: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1275,6 +1276,7 @@ struct UpdateTaskToolArgs {
     group_id: Option<i64>,
     working_dir: Option<String>,
     timeout: Option<i64>,
+    startup_supplement_enabled: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1305,6 +1307,7 @@ fn task_summary(task: &crate::models::Task) -> Value {
         "enabled": task.enabled,
         "working_dir": task.working_dir,
         "timeout": task.timeout,
+        "startup_supplement_enabled": task.startup_supplement_enabled,
         "last_run_at": task.last_run_at,
         "next_run_at": task.next_run_at,
     })
@@ -1724,6 +1727,7 @@ async fn execute_agent_tool(
                 working_dir: args.working_dir,
                 notification: None,
                 timeout: args.timeout.unwrap_or(0).max(0),
+                startup_supplement_enabled: args.startup_supplement_enabled.unwrap_or(false),
             }).await.map_err(|e| e.to_string())?;
             state.scheduler.add_task_to_scheduler(task.id).await.map_err(|e| e.to_string())?;
             Ok(json!({ "task": task_summary(&task) }))
@@ -1743,6 +1747,7 @@ async fn execute_agent_tool(
                 working_dir: args.working_dir,
                 notification: None,
                 timeout: args.timeout.map(|value| value.max(0)),
+                startup_supplement_enabled: args.startup_supplement_enabled,
             }).await.map_err(|e| e.to_string())?.ok_or_else(|| "任务不存在".to_string())?;
             state.scheduler.update_task_in_scheduler(args.id).await.map_err(|e| e.to_string())?;
             Ok(json!({ "task": task_summary(&task) }))
@@ -2037,13 +2042,11 @@ async fn run_agent_job(state: Arc<AppState>, request: AiChatRequest, job: Arc<Ai
     };
     let system = agent_system_prompt();
     let stable_context = format!(
-        "执行工具状态: 由系统处理\n模式: {}\n当前文件名: {}\n当前路径: {}\n当前附加目录: {}\n当前文件内容:\n{}\n\n最近执行输出:\n{}",
+        "执行工具状态: 由系统处理\n模式: {}\n当前附加文件名: {}\n当前附加文件路径: {}\n当前附加目录: {}\n附加文件内容未直接注入上下文；如需查看，请先使用 read_file 读取附加文件路径。",
         request.mode,
-        request.file_name.as_deref().unwrap_or("未选择文件"),
-        request.file_path.as_deref().unwrap_or(""),
+        request.file_name.as_deref().unwrap_or("未附加文件"),
+        request.file_path.as_deref().unwrap_or("未附加文件"),
         request.directory_path.as_deref().unwrap_or("未附加目录"),
-        request.file_content.as_deref().unwrap_or("未提供"),
-        request.execution_output.as_deref().unwrap_or("未提供"),
     );
     let mut messages = vec![json!({"role":"system","content":system})];
     let history_start = request.history.len().saturating_sub(40);
@@ -2391,6 +2394,14 @@ async fn create_agent_job(
         pending_tool: Mutex::new(None),
         approval_notify: Notify::new(),
     });
+    set_session_context(
+        state,
+        request.session_id.as_deref(),
+        user_key,
+        request.file_path.as_deref(),
+        request.directory_path.as_deref(),
+    )
+    .await;
     set_session_job(state, request.session_id.as_deref(), user_key, Some(&job_id)).await;
     AI_JOBS.write().await.insert(job_id.clone(), job.clone());
     publish_job(&job, json!({"type":"job_started","job_id":job_id})).await;
@@ -2508,13 +2519,11 @@ pub async fn agent(
     let stream = async_stream::stream! {
         let system = agent_system_prompt();
         let stable_context = format!(
-            "执行工具状态: 由系统处理\n模式: {}\n当前文件名: {}\n当前路径: {}\n当前附加目录: {}\n当前文件内容:\n{}\n\n最近执行输出:\n{}",
+            "执行工具状态: 由系统处理\n模式: {}\n当前附加文件名: {}\n当前附加文件路径: {}\n当前附加目录: {}\n附加文件内容未直接注入上下文；如需查看，请先使用 read_file 读取附加文件路径。",
                     request.mode,
-            request.file_name.as_deref().unwrap_or("未选择文件"),
-            request.file_path.as_deref().unwrap_or(""),
+            request.file_name.as_deref().unwrap_or("未附加文件"),
+            request.file_path.as_deref().unwrap_or("未附加文件"),
             request.directory_path.as_deref().unwrap_or("未附加目录"),
-            request.file_content.as_deref().unwrap_or("未提供"),
-            request.execution_output.as_deref().unwrap_or("未提供"),
         );
         let mut messages = vec![
             json!({"role": "system", "content": system}),
@@ -2908,6 +2917,35 @@ pub async fn create_session(
     Ok(Json(row.into()))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct AiSessionContextRequest {
+    file_path: Option<String>,
+    directory_path: Option<String>,
+}
+
+pub async fn update_session_context(
+    State(state): State<Arc<AppState>>,
+    Claims { sub, .. }: Claims,
+    Path(session_id): Path<String>,
+    Json(request): Json<AiSessionContextRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let file_path = request.file_path.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    let directory_path = request.directory_path.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    let pool = state.db_pool.read().await;
+    let result = sqlx::query("UPDATE ai_sessions SET file_path = ?, directory_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_key = ?")
+        .bind(file_path)
+        .bind(directory_path)
+        .bind(&session_id)
+        .bind(sub)
+        .execute(&*pool)
+        .await
+        .map_err(internal_error)?;
+    if result.rows_affected() == 0 {
+        return Err((StatusCode::NOT_FOUND, "AI 会话不存在".into()));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub async fn get_session_messages(
     State(state): State<Arc<AppState>>,
     Claims { sub, .. }: Claims,
@@ -3228,6 +3266,24 @@ async fn set_session_model(state: &Arc<AppState>, session_id: Option<&str>, user
     let pool = state.db_pool.read().await;
     let _ = sqlx::query("UPDATE ai_sessions SET model = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_key = ?")
         .bind(model).bind(session_id).bind(user_key).execute(&*pool).await;
+}
+
+async fn set_session_context(
+    state: &Arc<AppState>,
+    session_id: Option<&str>,
+    user_key: &str,
+    file_path: Option<&str>,
+    directory_path: Option<&str>,
+) {
+    let Some(session_id) = session_id.filter(|id| !id.is_empty()) else { return; };
+    let pool = state.db_pool.read().await;
+    let _ = sqlx::query("UPDATE ai_sessions SET file_path = ?, directory_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_key = ?")
+        .bind(file_path)
+        .bind(directory_path)
+        .bind(session_id)
+        .bind(user_key)
+        .execute(&*pool)
+        .await;
 }
 
 async fn set_session_job(
