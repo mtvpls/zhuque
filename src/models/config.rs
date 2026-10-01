@@ -161,21 +161,87 @@ impl Default for AiConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutoBackupConfig {
     pub enabled: bool,
+    /// 备份目标类型："webdav"（默认）或 "s3"（S3 兼容对象存储，如 Cloudflare R2 / MinIO）
+    #[serde(default = "default_backup_provider")]
+    pub provider: String,
     pub webdav_url: String,
     pub webdav_username: String,
     pub webdav_password: String,
+    // S3 兼容存储配置
+    #[serde(default)]
+    pub s3_endpoint: String, // 如 https://<account_id>.r2.cloudflarestorage.com 或 http://host:9000
+    #[serde(default = "default_s3_region")]
+    pub s3_region: String, // R2 使用 "auto"
+    #[serde(default)]
+    pub s3_bucket: String,
+    #[serde(default)]
+    pub s3_access_key_id: String,
+    #[serde(default)]
+    pub s3_secret_access_key: String,
     pub cron: String,
-    pub remote_path: Option<String>, // WebDAV 远程路径，默认为根目录
+    pub remote_path: Option<String>, // 远端路径/对象前缀，默认为根目录
     pub max_backups: Option<u32>,    // 最大保留备份数量，None 表示不限制
 }
+
+fn default_backup_provider() -> String {
+    "webdav".to_string()
+}
+
+fn default_s3_region() -> String {
+    "auto".to_string()
+}
+
+impl AutoBackupConfig {
+    /// 备份目标是否为 S3 兼容对象存储（Cloudflare R2 / MinIO / Wasabi 等）
+    pub fn is_s3(&self) -> bool {
+        self.provider.eq_ignore_ascii_case("s3")
+    }
+
+    /// 按 provider 列出缺失的必填项（用于启用前的配置校验）
+    pub fn missing_fields(&self) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        if self.is_s3() {
+            if self.s3_endpoint.trim().is_empty() {
+                missing.push("s3_endpoint");
+            }
+            if self.s3_bucket.trim().is_empty() {
+                missing.push("s3_bucket");
+            }
+            if self.s3_access_key_id.trim().is_empty() {
+                missing.push("s3_access_key_id");
+            }
+            if self.s3_secret_access_key.trim().is_empty() {
+                missing.push("s3_secret_access_key");
+            }
+        } else {
+            if self.webdav_url.trim().is_empty() {
+                missing.push("webdav_url");
+            }
+            if self.webdav_username.trim().is_empty() {
+                missing.push("webdav_username");
+            }
+            if self.webdav_password.is_empty() {
+                missing.push("webdav_password");
+            }
+        }
+        missing
+    }
+}
+
 
 impl Default for AutoBackupConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            provider: default_backup_provider(),
             webdav_url: String::new(),
             webdav_username: String::new(),
             webdav_password: String::new(),
+            s3_endpoint: String::new(),
+            s3_region: default_s3_region(),
+            s3_bucket: String::new(),
+            s3_access_key_id: String::new(),
+            s3_secret_access_key: String::new(),
             cron: "0 2 * * *".to_string(), // 默认每天凌晨2点（5字段格式）
             remote_path: None,
             max_backups: Some(10), // 默认保留10个备份

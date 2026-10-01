@@ -1,4 +1,5 @@
-use crate::services::{ConfigService, WebDavClient};
+use crate::models::AutoBackupConfig;
+use crate::services::{ConfigService, S3Client, WebDavClient};
 use anyhow::Result;
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::RwLock;
@@ -58,31 +59,25 @@ impl BackupScheduler {
         }
 
         // 验证配置
-        if backup_config.webdav_url.is_empty()
-            || backup_config.webdav_username.is_empty()
-            || backup_config.webdav_password.is_empty()
-        {
-            error!("Auto backup is enabled but WebDAV configuration is incomplete");
+        let missing = backup_config.missing_fields();
+        if !missing.is_empty() {
+            error!(
+                "Auto backup is enabled but {} configuration is incomplete: missing {}",
+                if backup_config.is_s3() { "S3" } else { "WebDAV" },
+                missing.join(", ")
+            );
             return Ok(());
         }
 
         let cron_expr = normalize_cron_expr(&backup_config.cron);
-        let webdav_url = backup_config.webdav_url.clone();
-        let webdav_username = backup_config.webdav_username.clone();
-        let webdav_password = backup_config.webdav_password.clone();
-        let remote_path = backup_config.remote_path.clone();
-        let max_backups = backup_config.max_backups;
+        let cron_for_log = backup_config.cron.clone();
 
         match Job::new_async_tz(cron_expr.as_str(), chrono::Local, move |_uuid, _l| {
-            let url = webdav_url.clone();
-            let username = webdav_username.clone();
-            let password = webdav_password.clone();
-            let path = remote_path.clone();
-            let max = max_backups;
+            let config = backup_config.clone();
 
             Box::pin(async move {
                 info!("Running scheduled backup...");
-                if let Err(e) = Self::perform_backup(&url, &username, &password, path.as_deref(), max).await {
+                if let Err(e) = Self::perform_backup(&config).await {
                     error!("Failed to perform scheduled backup: {}", e);
                 } else {
                     info!("Scheduled backup completed successfully");
@@ -92,7 +87,7 @@ impl BackupScheduler {
             Ok(job) => {
                 match self.scheduler.add(job).await {
                     Ok(id) => {
-                        info!("Added backup job with schedule: {}", backup_config.cron);
+                        info!("Added backup job with schedule: {}", cron_for_log);
                         *job_id = Some(id);
                     }
                     Err(e) => error!("Failed to add backup job: {}", e),
@@ -106,23 +101,11 @@ impl BackupScheduler {
     }
 
     // 静态方法，供外部调用执行备份
-    pub async fn perform_backup_static(
-        webdav_url: &str,
-        webdav_username: &str,
-        webdav_password: &str,
-        remote_path: Option<&str>,
-        max_backups: Option<u32>,
-    ) -> Result<()> {
-        Self::perform_backup(webdav_url, webdav_username, webdav_password, remote_path, max_backups).await
+    pub async fn perform_backup_static(config: &AutoBackupConfig) -> Result<()> {
+        Self::perform_backup(config).await
     }
 
-    async fn perform_backup(
-        webdav_url: &str,
-        webdav_username: &str,
-        webdav_password: &str,
-        remote_path: Option<&str>,
-        max_backups: Option<u32>,
-    ) -> Result<()> {
+    async fn perform_backup(config: &AutoBackupConfig) -> Result<()> {
         let data_dir = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "./data".into()));
         if !data_dir.is_dir() {
             anyhow::bail!("Data directory does not exist: {}", data_dir.display());
@@ -138,38 +121,64 @@ impl BackupScheduler {
             tokio::fs::metadata(&temp_file).await?.len()
         );
 
-        // 上传到 WebDAV
-        info!("Uploading to WebDAV...");
-        let client = WebDavClient::new(
-            webdav_url.to_string(),
-            webdav_username.to_string(),
-            webdav_password.to_string(),
-        );
-
-        let remote_file_path = if let Some(path) = remote_path {
+        let remote_file_path = if let Some(path) = config.remote_path.as_deref() {
             format!("{}/{}", path.trim_end_matches('/'), backup_filename)
         } else {
             backup_filename.clone()
         };
 
-        client.upload_file(&temp_file, &remote_file_path).await?;
+        let upload_result = if config.is_s3() {
+            // 上传到 S3 兼容对象存储（Cloudflare R2 / MinIO / Wasabi 等）
+            info!("Uploading to S3...");
+            let client = S3Client::new(
+                config.s3_endpoint.clone(),
+                config.s3_region.clone(),
+                config.s3_bucket.clone(),
+                config.s3_access_key_id.clone(),
+                config.s3_secret_access_key.clone(),
+            )?;
+
+            client.upload_file(&temp_file, &remote_file_path).await?;
+            info!("Backup uploaded to S3: {}", remote_file_path);
+
+            if let Some(max) = config.max_backups {
+                if max > 0 {
+                    info!("Cleaning up old backups, keeping latest {} backups", max);
+                    if let Err(e) = Self::cleanup_old_backups_s3(&client, config.remote_path.as_deref(), max).await {
+                        error!("Failed to cleanup old backups: {}", e);
+                    }
+                }
+            }
+
+            Ok(())
+        } else {
+            // 上传到 WebDAV
+            info!("Uploading to WebDAV...");
+            let client = WebDavClient::new(
+                config.webdav_url.clone(),
+                config.webdav_username.clone(),
+                config.webdav_password.clone(),
+            );
+
+            client.upload_file(&temp_file, &remote_file_path).await?;
+            info!("Backup uploaded to WebDAV: {}", remote_file_path);
+
+            if let Some(max) = config.max_backups {
+                if max > 0 {
+                    info!("Cleaning up old backups, keeping latest {} backups", max);
+                    if let Err(e) = Self::cleanup_old_backups(&client, config.remote_path.as_deref(), max).await {
+                        error!("Failed to cleanup old backups: {}", e);
+                    }
+                }
+            }
+
+            Ok(())
+        };
 
         // 删除临时文件
         let _ = tokio::fs::remove_file(&temp_file).await;
 
-        info!("Backup uploaded to WebDAV: {}", remote_file_path);
-
-        // 清理旧备份
-        if let Some(max) = max_backups {
-            if max > 0 {
-                info!("Cleaning up old backups, keeping latest {} backups", max);
-                if let Err(e) = Self::cleanup_old_backups(&client, remote_path, max).await {
-                    error!("Failed to cleanup old backups: {}", e);
-                }
-            }
-        }
-
-        Ok(())
+        upload_result
     }
 
     async fn cleanup_old_backups(
@@ -196,6 +205,40 @@ impl BackupScheduler {
             for file in files_to_delete {
                 info!("Deleting old backup: {}", file.name);
                 if let Err(e) = client.delete_file(&file.path).await {
+                    error!("Failed to delete {}: {}", file.name, e);
+                }
+            }
+        } else {
+            info!("No old backups to delete (total: {})", files.len());
+        }
+
+        Ok(())
+    }
+
+    async fn cleanup_old_backups_s3(
+        client: &S3Client,
+        prefix: Option<&str>,
+        max_backups: u32,
+    ) -> Result<()> {
+        let list_prefix = prefix.unwrap_or("");
+
+        // 列出所有备份对象
+        let mut files = client.list_files(list_prefix).await?;
+
+        // 过滤出备份文件（以 zhuque_backup_ 开头，以 .tar.gz 结尾）
+        files.retain(|f| f.name.starts_with("zhuque_backup_") && f.name.ends_with(".tar.gz"));
+
+        // 按文件名排序（文件名包含时间戳，所以可以直接排序）
+        files.sort_by(|a, b| b.name.cmp(&a.name)); // 降序排列，最新的在前面
+
+        // 如果备份数量超过限制，删除旧的备份
+        if files.len() > max_backups as usize {
+            let files_to_delete = &files[max_backups as usize..];
+            info!("Found {} old backups to delete", files_to_delete.len());
+
+            for file in files_to_delete {
+                info!("Deleting old backup: {}", file.name);
+                if let Err(e) = client.delete_file(&file.key).await {
                     error!("Failed to delete {}: {}", file.name, e);
                 }
             }

@@ -80,20 +80,89 @@ async fn main() -> Result<()> {
     let env_webdav_password = std::env::var("WEBDAV_PASSWORD").ok();
     let env_remote_path = std::env::var("WEBDAV_REMOTE_PATH").ok();
 
-    if auto_restore_enabled && env_webdav_url.is_some() && env_webdav_username.is_some() && env_webdav_password.is_some() {
-        info!("Auto restore is enabled via environment variables, restoring latest backup...");
-        let backup_config = models::config::AutoBackupConfig {
-            enabled: false,
-            webdav_url: env_webdav_url.unwrap(),
-            webdav_username: env_webdav_username.unwrap(),
-            webdav_password: env_webdav_password.unwrap(),
-            cron: String::new(),
-            remote_path: env_remote_path,
-            max_backups: None,
+    // S3 兼容对象存储（Cloudflare R2 / MinIO / Wasabi 等）
+    let env_s3_endpoint = std::env::var("S3_ENDPOINT").ok();
+    let env_s3_region = std::env::var("S3_REGION").ok();
+    let env_s3_bucket = std::env::var("S3_BUCKET").ok();
+    let env_s3_access_key_id = std::env::var("S3_ACCESS_KEY_ID").ok();
+    let env_s3_secret_access_key = std::env::var("S3_SECRET_ACCESS_KEY").ok();
+    let env_s3_remote_path = std::env::var("S3_REMOTE_PATH").ok();
+
+    if auto_restore_enabled {
+        // 备份目标：BACKUP_PROVIDER 显式指定优先，否则按已提供的环境变量推断
+        let provider = std::env::var("BACKUP_PROVIDER")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| {
+                if env_webdav_url.is_some() {
+                    "webdav".to_string()
+                } else if env_s3_endpoint.is_some() {
+                    "s3".to_string()
+                } else {
+                    "webdav".to_string()
+                }
+            });
+
+        let backup_config = if provider == "s3" {
+            let missing: Vec<&str> = [
+                ("S3_ENDPOINT", env_s3_endpoint.as_deref()),
+                ("S3_BUCKET", env_s3_bucket.as_deref()),
+                ("S3_ACCESS_KEY_ID", env_s3_access_key_id.as_deref()),
+                ("S3_SECRET_ACCESS_KEY", env_s3_secret_access_key.as_deref()),
+            ]
+            .iter()
+            .filter(|(_, value)| value.map(|v| v.trim().is_empty()).unwrap_or(true))
+            .map(|(name, _)| *name)
+            .collect();
+
+            if !missing.is_empty() {
+                warn!(
+                    "AUTO_RESTORE_ON_STARTUP with BACKUP_PROVIDER=s3 requires {}, skipping auto restore",
+                    missing.join(", ")
+                );
+                None
+            } else {
+                Some(models::config::AutoBackupConfig {
+                    provider: "s3".to_string(),
+                    s3_endpoint: env_s3_endpoint.unwrap(),
+                    s3_region: env_s3_region.unwrap_or_else(|| "auto".to_string()),
+                    s3_bucket: env_s3_bucket.unwrap(),
+                    s3_access_key_id: env_s3_access_key_id.unwrap(),
+                    s3_secret_access_key: env_s3_secret_access_key.unwrap(),
+                    remote_path: env_s3_remote_path,
+                    ..Default::default()
+                })
+            }
+        } else {
+            match (env_webdav_url, env_webdav_username, env_webdav_password) {
+                (Some(url), Some(username), Some(password)) => {
+                    Some(models::config::AutoBackupConfig {
+                        provider: "webdav".to_string(),
+                        webdav_url: url,
+                        webdav_username: username,
+                        webdav_password: password,
+                        remote_path: env_remote_path,
+                        ..Default::default()
+                    })
+                }
+                _ => {
+                    warn!(
+                        "AUTO_RESTORE_ON_STARTUP with provider webdav requires WEBDAV_URL, WEBDAV_USERNAME, WEBDAV_PASSWORD, skipping auto restore"
+                    );
+                    None
+                }
+            }
         };
 
-        restore_latest_backup(&backup_config, &data_dir).await?;
-        info!("Startup backup restore handling completed");
+        if let Some(backup_config) = backup_config {
+            info!(
+                "Auto restore is enabled via environment variables (provider: {}), restoring latest backup...",
+                backup_config.provider
+            );
+            restore_latest_backup(&backup_config, &data_dir).await?;
+            info!("Startup backup restore handling completed");
+        }
     }
 
     // 初始化数据库
@@ -327,40 +396,10 @@ async fn restore_latest_backup(
     backup_config: &models::config::AutoBackupConfig,
     data_dir: &PathBuf,
 ) -> Result<()> {
-    use services::WebDavClient;
-
-    let client = WebDavClient::new(
-        backup_config.webdav_url.clone(),
-        backup_config.webdav_username.clone(),
-        backup_config.webdav_password.clone(),
-    );
-
-    let list_path = backup_config.remote_path.as_deref().unwrap_or("");
-
-    // 列出所有备份文件
-    let mut files = client.list_files(list_path).await?;
-
-    // 过滤出备份文件
-    files.retain(|f| f.name.starts_with("zhuque_backup_") && f.name.ends_with(".tar.gz"));
-
-    if files.is_empty() {
-        info!("No backup files found on WebDAV");
+    // 先把最新的备份文件下载到本地临时文件（按 provider 分派）
+    let Some(temp_file) = download_latest_backup(backup_config).await? else {
         return Ok(());
-    }
-
-    // 按文件名排序，获取最新的
-    files.sort_by(|a, b| b.name.cmp(&a.name));
-    let latest_file = &files[0];
-
-    info!("Found latest backup: {}", latest_file.name);
-
-    // 下载到临时文件
-    let temp_dir = std::env::temp_dir();
-    let temp_file = temp_dir.join(&latest_file.name);
-
-    client.download_file(&latest_file.path, &temp_file).await?;
-
-    info!("Downloaded backup file: {} bytes", tokio::fs::metadata(&temp_file).await?.len());
+    };
 
     let restore_result: Result<()> = async {
         let rollback_path = data_dir.parent().unwrap_or(std::path::Path::new(".")).join(format!(
@@ -414,4 +453,80 @@ async fn restore_latest_backup(
     info!("Backup restored successfully");
 
     Ok(())
+}
+
+/// 按 provider（WebDAV / S3 兼容对象存储）列出远端备份并下载最新的一个到本地临时文件。
+/// 远端没有任何备份时返回 `Ok(None)`。
+async fn download_latest_backup(
+    backup_config: &models::config::AutoBackupConfig,
+) -> Result<Option<PathBuf>> {
+    let list_path = backup_config.remote_path.as_deref().unwrap_or("").to_string();
+
+    if backup_config.is_s3() {
+        use services::S3Client;
+
+        let client = S3Client::new(
+            backup_config.s3_endpoint.clone(),
+            backup_config.s3_region.clone(),
+            backup_config.s3_bucket.clone(),
+            backup_config.s3_access_key_id.clone(),
+            backup_config.s3_secret_access_key.clone(),
+        )?;
+
+        let mut files = client.list_files(&list_path).await?;
+        files.retain(|f| f.name.starts_with("zhuque_backup_") && f.name.ends_with(".tar.gz"));
+
+        if files.is_empty() {
+            info!("No backup files found on S3");
+            return Ok(None);
+        }
+
+        // 按文件名排序（文件名包含时间戳），取最新的
+        files.sort_by(|a, b| b.name.cmp(&a.name));
+        let latest_file = files.remove(0);
+
+        info!("Found latest backup: {}", latest_file.name);
+
+        let temp_file = std::env::temp_dir().join(&latest_file.name);
+        client.download_file(&latest_file.key, &temp_file).await?;
+
+        info!(
+            "Downloaded backup file: {} bytes",
+            tokio::fs::metadata(&temp_file).await?.len()
+        );
+
+        Ok(Some(temp_file))
+    } else {
+        use services::WebDavClient;
+
+        let client = WebDavClient::new(
+            backup_config.webdav_url.clone(),
+            backup_config.webdav_username.clone(),
+            backup_config.webdav_password.clone(),
+        );
+
+        let mut files = client.list_files(&list_path).await?;
+        files.retain(|f| f.name.starts_with("zhuque_backup_") && f.name.ends_with(".tar.gz"));
+
+        if files.is_empty() {
+            info!("No backup files found on WebDAV");
+            return Ok(None);
+        }
+
+        // 按文件名排序（文件名包含时间戳），取最新的
+        files.sort_by(|a, b| b.name.cmp(&a.name));
+        let latest_file = files.remove(0);
+
+        info!("Found latest backup: {}", latest_file.name);
+
+        let temp_file = std::env::temp_dir().join(&latest_file.name);
+        client.download_file(&latest_file.path, &temp_file).await?;
+
+        info!(
+            "Downloaded backup file: {} bytes",
+            tokio::fs::metadata(&temp_file).await?.len()
+        );
+
+        Ok(Some(temp_file))
+    }
 }

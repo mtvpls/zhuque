@@ -1,6 +1,6 @@
 use crate::api::AppState;
 use crate::models::{AutoBackupConfig, MirrorConfig, UpdateSystemConfig, WebSearchConfig};
-use crate::services::WebDavClient;
+use crate::services::{S3Client, WebDavClient};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -171,25 +171,41 @@ pub async fn update_auto_backup_config(
     Ok(Json(backup_config))
 }
 
-// 测试 WebDAV 连接
-pub async fn test_webdav_connection(
+// 测试备份目标连接（按 provider 分派：WebDAV / S3 兼容对象存储）
+pub async fn test_backup_connection(
     Json(backup_config): Json<AutoBackupConfig>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let client = WebDavClient::new(
-        backup_config.webdav_url,
-        backup_config.webdav_username,
-        backup_config.webdav_password,
-    );
+    if backup_config.is_s3() {
+        let client = S3Client::new(
+            backup_config.s3_endpoint,
+            backup_config.s3_region,
+            backup_config.s3_bucket,
+            backup_config.s3_access_key_id,
+            backup_config.s3_secret_access_key,
+        )
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("S3 客户端初始化失败: {}", e)))?;
 
-    client
-        .test_connection()
-        .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("连接失败: {}", e)))?;
+        client
+            .test_connection()
+            .await
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("连接失败: {}", e)))?;
+    } else {
+        let client = WebDavClient::new(
+            backup_config.webdav_url,
+            backup_config.webdav_username,
+            backup_config.webdav_password,
+        );
+
+        client
+            .test_connection()
+            .await
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("连接失败: {}", e)))?;
+    }
 
     Ok(Json(serde_json::json!({ "success": true, "message": "连接成功" })))
 }
 
-// 立即备份到 WebDAV
+// 立即备份到所选存储（WebDAV / S3 兼容对象存储）
 pub async fn backup_now(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -200,38 +216,26 @@ pub async fn backup_now(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // 验证配置
-    if backup_config.webdav_url.is_empty()
-        || backup_config.webdav_username.is_empty()
-        || backup_config.webdav_password.is_empty()
-    {
+    // 验证配置（按 provider 校验必填项）
+    let missing = backup_config.missing_fields();
+    if !missing.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            "WebDAV 配置不完整，请先配置 WebDAV 信息".to_string(),
+            format!(
+                "{} 配置不完整，缺少: {}",
+                if backup_config.is_s3() { "S3" } else { "WebDAV" },
+                missing.join(", ")
+            ),
         ));
     }
 
     // 在后台执行备份
-    let webdav_url = backup_config.webdav_url.clone();
-    let webdav_username = backup_config.webdav_username.clone();
-    let webdav_password = backup_config.webdav_password.clone();
-    let remote_path = backup_config.remote_path.clone();
-    let max_backups = backup_config.max_backups;
-
     tokio::spawn(async move {
         use crate::scheduler::BackupScheduler;
         use tracing::{error, info};
 
         info!("Manual backup triggered");
-        match BackupScheduler::perform_backup_static(
-            &webdav_url,
-            &webdav_username,
-            &webdav_password,
-            remote_path.as_deref(),
-            max_backups,
-        )
-        .await
-        {
+        match BackupScheduler::perform_backup_static(&backup_config).await {
             Ok(_) => info!("Manual backup completed successfully"),
             Err(e) => error!("Manual backup failed: {}", e),
         }

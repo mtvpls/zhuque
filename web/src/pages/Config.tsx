@@ -16,6 +16,7 @@ import {
   Switch,
   Table,
   Select,
+  Radio,
 } from '@arco-design/web-react';
 import { IconSave, IconDownload, IconUpload, IconRefresh } from '@arco-design/web-react/icon';
 import axios from 'axios';
@@ -83,6 +84,7 @@ const Config: React.FC = () => {
   const [currentUptime, setCurrentUptime] = useState<number>(0);
   const [autoBackupForm] = Form.useForm();
   const [autoBackupLoading, setAutoBackupLoading] = useState(false);
+  const [backupProvider, setBackupProvider] = useState<string>('webdav');
   const [testConnectionLoading, setTestConnectionLoading] = useState(false);
   const [backupNowLoading, setBackupNowLoading] = useState(false);
   const [systemLogs, setSystemLogs] = useState<SystemLogEntry[]>([]);
@@ -366,6 +368,7 @@ const Config: React.FC = () => {
         headers: { Authorization: `Bearer ${token}` },
       });
       autoBackupForm.setFieldsValue(res.data);
+      setBackupProvider(res.data?.provider === 's3' ? 's3' : 'webdav');
     } catch (error: any) {
       Message.error('加载自动备份配置失败');
     }
@@ -394,24 +397,39 @@ const Config: React.FC = () => {
     }
   };
 
+  // 仅当前所选备份目标（provider）的字段需要校验，另一组字段保留在表单中但不参与校验
+  const providerRequiredRule = (provider: 'webdav' | 's3', message: string) =>
+    backupProvider === provider ? [{ required: true, message }] : [];
+
   const handleTestConnection = async () => {
+    const isS3 = backupProvider === 's3';
     try {
-      await autoBackupForm.validate(['webdav_url', 'webdav_username', 'webdav_password']);
+      await autoBackupForm.validate(
+        isS3
+          ? ['s3_endpoint', 's3_bucket', 's3_access_key_id', 's3_secret_access_key']
+          : ['webdav_url', 'webdav_username', 'webdav_password']
+      );
       const values = autoBackupForm.getFieldsValue();
 
       setTestConnectionLoading(true);
       const token = localStorage.getItem('token');
       await axios.post('/api/configs/auto-backup/test', {
+        provider: isS3 ? 's3' : 'webdav',
         webdav_url: values.webdav_url,
         webdav_username: values.webdav_username,
         webdav_password: values.webdav_password,
+        s3_endpoint: values.s3_endpoint,
+        s3_region: values.s3_region,
+        s3_bucket: values.s3_bucket,
+        s3_access_key_id: values.s3_access_key_id,
+        s3_secret_access_key: values.s3_secret_access_key,
         enabled: false,
         cron: '',
       }, {
         headers: { Authorization: `Bearer ${token}` },
       });
 
-      Message.success('WebDAV 连接测试成功');
+      Message.success(isS3 ? 'S3 连接测试成功' : 'WebDAV 连接测试成功');
     } catch (error: any) {
       if (error.response?.data) {
         Message.error(error.response.data);
@@ -1152,46 +1170,111 @@ const Config: React.FC = () => {
                   label="启用自动备份"
                   field="enabled"
                   triggerPropName="checked"
-                  extra="开启后将按照设置的时间自动备份到 WebDAV"
+                  extra="开启后将按照设置的时间自动备份到所选存储（WebDAV / S3）"
                 >
                   <Switch />
                 </FormItem>
 
                 <Divider />
 
-                <Title heading={6}>WebDAV 配置</Title>
-
                 <FormItem
-                  label="WebDAV 地址"
-                  field="webdav_url"
-                  rules={[{ required: true, message: '请输入 WebDAV 地址' }]}
-                  extra="例如: https://dav.example.com"
+                  label="备份目标"
+                  field="provider"
+                  initialValue="webdav"
+                  extra="WebDAV 与 S3 兼容存储二选一"
                 >
-                  <Input placeholder="https://dav.example.com" />
+                  <Radio.Group
+                    type="button"
+                    onChange={(value) => setBackupProvider(value as string)}
+                  >
+                    <Radio value="webdav">WebDAV</Radio>
+                    <Radio value="s3">S3 兼容存储</Radio>
+                  </Radio.Group>
                 </FormItem>
 
-                <FormItem
-                  label="用户名"
-                  field="webdav_username"
-                  rules={[{ required: true, message: '请输入用户名' }]}
-                >
-                  <Input placeholder="用户名" />
-                </FormItem>
+                <div style={{ display: backupProvider === 'webdav' ? undefined : 'none' }}>
+                  <Title heading={6}>WebDAV 配置</Title>
+
+                  <FormItem
+                    label="WebDAV 地址"
+                    field="webdav_url"
+                    rules={providerRequiredRule('webdav', '请输入 WebDAV 地址')}
+                    extra="例如: https://dav.example.com"
+                  >
+                    <Input placeholder="https://dav.example.com" />
+                  </FormItem>
+
+                  <FormItem
+                    label="用户名"
+                    field="webdav_username"
+                    rules={providerRequiredRule('webdav', '请输入用户名')}
+                  >
+                    <Input placeholder="用户名" />
+                  </FormItem>
+
+                  <FormItem
+                    label="密码"
+                    field="webdav_password"
+                    rules={providerRequiredRule('webdav', '请输入密码')}
+                  >
+                    <Input.Password placeholder="密码" />
+                  </FormItem>
+                </div>
+
+                <div style={{ display: backupProvider === 's3' ? undefined : 'none' }}>
+                  <Title heading={6}>S3 兼容存储配置</Title>
+
+                  <FormItem
+                    label="Endpoint"
+                    field="s3_endpoint"
+                    rules={providerRequiredRule('s3', '请输入 S3 Endpoint')}
+                    extra="Cloudflare R2: https://<account_id>.r2.cloudflarestorage.com ；MinIO: http://host:9000"
+                  >
+                    <Input placeholder="https://<account_id>.r2.cloudflarestorage.com" />
+                  </FormItem>
+
+                  <FormItem
+                    label="Region"
+                    field="s3_region"
+                    initialValue="auto"
+                    extra="Cloudflare R2 固定填 auto，其余按服务商填写（如 us-east-1）"
+                  >
+                    <Input placeholder="auto" />
+                  </FormItem>
+
+                  <FormItem
+                    label="Bucket"
+                    field="s3_bucket"
+                    rules={providerRequiredRule('s3', '请输入 Bucket 名称')}
+                  >
+                    <Input placeholder="zhuque-backup" />
+                  </FormItem>
+
+                  <FormItem
+                    label="Access Key ID"
+                    field="s3_access_key_id"
+                    rules={providerRequiredRule('s3', '请输入 Access Key ID')}
+                  >
+                    <Input placeholder="Access Key ID" />
+                  </FormItem>
+
+                  <FormItem
+                    label="Secret Access Key"
+                    field="s3_secret_access_key"
+                    rules={providerRequiredRule('s3', '请输入 Secret Access Key')}
+                  >
+                    <Input.Password placeholder="Secret Access Key" />
+                  </FormItem>
+                </div>
 
                 <FormItem
-                  label="密码"
-                  field="webdav_password"
-                  rules={[{ required: true, message: '请输入密码' }]}
-                >
-                  <Input.Password placeholder="密码" />
-                </FormItem>
-
-                <FormItem
-                  label="远程路径"
+                  label={backupProvider === 's3' ? '对象前缀' : '远程路径'}
                   field="remote_path"
-                  extra="备份文件保存的远程路径，留空则保存到根目录"
+                  extra={backupProvider === 's3'
+                    ? '备份对象保存的 Key 前缀，留空则保存到存储桶根目录'
+                    : '备份文件保存的远程路径，留空则保存到根目录'}
                 >
-                  <Input placeholder="/backups" />
+                  <Input placeholder={backupProvider === 's3' ? 'backups' : '/backups'} />
                 </FormItem>
 
                 <div style={{ marginBottom: 16 }}>

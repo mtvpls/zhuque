@@ -275,7 +275,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/configs/auto-backup/test",
-            post(config::test_webdav_connection),
+            post(config::test_backup_connection),
         )
         .route(
             "/api/configs/auto-backup/backup-now",

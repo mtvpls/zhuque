@@ -320,15 +320,24 @@ sendNotify('标题', '内容');
 | `RUST_LOG` | 日志级别 (trace/debug/info/warn/error) | `info` | 否 |
 | `TZ` | 时区设置 | `Asia/Shanghai` | 否 |
 | `AUTO_RESTORE_ON_STARTUP` | 启动时自动恢复备份 | `false` | 否 |
+| `BACKUP_PROVIDER` | 备份目标类型，`webdav` 或 `s3`（不填时按已配置的环境变量推断） | 自动推断 | 否 |
 | `WEBDAV_URL` | WebDAV 服务器地址 | 无 | 否\*\* |
 | `WEBDAV_USERNAME` | WebDAV 用户名 | 无 | 否\*\* |
 | `WEBDAV_PASSWORD` | WebDAV 密码 | 无 | 否\*\* |
 | `WEBDAV_REMOTE_PATH` | WebDAV 远程路径 | 无 | 否 |
+| `S3_ENDPOINT` | S3 兼容存储 Endpoint（R2: `https://<account_id>.r2.cloudflarestorage.com`，MinIO: `http://host:9000`） | 无 | 否\*\*\* |
+| `S3_REGION` | S3 区域（Cloudflare R2 填 `auto`） | `auto` | 否 |
+| `S3_BUCKET` | S3 存储桶名称 | 无 | 否\*\*\* |
+| `S3_ACCESS_KEY_ID` | S3 Access Key ID | 无 | 否\*\*\* |
+| `S3_SECRET_ACCESS_KEY` | S3 Secret Access Key | 无 | 否\*\*\* |
+| `S3_REMOTE_PATH` | S3 对象前缀 | 无 | 否 |
 
 > **注意：**
 >
 > - `WEBHOOK_TOKEN` 如果需要使用 Webhook 功能则必须配置
-> - `WEBDAV_*` 如果启用 `AUTO_RESTORE_ON_STARTUP` 则必须配置 WebDAV 相关信息
+> - `WEBDAV_*` 如果启用 `AUTO_RESTORE_ON_STARTUP` 且 `BACKUP_PROVIDER=webdav`（或未指定 `BACKUP_PROVIDER` 且有 `WEBDAV_URL`）则必须配置 WebDAV 相关信息
+> - `S3_*` 如果启用 `AUTO_RESTORE_ON_STARTUP` 且 `BACKUP_PROVIDER=s3`（或未指定 `BACKUP_PROVIDER` 且无 `WEBDAV_URL` 但有 `S3_ENDPOINT`）则至少需要配置 `S3_ENDPOINT`、`S3_BUCKET`、`S3_ACCESS_KEY_ID`、`S3_SECRET_ACCESS_KEY`
+> - 以上备份相关环境变量仅用于**启动时自动恢复**；定时自动备份与"立即备份"请在 Web 界面「设置 → 自动备份」中配置（WebDAV 与 S3 二选一）
 > - `AUTH_USERNAME` ~~和~~ `AUTH_PASSWORD` ~~已废弃~~，首次启动时通过 Web 界面设置管理员账号
 
 **Docker 运行示例：**

@@ -69,6 +69,9 @@ sysinfo = "0.30"
 # WebDAV 客户端
 reqwest = { version = "0.12", features = ["rustls-tls", "stream", "json"] }
 
+# S3 兼容对象存储（Cloudflare R2 / MinIO / Wasabi 等）
+rust-s3 = { version = "0.37", default-features = false, features = ["tokio-rustls-tls", "fail-on-err"] }
+
 # 邮件发送
 lettre = { version = "0.11", features = ["tokio1-rustls-tls", "builder", "smtp-transport"], default-features = false }
 
