@@ -340,7 +340,10 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
   const [pendingToolArguments, setPendingToolArguments] = useState<Record<string, unknown> | null>(null);
   const [showFullDiff, setShowFullDiff] = useState(false);
   const [showSessions, setShowSessions] = useState(false);
-  const pendingApprovalRef = useRef<{ callId: string; decision: 'approve' | 'reject'; remember: boolean } | null>(null);
+  const pendingApprovalRef = useRef<{ callId: string; decision: 'approve' | 'reject'; remember: boolean; permission: 'command' | 'change' | null } | null>(null);
+  const sessionGrantsRef = useRef<Record<string, { commands: boolean; changes: boolean }>>(
+    JSON.parse(localStorage.getItem('script-ai-session-grants') || '{}'),
+  );
   const contextEnabled = Boolean(attachedFile);
   const [workspaceWidth, setWorkspaceWidth] = useState(360);
   const [isMobileViewport, setIsMobileViewport] = useState(() => window.matchMedia('(max-width: 1024px), (hover: none) and (pointer: coarse)').matches);
@@ -407,7 +410,11 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
       const options = (config.providers || []).flatMap((provider) => (provider.models || []).map((model) => ({ provider: provider.name, model })));
       setModelOptions(options);
       const remembered = localStorage.getItem('script-ai-last-model') || '';
-      setSelectedModel((current) => current || remembered || options[0]?.model || '');
+      setSelectedModel((current) => {
+        const candidate = current || remembered;
+        const valid = options.some((option) => option.model === candidate);
+        return valid ? candidate : (options[0]?.model || '');
+      });
     }).catch(() => undefined);
     setLoadingSession(true);
     void (async () => {
@@ -472,9 +479,12 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
     }
     const session = sessions.find((item) => item.id === sessionId);
     setProviderContextTokens(session?.current_context_tokens ?? null);
-    if (session?.model) setSelectedModel(session.model);
+    const sessionModel = session?.model || '';
+    const sessionModelAvailable = sessionModel !== ''
+      && (modelOptions.length === 0 || modelOptions.some((option) => option.model === sessionModel));
+    if (sessionModelAvailable) setSelectedModel(sessionModel);
     else if (selectedModel) localStorage.setItem('script-ai-last-model', selectedModel);
-  }, [sessionId, sessions]);
+  }, [sessionId, sessions, modelOptions]);
 
   useEffect(() => {
     if (!sessionId || !visible) return;
@@ -605,6 +615,37 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
     ]);
   };
 
+  const clearPendingApproval = () => {
+    pendingApprovalRef.current = null;
+    setPendingPermission(null);
+    setPendingToolCallId(null);
+    setPendingToolName('');
+    setPendingToolArguments(null);
+  };
+
+  const sessionGrants = (id: string | null) => (
+    (id ? sessionGrantsRef.current[id] : null) || { commands: false, changes: false }
+  );
+
+  const rememberSessionGrant = (permission: 'command' | 'change' | null) => {
+    const id = sessionIdRef.current;
+    if (!permission || !id) return;
+    const current = sessionGrants(id);
+    const next = permission === 'command'
+      ? { ...current, commands: true }
+      : { ...current, changes: true };
+    sessionGrantsRef.current = { ...sessionGrantsRef.current, [id]: next };
+    localStorage.setItem('script-ai-session-grants', JSON.stringify(sessionGrantsRef.current));
+  };
+
+  const clearSessionGrant = (id: string | null) => {
+    if (!id || !sessionGrantsRef.current[id]) return;
+    const next = { ...sessionGrantsRef.current };
+    delete next[id];
+    sessionGrantsRef.current = next;
+    localStorage.setItem('script-ai-session-grants', JSON.stringify(next));
+  };
+
 
   const connectJob = (jobId?: string, startRequest?: Record<string, unknown>) => {
     const existingSocket = socketRef.current;
@@ -630,6 +671,9 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
           tool_call_id: queuedApproval.callId,
           ...(queuedApproval.decision === 'approve' ? { remember: queuedApproval.remember } : {}),
         }));
+        if (queuedApproval.decision === 'approve' && queuedApproval.remember) {
+          rememberSessionGrant(queuedApproval.permission);
+        }
         pendingApprovalRef.current = null;
         setPendingPermission(null);
         setPendingToolCallId(null);
@@ -805,6 +849,8 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
           }
         } else if (type === 'cancelled') {
           addEvent('任务已取消', String(payload.message || '当前任务已停止'), 'warning');
+          clearPendingApproval();
+          setRunning(false);
         } else if (type === 'conversation_sync') {
           const messages = Array.isArray(payload.messages)
             ? payload.messages.filter((item): item is ConversationMessage => Boolean(item && (item.role === 'user' || item.role === 'assistant' || item.role === 'tool') && typeof item.content === 'string'))
@@ -816,6 +862,7 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
         } else if (type === 'error') {
           const errorMessage = String(payload.message || '无法连接 AI Agent');
           addEvent('Agent 请求失败', errorMessage, 'error');
+          clearPendingApproval();
           if (errorMessage.includes('后台任务不存在') && sessionIdRef.current) {
             delete sessionJobsRef.current[sessionIdRef.current];
             localStorage.setItem('script-ai-active-jobs', JSON.stringify(sessionJobsRef.current));
@@ -844,6 +891,7 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
             localStorage.setItem('script-ai-active-jobs', JSON.stringify(sessionJobsRef.current));
           }
           if (sessionIdRef.current === sessionIdRef.current) jobIdRef.current = null;
+          clearPendingApproval();
           keepSubscribedRef.current = true;
           setRunning(false);
         }
@@ -899,6 +947,7 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
     activeRequestRef.current = request;
     assistantTextRef.current = '';
     setFeedItems((previous) => [...previous, { kind: 'message', message: { role: 'user', content: request } }]);
+    const granted = sessionGrants(sessionId);
     connectJob(jobIdRef.current || undefined, {
       mode: 'agent',
       prompt: request,
@@ -906,8 +955,8 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
       file_path: contextEnabled ? attachedFile?.path : undefined,
       directory_path: aiDirectoryPath,
       history: conversation,
-      allow_commands: permissionMode === 'all',
-      allow_changes: permissionMode === 'changes' || permissionMode === 'all',
+      allow_commands: permissionMode === 'all' || granted.commands,
+      allow_changes: permissionMode === 'changes' || permissionMode === 'all' || granted.changes,
       session_id: sessionId,
       model: selectedModel,
     });
@@ -916,13 +965,14 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
 
   const respondToToolApproval = (decision: 'approve' | 'reject', remember = false) => {
     if (!pendingToolCallId) return;
-    const approval = { callId: pendingToolCallId, decision, remember };
+    const approval = { callId: pendingToolCallId, decision, remember, permission: pendingPermission };
     pendingApprovalRef.current = approval;
     const socket = socketRef.current;
     if (!socket || socket.readyState !== WebSocket.OPEN) {
       Message.info('审批决定已暂存，连接恢复后会自动提交');
       return;
     }
+    if (decision === 'approve' && remember) rememberSessionGrant(pendingPermission);
     socket.send(JSON.stringify({
       type: decision === 'approve' ? 'approve_tool' : 'reject_tool',
       tool_call_id: pendingToolCallId,
@@ -1505,9 +1555,9 @@ const ScriptAIWorkspace: React.FC<ScriptAIWorkspaceProps> = ({
               triggerProps={{ style: { zIndex: 2147483647 } }}
               droplist={(
                 <Menu selectedKeys={[permissionMode]}>
-                  <Menu.Item key="default" onClick={() => setPermissionMode('default')}><Space><IconLock />默认</Space></Menu.Item>
-                  <Menu.Item key="changes" onClick={() => setPermissionMode('changes')}><Space><IconEdit />允许编辑文件</Space></Menu.Item>
-                  <Menu.Item key="all" onClick={() => setPermissionMode('all')}><Space><IconUnlock />全部权限</Space></Menu.Item>
+                  <Menu.Item key="default" onClick={() => { clearSessionGrant(sessionId); setPermissionMode('default'); }}><Space><IconLock />默认</Space></Menu.Item>
+                  <Menu.Item key="changes" onClick={() => { clearSessionGrant(sessionId); setPermissionMode('changes'); }}><Space><IconEdit />允许编辑文件</Space></Menu.Item>
+                  <Menu.Item key="all" onClick={() => { clearSessionGrant(sessionId); setPermissionMode('all'); }}><Space><IconUnlock />全部权限</Space></Menu.Item>
                 </Menu>
               )}
             >

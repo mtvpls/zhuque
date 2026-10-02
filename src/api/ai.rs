@@ -146,9 +146,13 @@ impl AiProtocol {
 
 fn config_for_model(config: &AiConfig, requested_model: Option<&str>) -> AiConfig {
     let mut selected = config.clone();
-    let requested = requested_model.map(str::trim).filter(|value| !value.is_empty());
+    let offered_by_provider = |model: &str| config.providers.iter().any(|provider| provider.models.iter().any(|candidate| candidate == model));
+    // 只接受当前配置确实存在的模型，避免替换 Provider 后仍沿用旧模型名。
+    let requested = requested_model
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && offered_by_provider(value));
     let provider = requested.and_then(|model| config.providers.iter().find(|provider| provider.models.iter().any(|candidate| candidate == model)))
-        .or_else(|| config.providers.iter().find(|provider| provider.models.iter().any(|candidate| candidate == &config.model)))
+        .or_else(|| config.providers.iter().find(|provider| provider.models.iter().any(|candidate| candidate.as_str() == config.model.trim())))
         .or_else(|| config.providers.first());
     if let Some(provider) = provider {
         selected.provider = provider.name.clone();
@@ -156,8 +160,9 @@ fn config_for_model(config: &AiConfig, requested_model: Option<&str>) -> AiConfi
         selected.base_url = provider.base_url.clone();
         if !provider.api_key.trim().is_empty() { selected.api_key = provider.api_key.clone(); }
         selected.model = requested.map(str::to_string)
-            .or_else(|| (!config.model.trim().is_empty()).then(|| config.model.clone()))
+            .or_else(|| provider.models.iter().find(|candidate| candidate.as_str() == config.model.trim()).cloned())
             .or_else(|| provider.models.first().cloned())
+            .or_else(|| (!config.model.trim().is_empty()).then(|| config.model.clone()))
             .unwrap_or_default();
     }
     selected
@@ -1986,7 +1991,41 @@ async fn publish_job(job: &Arc<AiJob>, payload: Value) {
     let _ = sequence;
 }
 
+/// 把任务以错误结束：持久化错误内容并广播 error/done，同时清空会话的 active_job_id。
+async fn fail_agent_job(
+    state: &AppState,
+    session_id: Option<&str>,
+    user_key: &str,
+    job: &Arc<AiJob>,
+    message: &str,
+) {
+    let _ = store_session_message(state, session_id, user_key, "assistant", &format!("⚠️ {message}")).await;
+    publish_job(job, json!({"type":"error","message":message})).await;
+    set_session_job(state, session_id, user_key, None).await;
+    publish_job(job, json!({"type":"done"})).await;
+}
+
+/// 把任务以取消结束：持久化取消提示并广播 cancelled/done，同时清空会话的 active_job_id。
+async fn cancel_agent_job(
+    state: &AppState,
+    session_id: Option<&str>,
+    user_key: &str,
+    job: &Arc<AiJob>,
+    message: &str,
+) {
+    let _ = store_session_message(state, session_id, user_key, "assistant", &format!("⚠️ {message}")).await;
+    publish_job(job, json!({"type":"cancelled","message":message})).await;
+    set_session_job(state, session_id, user_key, None).await;
+    publish_job(job, json!({"type":"done"})).await;
+}
+
 async fn run_agent_job(state: Arc<AppState>, request: AiChatRequest, job: Arc<AiJob>) {
+    run_agent_job_inner(state, request, job.clone()).await;
+    // 任务结束后立即移除，避免后续 WS 连接重放已完成任务的历史事件（幽灵审批卡片等）。
+    AI_JOBS.write().await.remove(&job.job_id);
+}
+
+async fn run_agent_job_inner(state: Arc<AppState>, request: AiChatRequest, job: Arc<AiJob>) {
     if !request.retry {
         if let Some(title) = store_session_message(
             &state,
@@ -2009,23 +2048,17 @@ async fn run_agent_job(state: Arc<AppState>, request: AiChatRequest, job: Arc<Ai
             config
         }
         Ok(_) => {
-            publish_job(&job, json!({"type":"error","message":"AI 尚未配置，请先在系统配置中填写 Provider、API Key 和模型"})).await;
-            set_session_job(&state, request.session_id.as_deref(), &job.user_key, None).await;
-            publish_job(&job, json!({"type":"done"})).await;
+            fail_agent_job(&state, request.session_id.as_deref(), &job.user_key, &job, "AI 尚未配置，请先在系统配置中填写 Provider、API Key 和模型").await;
             return;
         }
         Err(error) => {
-            publish_job(&job, json!({"type":"error","message":error.to_string()})).await;
-            set_session_job(&state, request.session_id.as_deref(), &job.user_key, None).await;
-            publish_job(&job, json!({"type":"done"})).await;
+            fail_agent_job(&state, request.session_id.as_deref(), &job.user_key, &job, &error.to_string()).await;
             return;
         }
     };
     let config = config_for_model(&config, request.model.as_deref());
     if config.model.trim().is_empty() || config.api_key.trim().is_empty() {
-        publish_job(&job, json!({"type":"error","message":"请选择已配置的 AI 模型"})).await;
-        set_session_job(&state, request.session_id.as_deref(), &job.user_key, None).await;
-        publish_job(&job, json!({"type":"done"})).await;
+        fail_agent_job(&state, request.session_id.as_deref(), &job.user_key, &job, "请选择已配置的 AI 模型").await;
         return;
     }
     set_session_model(&state, request.session_id.as_deref(), &job.user_key, &config.model).await;
@@ -2034,9 +2067,7 @@ async fn run_agent_job(state: Arc<AppState>, request: AiChatRequest, job: Arc<Ai
     let client = match Client::builder().build() {
         Ok(client) => client,
         Err(error) => {
-            publish_job(&job, json!({"type":"error","message":error.to_string()})).await;
-            set_session_job(&state, request.session_id.as_deref(), &job.user_key, None).await;
-            publish_job(&job, json!({"type":"done"})).await;
+            fail_agent_job(&state, request.session_id.as_deref(), &job.user_key, &job, &error.to_string()).await;
             return;
         }
     };
@@ -2153,16 +2184,12 @@ async fn run_agent_job(state: Arc<AppState>, request: AiChatRequest, job: Arc<Ai
             }
         }
         if job.cancel.is_cancelled() {
-            publish_job(&job, json!({"type":"cancelled","message":"任务已取消"})).await;
-            set_session_job(&state, request.session_id.as_deref(), &job.user_key, None).await;
-            publish_job(&job, json!({"type":"done"})).await;
+            cancel_agent_job(&state, request.session_id.as_deref(), &job.user_key, &job, "任务已取消").await;
             return;
         }
         let provider_response = tokio::select! {
             _ = job.cancel.cancelled() => {
-                publish_job(&job, json!({"type":"cancelled","message":"任务已取消"})).await;
-                set_session_job(&state, request.session_id.as_deref(), &job.user_key, None).await;
-                publish_job(&job, json!({"type":"done"})).await;
+                cancel_agent_job(&state, request.session_id.as_deref(), &job.user_key, &job, "任务已取消").await;
                 return;
             }
             result = call_agent_provider(
@@ -2180,9 +2207,7 @@ async fn run_agent_job(state: Arc<AppState>, request: AiChatRequest, job: Arc<Ai
         let response = match provider_response {
             Ok(value) => value,
             Err(error) => {
-                publish_job(&job, json!({"type":"error","message":error})).await;
-                set_session_job(&state, request.session_id.as_deref(), &job.user_key, None).await;
-                publish_job(&job, json!({"type":"done"})).await;
+                fail_agent_job(&state, request.session_id.as_deref(), &job.user_key, &job, &error).await;
                 return;
             }
         };
@@ -2420,12 +2445,14 @@ async fn handle_agent_ws(
     let mut current_job: Option<Arc<AiJob>> = None;
     if let Some(job_id) = requested_job_id {
         current_job = AI_JOBS.read().await.get(&job_id).filter(|job| job.user_key == user_key).cloned();
+        if current_job.is_none() {
+            // 任务已结束或不存在：通知前端停止等待，避免界面一直停留在“运行中”。
+            let payload = json!({"type":"error","message":"后台任务不存在"}).to_string();
+            if sender.send(Message::Text(payload.into())).await.is_err() { return; }
+        }
     }
-    let replay_jobs: Vec<Arc<AiJob>> = AI_JOBS.read().await.values()
-        .filter(|job| job.user_key == user_key)
-        .cloned()
-        .collect();
-    for job in replay_jobs {
+    // 只重放当前订阅任务的实时事件，绝不回放其它（含已完成）任务的历史事件。
+    if let Some(job) = current_job.as_ref() {
         for message in job.events.read().await.clone() {
             if sender.send(Message::Text(message.into())).await.is_err() { return; }
         }
@@ -2444,13 +2471,21 @@ async fn handle_agent_ws(
                             current_job = Some(create_agent_job(&state, &request, &user_key).await);
                         }
                         Ok(AgentWsMessage::Subscribe { job_id }) => {
-                            current_job = match job_id {
-                                Some(job_id) => AI_JOBS.read().await.get(&job_id).filter(|job| job.user_key == user_key).cloned(),
+                            current_job = match &job_id {
+                                Some(job_id) => AI_JOBS.read().await.get(job_id).filter(|job| job.user_key == user_key).cloned(),
                                 None => None,
                             };
-                            if let Some(job) = current_job.as_ref() {
-                                for message in job.events.read().await.clone() {
-                                    if sender.send(Message::Text(message.into())).await.is_err() { return; }
+                            match current_job.as_ref() {
+                                Some(job) => {
+                                    for message in job.events.read().await.clone() {
+                                        if sender.send(Message::Text(message.into())).await.is_err() { return; }
+                                    }
+                                }
+                                None => {
+                                    if job_id.is_some() {
+                                        let payload = json!({"type":"error","message":"后台任务不存在"}).to_string();
+                                        if sender.send(Message::Text(payload.into())).await.is_err() { return; }
+                                    }
                                 }
                             }
                         }
@@ -2483,7 +2518,16 @@ async fn handle_agent_ws(
                         if sender.send(Message::Text(message.into())).await.is_err() { return; }
                     }
                     Ok(_) => {}
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // 广播滞后会丢事件（可能包括 approval_required 审批卡片），
+                        // 重放当前任务事件让前端补齐；前端按 seq 去重，重复事件会被忽略。
+                        if let Some(job) = current_job.as_ref() {
+                            for message in job.events.read().await.clone() {
+                                if sender.send(Message::Text(message.into())).await.is_err() { return; }
+                            }
+                        }
+                        continue;
+                    }
                     Err(broadcast::error::RecvError::Closed) => return,
                 }
             }
