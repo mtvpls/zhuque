@@ -63,7 +63,14 @@ async fn fix_permissions(dir: &Path) -> io::Result<()> {
             Box::pin(fix_permissions(&path)).await?;
         } else if !metadata.file_type().is_symlink() {
             let mut perms = metadata.permissions();
-            perms.set_mode(0o644);
+            let is_notify_launcher = path.file_name() == Some(OsStr::new("notify"))
+                && path.parent().and_then(Path::file_name) == Some(OsStr::new("helpers"));
+            let mode = if is_notify_launcher || perms.mode() & 0o111 != 0 {
+                0o755
+            } else {
+                0o644
+            };
+            perms.set_mode(mode);
             fs::set_permissions(&path, perms).await?;
         }
     }
@@ -827,6 +834,31 @@ pub async fn restore_backup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fix_permissions_keeps_scripts_executable_and_repairs_notify_launcher() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("zhuque-permissions-test-{}", uuid::Uuid::new_v4()));
+        let helpers = root.join("helpers");
+        fs::create_dir_all(&helpers).await.unwrap();
+        let notify = helpers.join("notify");
+        let script = root.join("task.sh");
+        let ordinary = root.join("notes.txt");
+        fs::write(&notify, b"#!/bin/sh\\n").await.unwrap();
+        fs::write(&script, b"#!/bin/sh\\n").await.unwrap();
+        fs::write(&ordinary, b"notes").await.unwrap();
+        fs::set_permissions(&notify, std::fs::Permissions::from_mode(0o666)).await.unwrap();
+        fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).await.unwrap();
+
+        fix_permissions(&root).await.unwrap();
+
+        assert_eq!(std::fs::metadata(&notify).unwrap().permissions().mode() & 0o777, 0o755);
+        assert_eq!(std::fs::metadata(&script).unwrap().permissions().mode() & 0o777, 0o755);
+        assert_eq!(std::fs::metadata(&ordinary).unwrap().permissions().mode() & 0o777, 0o644);
+        fs::remove_dir_all(root).await.unwrap();
+    }
 
     #[tokio::test]
     async fn restore_replaces_contents_without_replacing_data_directory() {

@@ -8,10 +8,10 @@ use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{broadcast, RwLock};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 #[cfg(unix)]
 use libc;
@@ -116,7 +116,7 @@ impl Executor {
 
         let helpers_dir_clone = helpers_dir.clone();
         tokio::spawn(async move {
-            if let Err(e) = Self::init_notify_helpers(&helpers_dir_clone).await {
+            if let Err(e) = Self::ensure_notify_helpers(&helpers_dir_clone).await {
                 error!("Failed to init notify helpers: {}", e);
             }
         });
@@ -445,6 +445,126 @@ impl Executor {
         }
     }
 
+    async fn set_notify_helper_directory_permissions(dir: &std::path::Path) -> Result<()> {
+        tokio::fs::create_dir_all(dir).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = tokio::fs::metadata(dir).await?.permissions();
+            permissions.set_mode(0o755);
+            if let Err(e) = tokio::fs::set_permissions(dir, permissions).await {
+                warn!(
+                "Unable to normalize notify helper directory permissions: {}",
+                e
+            );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    async fn repair_notify_helper_file_permissions(dir: &std::path::Path) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        for (name, mode) in [
+            ("notify", 0o755),
+            ("notify.cmd", 0o644),
+            ("notify.py", 0o644),
+            ("sendNotify.js", 0o644),
+            ("sendNotify.ts", 0o644),
+        ] {
+            let path = dir.join(name);
+            let metadata = tokio::fs::symlink_metadata(&path).await?;
+            if !metadata.file_type().is_file() {
+                return Err(anyhow!("Notify helper is not a regular file: {}", path.display()));
+            }
+            let mut permissions = metadata.permissions();
+            if permissions.mode() & 0o777 != mode {
+                permissions.set_mode(mode);
+                tokio::fs::set_permissions(&path, permissions).await?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    async fn repair_notify_helper_file_permissions(_dir: &std::path::Path) -> Result<()> {
+        Ok(())
+    }
+
+    pub(crate) async fn ensure_notify_helpers(dir: &std::path::Path) -> Result<()> {
+        static INIT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _guard = INIT_LOCK.lock().await;
+
+        Self::set_notify_helper_directory_permissions(dir).await?;
+        let names = [
+            "notify",
+            "notify.cmd",
+            "notify.py",
+            "sendNotify.js",
+            "sendNotify.ts",
+        ];
+        if names.iter().any(|name| !dir.join(name).is_file()) {
+            Self::init_notify_helpers(dir).await?;
+        }
+        if let Err(e) = Self::repair_notify_helper_file_permissions(dir).await {
+            warn!(
+                "Unable to repair notify helper file permissions in place; regenerating helpers: {}",
+                e
+            );
+            Self::init_notify_helpers(dir).await?;
+            Self::repair_notify_helper_file_permissions(dir).await?;
+        }
+        Ok(())
+    }
+
+    async fn write_notify_helper(
+        dir: &std::path::Path,
+        name: &str,
+        contents: &str,
+        mode: u32,
+    ) -> Result<()> {
+        let path = dir.join(name);
+        let temporary_path = dir.join(format!(".{}.{}.tmp", name, Uuid::new_v4()));
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+            .await?;
+        if let Err(e) = file.write_all(contents.as_bytes()).await {
+            drop(file);
+            let _ = tokio::fs::remove_file(&temporary_path).await;
+            return Err(e.into());
+        }
+        drop(file);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = tokio::fs::metadata(&temporary_path).await?.permissions();
+            permissions.set_mode(mode);
+            if let Err(e) = tokio::fs::set_permissions(&temporary_path, permissions).await {
+                let _ = tokio::fs::remove_file(&temporary_path).await;
+                return Err(e.into());
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+
+        #[cfg(windows)]
+        match tokio::fs::symlink_metadata(&path).await {
+            Ok(_) => tokio::fs::remove_file(&path).await?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+
+        if let Err(e) = tokio::fs::rename(&temporary_path, &path).await {
+            let _ = tokio::fs::remove_file(&temporary_path).await;
+            return Err(e.into());
+        }
+        Ok(())
+    }
+
     /// 初始化脚本通知 helper 文件（启动时调用一次，或在 helper 丢失时懒重建）
     async fn init_notify_helpers(dir: &std::path::Path) -> Result<()> {
         tokio::fs::create_dir_all(dir).await?;
@@ -475,64 +595,66 @@ try:
     _req.urlopen(req, timeout=10)
 except Exception as e:
     print("[notify] send failed:", e, file=sys.stderr)
+    sys.exit(1)
 "#;
-        let bin_path = dir.join("notify");
-        tokio::fs::write(&bin_path, notify_bin).await?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = tokio::fs::metadata(&bin_path).await?.permissions();
-            perms.set_mode(0o755);
-            tokio::fs::set_permissions(&bin_path, perms).await?;
-        }
-
-        tokio::fs::write(
-            dir.join("notify.py"),
+        Self::write_notify_helper(dir, "notify", notify_bin, 0o755).await?;
+        Self::write_notify_helper(
+            dir,
+            "notify.py",
             r#"import subprocess as _sp
 import os as _os
 
 def send(title: str, content: str) -> None:
-    _sp.run(['notify.cmd' if _os.name == 'nt' else 'notify', title, content])
+    result = _sp.run(['notify.cmd' if _os.name == 'nt' else 'notify', title, content])
+    if result.returncode != 0:
+        raise RuntimeError(f'Notification helper exited with status {result.returncode}')
 
 sendNotify = send
 "#,
+            0o644,
         )
         .await?;
-
-        tokio::fs::write(
-            dir.join("sendNotify.js"),
+        Self::write_notify_helper(
+            dir,
+            "sendNotify.js",
             r#"'use strict';
 const { spawnSync } = require('child_process');
 
 function sendNotify(title, content) {
     const command = process.platform === 'win32' ? 'notify.cmd' : 'notify';
-    spawnSync(command, [String(title), String(content)], { stdio: 'inherit' });
+    const result = spawnSync(command, [String(title), String(content)], { stdio: 'inherit' });
+    if (result.error) throw result.error;
+    if (result.status !== 0) throw new Error(`Notification helper exited with status ${result.status}`);
 }
 
 module.exports = { sendNotify };
 module.exports.default = sendNotify;
 "#,
+            0o644,
         )
         .await?;
-
-        tokio::fs::write(
-            dir.join("sendNotify.ts"),
+        Self::write_notify_helper(
+            dir,
+            "sendNotify.ts",
             r#"import { spawnSync } from 'child_process';
 
 export function sendNotify(title: string, content: string): void {
     const command = process.platform === 'win32' ? 'notify.cmd' : 'notify';
-    spawnSync(command, [String(title), String(content)], { stdio: 'inherit' });
+    const result = spawnSync(command, [String(title), String(content)], { stdio: 'inherit' });
+    if (result.error) throw result.error;
+    if (result.status !== 0) throw new Error(`Notification helper exited with status ${result.status}`);
 }
 
 export default sendNotify;
 "#,
+            0o644,
         )
         .await?;
-
-        tokio::fs::write(
-            dir.join("notify.cmd"),
+        Self::write_notify_helper(
+            dir,
+            "notify.cmd",
             "@echo off\r\npython \"%~dp0notify\" %*\r\n",
+            0o644,
         )
         .await?;
 
@@ -546,12 +668,8 @@ export default sendNotify;
         helpers_dir: &std::path::Path,
         mode: &str,
     ) {
-        // 懒重建：如果 helper 文件丢失（如数据目录被清理），在此重建
-        let bin_path = helpers_dir.join("notify");
-        if !bin_path.exists() {
-            if let Err(e) = Self::init_notify_helpers(helpers_dir).await {
-                error!("Failed to re-init notify helpers: {}", e);
-            }
+        if let Err(e) = Self::ensure_notify_helpers(helpers_dir).await {
+            error!("Failed to repair notify helper files or permissions: {}", e);
         }
 
         for key in ["PATH", "PYTHONPATH", "NODE_PATH"] {
@@ -1249,5 +1367,69 @@ export default sendNotify;
         output.push('\n');
 
         Ok((output, success))
+    }
+}
+
+#[cfg(all(test, unix))]
+mod notify_helper_tests {
+    use super::Executor;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn ensure_notify_helpers_repairs_permissions_without_replacing_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "zhuque-notify-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let names = ["notify", "notify.cmd", "notify.py", "sendNotify.js", "sendNotify.ts"];
+        for name in names {
+            let path = dir.join(name);
+            tokio::fs::write(&path, b"existing helper").await.unwrap();
+            tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
+                .await
+                .unwrap();
+        }
+
+        Executor::ensure_notify_helpers(&dir).await.unwrap();
+
+        for (name, expected_mode) in [
+            ("notify", 0o755),
+            ("notify.cmd", 0o644),
+            ("notify.py", 0o644),
+            ("sendNotify.js", 0o644),
+            ("sendNotify.ts", 0o644),
+        ] {
+            let path = dir.join(name);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                expected_mode
+            );
+            assert_eq!(tokio::fs::read(&path).await.unwrap(), b"existing helper");
+        }
+
+        tokio::fs::remove_dir_all(dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ensure_notify_helpers_creates_runnable_launcher() {
+        let dir = std::env::temp_dir().join(format!(
+            "zhuque-notify-launcher-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        Executor::ensure_notify_helpers(&dir).await.unwrap();
+
+        let output = tokio::process::Command::new(dir.join("notify"))
+            .env("ZHUQUE_NOTIFY_MODE", "simulate")
+            .arg("title")
+            .arg("content")
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("模拟发送通知"));
+
+        tokio::fs::remove_dir_all(dir).await.unwrap();
     }
 }

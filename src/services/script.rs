@@ -1,6 +1,6 @@
 use crate::models::ScriptFile;
 use crate::models::config::NotificationConfig;
-use crate::services::{ConfigService, EnvService};
+use crate::services::{ConfigService, EnvService, Executor};
 use crate::utils::python_detector::PYTHON_CMD;
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
@@ -488,7 +488,10 @@ impl ScriptService {
         self.validate_path(path)?;
         let full_path = self.base_path.join(path);
 
-        // 检查文件是否存在
+        if let Err(e) = Executor::ensure_notify_helpers(&self.helpers_dir).await {
+            tracing::warn!("Failed to repair notify helper files or permissions: {}", e);
+        }
+
         if !tokio::fs::metadata(&full_path).await?.is_file() {
             return Err(anyhow!("File not found"));
         }
