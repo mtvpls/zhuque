@@ -10,7 +10,7 @@ use axum::{
     Json,
 };
 use futures::stream::{Stream, StreamExt};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::sync::Arc;
 
@@ -52,6 +52,41 @@ pub struct RenameRequest {
 #[derive(Deserialize)]
 pub struct CopyRequest {
     pub target_path: String,
+}
+
+#[derive(Deserialize)]
+pub struct BatchDeleteRequest {
+    pub items: Vec<BatchDeleteItem>,
+}
+
+#[derive(Deserialize)]
+pub struct BatchDeleteItem {
+    pub path: String,
+    pub is_directory: bool,
+}
+
+#[derive(Deserialize)]
+pub struct BatchTransferRequest {
+    pub items: Vec<BatchTransferItem>,
+}
+
+#[derive(Deserialize)]
+pub struct BatchTransferItem {
+    pub source_path: String,
+    pub target_path: String,
+}
+
+#[derive(Serialize)]
+pub struct BatchOperationResponse {
+    pub results: Vec<BatchOperationResult>,
+}
+
+#[derive(Serialize)]
+pub struct BatchOperationResult {
+    pub path: String,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -118,6 +153,58 @@ pub async fn delete_script(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn batch_delete_scripts(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<BatchDeleteRequest>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let mut results = Vec::with_capacity(request.items.len());
+    for item in request.items {
+        let result = if item.is_directory {
+            state.script_service.delete_directory(&item.path).await
+        } else {
+            state.script_service.delete(&item.path).await
+        };
+        results.push(BatchOperationResult {
+            path: item.path,
+            success: result.is_ok(),
+            error: result.err().map(|error| error.to_string()),
+        });
+    }
+    Ok(Json(BatchOperationResponse { results }))
+}
+
+pub async fn batch_copy_scripts(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<BatchTransferRequest>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let mut results = Vec::with_capacity(request.items.len());
+    for item in request.items {
+        let result = state.script_service.copy(&item.source_path, &item.target_path).await;
+        results.push(BatchOperationResult {
+            path: item.source_path,
+            success: result.is_ok(),
+            error: result.err().map(|error| error.to_string()),
+        });
+    }
+    Ok(Json(BatchOperationResponse { results }))
+}
+
+pub async fn batch_move_scripts(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<BatchTransferRequest>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let mut results = Vec::with_capacity(request.items.len());
+    for item in request.items {
+        let result = state.script_service.rename(&item.source_path, &item.target_path).await;
+        results.push(BatchOperationResult {
+            path: item.source_path,
+            success: result.is_ok(),
+            error: result.err().map(|error| error.to_string()),
+        });
+    }
+    Ok(Json(BatchOperationResponse { results }))
 }
 
 pub async fn upload_script(

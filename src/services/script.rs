@@ -355,6 +355,13 @@ impl ScriptService {
         let old_full_path = self.base_path.join(old_path);
         let new_full_path = self.base_path.join(new_path);
 
+        if old_full_path == new_full_path {
+            return Ok(());
+        }
+        if tokio::fs::try_exists(&new_full_path).await? {
+            return Err(anyhow!("Target path already exists"));
+        }
+
         // 确保新路径的父目录存在
         if let Some(parent) = new_full_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -375,6 +382,10 @@ impl ScriptService {
         if !source_full.exists() {
             return Err(anyhow!("Source path does not exist"));
         }
+        let metadata = tokio::fs::metadata(&source_full).await?;
+        if metadata.is_dir() && target_full.starts_with(&source_full) {
+            return Err(anyhow!("Cannot copy a directory into itself"));
+        }
 
         // 检查目标路径是否已存在
         if target_full.exists() {
@@ -385,8 +396,6 @@ impl ScriptService {
         if let Some(parent) = target_full.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-
-        let metadata = tokio::fs::metadata(&source_full).await?;
 
         if metadata.is_dir() {
             // 目录复制：使用 spawn_blocking 避免阻塞

@@ -13,6 +13,7 @@ import {
   Menu,
   Spin,
   Tree,
+  Checkbox,
 } from '@arco-design/web-react';
 import {
   IconPlus,
@@ -33,6 +34,7 @@ import {
   IconDragArrow,
   IconRobot,
   IconBug,
+  IconSelectAll,
 } from '@arco-design/web-react/icon';
 import Editor from '@monaco-editor/react';
 import axios from 'axios';
@@ -53,6 +55,9 @@ const isImageFile = (fileName: string): boolean =>
 
 const Scripts: React.FC = () => {
   const [files, setFiles] = useState<ScriptFile[]>([]);
+  const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
+  const [batchMode, setBatchMode] = useState(false);
+  const selectedFiles = files.filter((file) => selectedPaths.includes(file.path));
   const [loading, setLoading] = useState(false);
   const [currentPath, setCurrentPath] = useState('');
   const [selectedFile, setSelectedFile] = useState<ScriptFile | null>(null);
@@ -69,7 +74,7 @@ const Scripts: React.FC = () => {
   const [renamingFile, setRenamingFile] = useState<ScriptFile | null>(null);
   const [copyVisible, setCopyVisible] = useState(false);
   const [moveVisible, setMoveVisible] = useState(false);
-  const [operatingFile, setOperatingFile] = useState<ScriptFile | null>(null);
+  const [operatingFiles, setOperatingFiles] = useState<ScriptFile[]>([]);
   const [treeData, setTreeData] = useState<any[]>([]);
   const [selectedTreeNode, setSelectedTreeNode] = useState<string>('');
   const [targetFileName, setTargetFileName] = useState('');
@@ -90,6 +95,8 @@ const Scripts: React.FC = () => {
   const [renameForm] = Form.useForm();
 
   useEffect(() => {
+    setBatchMode(false);
+    setSelectedPaths([]);
     loadFiles();
   }, [currentPath]);
 
@@ -251,23 +258,62 @@ const Scripts: React.FC = () => {
     }
   };
 
-  const handleDelete = async (file: ScriptFile) => {
+  const handleDelete = async (items: ScriptFile[]) => {
+    const token = localStorage.getItem('token');
     try {
-      const token = localStorage.getItem('token');
-      if (file.isDirectory) {
-        await axios.delete(`/api/scripts/directories/${file.path}`, {
-          headers: { Authorization: `Bearer ${token}` },
-        });
-      } else {
-        await axios.delete(`/api/scripts/${file.path}`, {
-          headers: { Authorization: `Bearer ${token}` },
-        });
+      const response = await axios.post<{ results: { path: string; success: boolean; error?: string }[] }>(
+        '/api/scripts/batch/delete',
+        { items: items.map((file) => ({ path: file.path, is_directory: file.isDirectory === true })) },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      const results = new Map(response.data.results.map((result) => [result.path, result]));
+      const deleted = items.filter((file) => results.get(file.path)?.success);
+      const failed = items.filter((file) => !results.get(file.path)?.success);
+
+      if (deleted.length === 0) {
+        const reason = response.data.results.find((result) => !result.success)?.error;
+        Message.error(items.length === 1
+          ? `删除失败：${items[0].name}${reason ? `（${reason}）` : ''}`
+          : `删除失败：${items.length} 个项目`);
+        return;
       }
-      Message.success('删除成功');
-      loadFiles();
-    } catch (error: any) {
-      Message.error('删除失败');
+
+      const deletedPaths = new Set(deleted.map((file) => file.path));
+      setSelectedPaths((paths) => paths.filter((path) => !deletedPaths.has(path)));
+      if (selectedFile && deleted.some((file) =>
+        selectedFile.path === file.path || (file.isDirectory && selectedFile.path.startsWith(`${file.path}/`))
+      )) {
+        setSelectedFile(null);
+        setFileContent('');
+        setHasUnsavedChanges(false);
+        setIsEditing(false);
+      }
+
+      if (failed.length > 0) {
+        Message.warning(`已删除 ${deleted.length}/${items.length} 个项目，${failed.length} 个失败`);
+      } else if (deleted.length === 1) {
+        Message.success(`已删除：${deleted[0].name}`);
+      } else {
+        Message.success(`已删除 ${deleted.length} 个项目`);
+      }
+      await loadFiles();
+    } catch {
+      Message.error(items.length === 1 ? `删除失败：${items[0].name}` : `删除失败：${items.length} 个项目`);
     }
+  };
+
+  const confirmDelete = (items: ScriptFile[]) => {
+    if (items.length === 0) return;
+    const containsDirectory = items.some((file) => file.isDirectory);
+    const title = items.length === 1
+      ? `确定删除${items[0].isDirectory ? '文件夹' : '文件'}“${items[0].name}”吗？`
+      : `确定删除 ${items.length} 个项目吗？`;
+
+    Modal.confirm({
+      title,
+      content: containsDirectory ? '删除文件夹将同时删除其中的所有内容，此操作不可恢复。' : undefined,
+      onOk: () => handleDelete(items),
+    });
   };
 
   const handleRename = (file: ScriptFile) => {
@@ -382,16 +428,8 @@ const Scripts: React.FC = () => {
     });
   };
 
-  const handleCopy = async (file: ScriptFile) => {
-    setOperatingFile(file);
-    // 默认文件名为 "文件名_copy"
-    const defaultName = file.isDirectory
-      ? `${file.name}_copy`
-      : file.name.replace(/(\.[^.]+)$/, '_copy$1');
-    setTargetFileName(defaultName);
+  const loadDestinationTree = async () => {
     setSelectedTreeNode('');
-
-    // 只加载根目录的直接子目录
     const rootChildren = await loadTreeChildren();
     setTreeData([
       {
@@ -401,96 +439,146 @@ const Scripts: React.FC = () => {
         children: rootChildren,
       },
     ]);
+  };
 
+  const startCopy = async (items: ScriptFile[]) => {
+    if (items.length === 0) return;
+    setOperatingFiles(items);
+    const file = items[0];
+    const defaultName = items.length !== 1
+      ? ''
+      : file.isDirectory
+        ? `${file.name}_copy`
+        : file.name.replace(/(\.[^.]+)$/, '_copy$1');
+    setTargetFileName(defaultName);
+    await loadDestinationTree();
     setCopyVisible(true);
   };
 
+  const handleCopy = (file: ScriptFile) => startCopy([file]);
+  const handleBatchCopy = () => startCopy(selectedFiles);
+
   const handleCopySubmit = async () => {
-    if (!operatingFile) return;
+    if (operatingFiles.length === 0) return;
+    if (operatingFiles.length === 1 && !targetFileName.trim()) {
+      Message.warning('请输入复制后的名称');
+      return;
+    }
+
+    const token = localStorage.getItem('token');
+    const items = operatingFiles.map((file) => {
+      const name = operatingFiles.length === 1 ? targetFileName.trim() : file.name;
+      return {
+        source_path: file.path,
+        target_path: selectedTreeNode ? `${selectedTreeNode}/${name}` : name,
+      };
+    });
 
     try {
-      const token = localStorage.getItem('token');
-      const targetPath = selectedTreeNode
-        ? `${selectedTreeNode}/${targetFileName}`
-        : targetFileName;
-
-      await axios.post(
-        `/api/scripts/copy/${operatingFile.path}`,
-        { target_path: targetPath },
-        {
-          headers: {
-            Authorization: `Bearer ${token}`,
-            'Content-Type': 'application/json',
-          },
-        }
+      const response = await axios.post<{ results: { path: string; success: boolean; error?: string }[] }>(
+        '/api/scripts/batch/copy',
+        { items },
+        { headers: { Authorization: `Bearer ${token}` } }
       );
+      const results = new Map(response.data.results.map((result) => [result.path, result]));
+      const copied = operatingFiles.filter((file) => results.get(file.path)?.success);
+      const failed = operatingFiles.filter((file) => !results.get(file.path)?.success);
 
-      Message.success('复制成功');
+      if (copied.length === 0) {
+        const reason = response.data.results.find((result) => !result.success)?.error;
+        Message.error(reason || '复制失败');
+        return;
+      }
+
+      if (failed.length > 0) {
+        Message.warning(`已复制 ${copied.length}/${operatingFiles.length} 个项目，${failed.length} 个失败`);
+      } else if (copied.length === 1) {
+        Message.success(`已复制：${targetFileName.trim()}`);
+      } else {
+        Message.success(`已复制 ${copied.length} 个项目`);
+      }
+
+      const copiedPaths = new Set(copied.map((file) => file.path));
+      setSelectedPaths((paths) => paths.filter((path) => !copiedPaths.has(path)));
       setCopyVisible(false);
-      setOperatingFile(null);
+      setOperatingFiles([]);
       setTargetFileName('');
       setSelectedTreeNode('');
-      loadFiles();
-    } catch (error: any) {
-      Message.error(error.response?.data?.message || '复制失败');
+      await loadFiles();
+    } catch {
+      Message.error('复制请求失败');
     }
   };
 
-  const handleMove = async (file: ScriptFile) => {
-    setOperatingFile(file);
-    setTargetFileName(file.name);
-    setSelectedTreeNode('');
-
-    // 只加载根目录的直接子目录
-    const rootChildren = await loadTreeChildren();
-    setTreeData([
-      {
-        key: '',
-        title: '根目录',
-        icon: <IconFolder />,
-        children: rootChildren,
-      },
-    ]);
-
+  const startMove = async (items: ScriptFile[]) => {
+    if (items.length === 0) return;
+    setOperatingFiles(items);
+    setTargetFileName(items.length === 1 ? items[0].name : '');
+    await loadDestinationTree();
     setMoveVisible(true);
   };
 
+  const handleMove = (file: ScriptFile) => startMove([file]);
+  const handleBatchMove = () => startMove(selectedFiles);
+
   const handleMoveSubmit = async () => {
-    if (!operatingFile) return;
+    if (operatingFiles.length === 0) return;
+    if (operatingFiles.length === 1 && !targetFileName.trim()) {
+      Message.warning('请输入移动后的名称');
+      return;
+    }
+
+    const token = localStorage.getItem('token');
+    const items = operatingFiles.map((file) => {
+      const name = operatingFiles.length === 1 ? targetFileName.trim() : file.name;
+      return {
+        source_path: file.path,
+        target_path: selectedTreeNode ? `${selectedTreeNode}/${name}` : name,
+      };
+    });
 
     try {
-      const token = localStorage.getItem('token');
-      const targetPath = selectedTreeNode
-        ? `${selectedTreeNode}/${targetFileName}`
-        : targetFileName;
-
-      await axios.post(
-        `/api/scripts/rename/${operatingFile.path}`,
-        { new_path: targetPath },
-        {
-          headers: {
-            Authorization: `Bearer ${token}`,
-            'Content-Type': 'application/json',
-          },
-        }
+      const response = await axios.post<{ results: { path: string; success: boolean; error?: string }[] }>(
+        '/api/scripts/batch/move',
+        { items },
+        { headers: { Authorization: `Bearer ${token}` } }
       );
+      const results = new Map(response.data.results.map((result) => [result.path, result]));
+      const moved = operatingFiles.filter((file) => results.get(file.path)?.success);
+      const failed = operatingFiles.filter((file) => !results.get(file.path)?.success);
 
-      Message.success('移动成功');
-      setMoveVisible(false);
-      setOperatingFile(null);
-      setTargetFileName('');
-      setSelectedTreeNode('');
+      if (moved.length === 0) {
+        const reason = response.data.results.find((result) => !result.success)?.error;
+        Message.error(reason || '移动失败');
+        return;
+      }
 
-      // 如果移动的是当前打开的文件，清除选择
-      if (selectedFile?.path === operatingFile.path) {
+      if (failed.length > 0) {
+        Message.warning(`已移动 ${moved.length}/${operatingFiles.length} 个项目，${failed.length} 个失败`);
+      } else if (moved.length === 1) {
+        Message.success(`已移动：${targetFileName.trim()}`);
+      } else {
+        Message.success(`已移动 ${moved.length} 个项目`);
+      }
+
+      const movedPaths = new Set(moved.map((file) => file.path));
+      setSelectedPaths((paths) => paths.filter((path) => !movedPaths.has(path)));
+      if (selectedFile && moved.some((file) =>
+        selectedFile.path === file.path || (file.isDirectory && selectedFile.path.startsWith(`${file.path}/`))
+      )) {
         setSelectedFile(null);
         setFileContent('');
         setHasUnsavedChanges(false);
+        setIsEditing(false);
       }
 
-      loadFiles();
-    } catch (error: any) {
-      Message.error(error.response?.data?.message || '移动失败');
+      setMoveVisible(false);
+      setOperatingFiles([]);
+      setTargetFileName('');
+      setSelectedTreeNode('');
+      await loadFiles();
+    } catch {
+      Message.error('移动请求失败');
     }
   };
 
@@ -740,7 +828,17 @@ const Scripts: React.FC = () => {
                 e.preventDefault();
               }}
             >
-              <Space>
+              {batchMode && (
+                <Checkbox
+                  checked={selectedPaths.includes(file.path)}
+                  onChange={(checked) => setSelectedPaths((paths) =>
+                    checked ? [...paths, file.path] : paths.filter((path) => path !== file.path)
+                  )}
+                  onClick={(event) => event.stopPropagation()}
+                  aria-label={`选择 ${file.name}`}
+                />
+              )}
+              <Space style={{ marginLeft: 8 }}>
                 {file.isDirectory ? (
                   <IconFolder style={{ fontSize: 16, color: '#f7ba1e' }} />
                 ) : (
@@ -824,13 +922,7 @@ const Scripts: React.FC = () => {
                       </Menu.Item>
                       <Menu.Item
                         key="delete"
-                        onClick={() => {
-                          Modal.confirm({
-                            title: `确定删除${file.isDirectory ? '文件夹' : '文件'}吗？`,
-                            content: file.isDirectory ? '删除文件夹将删除其中所有内容' : '',
-                            onOk: () => handleDelete(file),
-                          });
-                        }}
+                        onClick={() => confirmDelete([file])}
                       >
                         <Space>
                           <IconDelete />
@@ -1026,8 +1118,51 @@ const Scripts: React.FC = () => {
                 </Button>
               </Upload>
             </Space>
+            {!batchMode && (
+              <Button
+                type="outline"
+                size="mini"
+                icon={<IconSelectAll />}
+                onClick={() => setBatchMode(true)}
+              >
+                批量操作
+              </Button>
+            )}
           </Space>
         </div>
+
+        {batchMode && (
+          <div style={{ padding: '8px 12px', borderBottom: '1px solid var(--color-border)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <span>已选 {selectedFiles.length} 项</span>
+              <Space size="mini">
+                <Button
+                  size="mini"
+                  type="text"
+                  disabled={files.length === 0}
+                  onClick={() => setSelectedPaths(selectedFiles.length === files.length ? [] : files.map((file) => file.path))}
+                >
+                  {selectedFiles.length === files.length && files.length > 0 ? '取消全选' : '全选'}
+                </Button>
+                <Button
+                  size="mini"
+                  type="text"
+                  onClick={() => {
+                    setSelectedPaths([]);
+                    setBatchMode(false);
+                  }}
+                >
+                  取消操作
+                </Button>
+              </Space>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 8, flexWrap: 'nowrap', overflowX: 'auto' }}>
+              <Button size="mini" icon={<IconCopy />} disabled={selectedFiles.length === 0} onClick={handleBatchCopy}>复制</Button>
+              <Button size="mini" icon={<IconDragArrow />} disabled={selectedFiles.length === 0} onClick={handleBatchMove}>移动</Button>
+              <Button size="mini" status="danger" icon={<IconDelete />} disabled={selectedFiles.length === 0} onClick={() => confirmDelete(selectedFiles)}>删除</Button>
+            </div>
+          </div>
+        )}
 
         {loading ? (
           <div style={{ textAlign: 'center', padding: '40px' }}>
@@ -1406,12 +1541,12 @@ const Scripts: React.FC = () => {
 
       {/* 复制 */}
       <Modal
-        title={`复制 - ${operatingFile?.name}`}
+        title={`复制 - ${operatingFiles.length === 1 ? operatingFiles[0].name : `${operatingFiles.length} 个项目`}`}
         visible={copyVisible}
         onOk={handleCopySubmit}
         onCancel={() => {
           setCopyVisible(false);
-          setOperatingFile(null);
+          setOperatingFiles([]);
           setTargetFileName('');
           setSelectedTreeNode('');
         }}
@@ -1442,24 +1577,26 @@ const Scripts: React.FC = () => {
             当前选择：{selectedTreeNode || '根目录'}
           </div>
         </div>
-        <div>
-          <div style={{ marginBottom: 8, fontWeight: 500, fontSize: 14 }}>文件名：</div>
-          <Input
-            value={targetFileName}
-            onChange={(value) => setTargetFileName(value)}
-            placeholder="请输入文件名"
-          />
-        </div>
+        {operatingFiles.length === 1 && (
+          <div>
+            <div style={{ marginBottom: 8, fontWeight: 500, fontSize: 14 }}>复制后的名称：</div>
+            <Input
+              value={targetFileName}
+              onChange={(value) => setTargetFileName(value)}
+              placeholder="请输入名称"
+            />
+          </div>
+        )}
       </Modal>
 
       {/* 移动 */}
       <Modal
-        title={`移动 - ${operatingFile?.name}`}
+        title={`移动 - ${operatingFiles.length === 1 ? operatingFiles[0].name : `${operatingFiles.length} 个项目`}`}
         visible={moveVisible}
         onOk={handleMoveSubmit}
         onCancel={() => {
           setMoveVisible(false);
-          setOperatingFile(null);
+          setOperatingFiles([]);
           setTargetFileName('');
           setSelectedTreeNode('');
         }}
@@ -1490,14 +1627,16 @@ const Scripts: React.FC = () => {
             当前选择：{selectedTreeNode || '根目录'}
           </div>
         </div>
-        <div>
-          <div style={{ marginBottom: 8, fontWeight: 500, fontSize: 14 }}>文件名：</div>
-          <Input
-            value={targetFileName}
-            onChange={(value) => setTargetFileName(value)}
-            placeholder="请输入文件名"
-          />
-        </div>
+        {operatingFiles.length === 1 && (
+          <div>
+            <div style={{ marginBottom: 8, fontWeight: 500, fontSize: 14 }}>移动后的名称：</div>
+            <Input
+              value={targetFileName}
+              onChange={(value) => setTargetFileName(value)}
+              placeholder="请输入名称"
+            />
+          </div>
+        )}
       </Modal>
 
       {/* 执行日志 */}
