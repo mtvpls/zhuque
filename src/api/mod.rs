@@ -166,6 +166,9 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/scripts",
             get(script::list_scripts).post(script::upload_script),
         )
+        .route("/api/scripts/batch/delete", post(script::batch_delete_scripts))
+        .route("/api/scripts/batch/copy", post(script::batch_copy_scripts))
+        .route("/api/scripts/batch/move", post(script::batch_move_scripts))
         .route("/api/scripts/archive", post(script::upload_archive))
         .route(
             "/api/scripts/directories/*path",
